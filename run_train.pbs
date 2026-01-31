@@ -6,7 +6,6 @@
 #PBS -l walltime=12:00:00
 #PBS -j oe
 #PBS -m abe
-#PBS -M you@example.org
 
 set -euo pipefail
 
