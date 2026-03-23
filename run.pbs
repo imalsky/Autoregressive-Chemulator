@@ -32,6 +32,7 @@ readonly SOURCE_RAW_DIR="${PROJECT_ROOT}/data/raw"
 SELECTED_RAW_COUNT=0
 SELECTED_SIZE_MIN_BYTES=0
 SELECTED_SIZE_MAX_BYTES=0
+RUN_PYTHON_JOB_PID=""
 
 log() {
   printf '[%(%Y-%m-%dT%H:%M:%S%z)T] %s\n' -1 "$*"
@@ -124,7 +125,7 @@ run_python_job() {
     export PYTHONPATH="${workspace}/src:${workspace}${BASE_PYTHONPATH:+:${BASE_PYTHONPATH}}"
     python -u "${script_path}"
   ) >"${log_path}" 2>&1 &
-  printf '%s\n' "$!"
+  RUN_PYTHON_JOB_PID="$!"
 }
 
 validate_processed_output() {
@@ -253,7 +254,8 @@ log "launching parallel preprocessing"
 for band in "${BAND_NAMES[@]}"; do
   workspace="${BAND_WORKSPACES[$band]}"
   log_path="${LOG_DIR}/preprocess_${band}.log"
-  pid="$(run_python_job "${workspace}" "processing/preprocessing.py" "${log_path}")"
+  run_python_job "${workspace}" "processing/preprocessing.py" "${log_path}"
+  pid="${RUN_PYTHON_JOB_PID}"
   preprocess_jobs+=( "${band}:${pid}" )
 done
 wait_for_jobs "preprocess" "${preprocess_jobs[@]}"
@@ -267,7 +269,8 @@ log "launching parallel stage-1 training"
 for band in "${BAND_NAMES[@]}"; do
   workspace="${BAND_WORKSPACES[$band]}"
   log_path="${LOG_DIR}/train_${band}.log"
-  pid="$(run_python_job "${workspace}" "src/main.py" "${log_path}")"
+  run_python_job "${workspace}" "src/main.py" "${log_path}"
+  pid="${RUN_PYTHON_JOB_PID}"
   train_jobs+=( "${band}:${pid}" )
 done
 wait_for_jobs "train" "${train_jobs[@]}"
