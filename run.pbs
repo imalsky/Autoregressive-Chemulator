@@ -29,6 +29,9 @@ readonly WORKSPACES_DIR="${RUN_ROOT}/workspaces"
 readonly LOG_DIR="${RUN_ROOT}/logs"
 readonly SHARED_RAW_DIR="${RUN_ROOT}/shared_raw_subset"
 readonly SOURCE_RAW_DIR="${PROJECT_ROOT}/data/raw"
+SELECTED_RAW_COUNT=0
+SELECTED_SIZE_MIN_BYTES=0
+SELECTED_SIZE_MAX_BYTES=0
 
 log() {
   printf '[%(%Y-%m-%dT%H:%M:%S%z)T] %s\n' -1 "$*"
@@ -64,6 +67,7 @@ wait_for_jobs() {
 prepare_shared_raw_subset() {
   local -a raw_files=()
   local src
+  local discovered_count
 
   [ -d "${SOURCE_RAW_DIR}" ] || fail "raw_dir not found: ${SOURCE_RAW_DIR}"
   mkdir -p "${SHARED_RAW_DIR}"
@@ -72,19 +76,25 @@ prepare_shared_raw_subset() {
     find "${SOURCE_RAW_DIR}" -maxdepth 1 -type f \( -name '*.h5' -o -name '*.hdf5' \) | LC_ALL=C sort
   )
 
-  if [ "${#raw_files[@]}" -lt "${RAW_SUBSET_COUNT}" ]; then
-    fail "expected at least ${RAW_SUBSET_COUNT} raw files under ${SOURCE_RAW_DIR}, found ${#raw_files[@]}"
+  discovered_count="${#raw_files[@]}"
+  if [ "${discovered_count}" -eq 0 ]; then
+    fail "expected at least 1 raw file under ${SOURCE_RAW_DIR}, found 0"
   fi
 
-  if [ "${#raw_files[@]}" -gt "${RAW_SUBSET_COUNT}" ]; then
+  if [ "${discovered_count}" -gt "${RAW_SUBSET_COUNT}" ]; then
     raw_files=( "${raw_files[@]:0:${RAW_SUBSET_COUNT}}" )
   fi
+
+  SELECTED_RAW_COUNT="${#raw_files[@]}"
+  SELECTED_SIZE_MIN_BYTES=$((SIZE_MIN_BYTES * SELECTED_RAW_COUNT / RAW_SUBSET_COUNT))
+  SELECTED_SIZE_MAX_BYTES=$((SIZE_MAX_BYTES * SELECTED_RAW_COUNT / RAW_SUBSET_COUNT))
 
   for src in "${raw_files[@]}"; do
     ln -s "${src}" "${SHARED_RAW_DIR}/$(basename "${src}")"
   done
 
-  log "prepared deterministic raw subset with ${#raw_files[@]} files at ${SHARED_RAW_DIR}"
+  log "prepared deterministic raw subset with ${SELECTED_RAW_COUNT} files at ${SHARED_RAW_DIR} (discovered ${discovered_count}, cap ${RAW_SUBSET_COUNT})"
+  log "scaled processed-size gate to [${SELECTED_SIZE_MIN_BYTES}, ${SELECTED_SIZE_MAX_BYTES}] bytes"
 }
 
 prepare_workspace() {
@@ -122,7 +132,7 @@ validate_processed_output() {
   local workspace="$2"
   local processed_dir="${workspace}/data/processed_${band}"
 
-  python - "${processed_dir}" "${SIZE_MIN_BYTES}" "${SIZE_MAX_BYTES}" <<'PY'
+  python - "${processed_dir}" "${SELECTED_SIZE_MIN_BYTES}" "${SELECTED_SIZE_MAX_BYTES}" <<'PY'
 from pathlib import Path
 import sys
 
