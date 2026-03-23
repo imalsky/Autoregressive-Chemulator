@@ -1,16 +1,195 @@
 #!/bin/bash
-#PBS -N MYGPUJOB
+#PBS -N AUTOCHEM4
 #PBS -q gpu_long
 #PBS -W group_list=s2458
-#PBS -l select=1:ncpus=32:ngpus=1:mem=400gb:model=gh200
+#PBS -l select=1:ncpus=72:ngpus=1:mem=400gb:model=gh200
 #PBS -l walltime=72:00:00
 #PBS -j oe
 #PBS -m abe
 
 set -euo pipefail
 
-# PBS equivalent of SLURM_SUBMIT_DIR
 cd -P "${PROJECT_ROOT:-${PBS_O_WORKDIR:?}}"
+PROJECT_ROOT="$(pwd -P)"
+
+readonly BAND_NAMES=(
+  "dt_1e-2_1e0"
+  "dt_1e0_1e2"
+  "dt_1e2_1e4"
+  "dt_1e4_1e6"
+)
+readonly CONFIG_DIR="${PROJECT_ROOT}/configs/stage1_dt_bands"
+readonly RAW_SUBSET_COUNT=400
+readonly SIZE_MIN_BYTES=19500000000
+readonly SIZE_MAX_BYTES=20500000000
+readonly THREADS_PER_JOB=8
+readonly RUN_ID="${PBS_JOBID:-manual_$(date +%Y%m%d_%H%M%S)}"
+readonly RUN_ROOT="${PROJECT_ROOT}/pbs_runs/${RUN_ID}"
+readonly WORKSPACES_DIR="${RUN_ROOT}/workspaces"
+readonly LOG_DIR="${RUN_ROOT}/logs"
+readonly SHARED_RAW_DIR="${RUN_ROOT}/shared_raw_subset"
+readonly SOURCE_RAW_DIR="${PROJECT_ROOT}/data/raw"
+
+log() {
+  printf '[%(%Y-%m-%dT%H:%M:%S%z)T] %s\n' -1 "$*"
+}
+
+fail() {
+  log "ERROR: $*"
+  exit 1
+}
+
+wait_for_jobs() {
+  local phase="$1"
+  shift
+  local failed=0
+  local job_spec name pid
+
+  for job_spec in "$@"; do
+    name="${job_spec%%:*}"
+    pid="${job_spec##*:}"
+    if wait "${pid}"; then
+      log "${phase} completed for ${name}"
+    else
+      log "${phase} failed for ${name}; see ${LOG_DIR}/${phase}_${name}.log"
+      failed=1
+    fi
+  done
+
+  if [ "${failed}" -ne 0 ]; then
+    fail "${phase} phase failed"
+  fi
+}
+
+prepare_shared_raw_subset() {
+  local -a raw_files=()
+  local src
+
+  [ -d "${SOURCE_RAW_DIR}" ] || fail "raw_dir not found: ${SOURCE_RAW_DIR}"
+  mkdir -p "${SHARED_RAW_DIR}"
+
+  mapfile -t raw_files < <(
+    find "${SOURCE_RAW_DIR}" -maxdepth 1 -type f \( -name '*.h5' -o -name '*.hdf5' \) | LC_ALL=C sort
+  )
+
+  if [ "${#raw_files[@]}" -lt "${RAW_SUBSET_COUNT}" ]; then
+    fail "expected at least ${RAW_SUBSET_COUNT} raw files under ${SOURCE_RAW_DIR}, found ${#raw_files[@]}"
+  fi
+
+  if [ "${#raw_files[@]}" -gt "${RAW_SUBSET_COUNT}" ]; then
+    raw_files=( "${raw_files[@]:0:${RAW_SUBSET_COUNT}}" )
+  fi
+
+  for src in "${raw_files[@]}"; do
+    ln -s "${src}" "${SHARED_RAW_DIR}/$(basename "${src}")"
+  done
+
+  log "prepared deterministic raw subset with ${#raw_files[@]} files at ${SHARED_RAW_DIR}"
+}
+
+prepare_workspace() {
+  local band="$1"
+  local workspace="${WORKSPACES_DIR}/${band}"
+  local config_src="${CONFIG_DIR}/${band}.json"
+
+  [ -f "${config_src}" ] || fail "missing band config: ${config_src}"
+
+  rm -rf "${workspace}"
+  mkdir -p "${workspace}" "${workspace}/data" "${workspace}/models"
+
+  cp -R "${PROJECT_ROOT}/src" "${workspace}/"
+  cp -R "${PROJECT_ROOT}/processing" "${workspace}/"
+  cp "${config_src}" "${workspace}/config.json"
+  ln -s "${SHARED_RAW_DIR}" "${workspace}/data/raw"
+
+  printf '%s\n' "${workspace}"
+}
+
+run_python_job() {
+  local workspace="$1"
+  local script_path="$2"
+  local log_path="$3"
+  (
+    cd "${workspace}"
+    export PYTHONPATH="${workspace}/src:${workspace}${BASE_PYTHONPATH:+:${BASE_PYTHONPATH}}"
+    python -u "${script_path}"
+  ) >"${log_path}" 2>&1 &
+  printf '%s\n' "$!"
+}
+
+validate_processed_output() {
+  local band="$1"
+  local workspace="$2"
+  local processed_dir="${workspace}/data/processed_${band}"
+
+  python - "${processed_dir}" "${SIZE_MIN_BYTES}" "${SIZE_MAX_BYTES}" <<'PY'
+from pathlib import Path
+import sys
+
+processed_dir = Path(sys.argv[1])
+size_min = int(sys.argv[2])
+size_max = int(sys.argv[3])
+
+required_files = (
+    processed_dir / "normalization.json",
+    processed_dir / "preprocessing_summary.json",
+)
+for path in required_files:
+    if not path.is_file():
+        raise SystemExit(f"missing required preprocessing artifact: {path}")
+
+split_files = {}
+total_bytes = 0
+for split in ("train", "validation", "test"):
+    split_dir = processed_dir / split
+    files = sorted(split_dir.glob("*.npz")) if split_dir.is_dir() else []
+    split_files[split] = files
+    total_bytes += sum(path.stat().st_size for path in files)
+
+if not split_files["train"]:
+    raise SystemExit(f"train split is empty: {processed_dir / 'train'}")
+if not split_files["validation"]:
+    raise SystemExit(f"validation split is empty: {processed_dir / 'validation'}")
+if total_bytes < size_min or total_bytes > size_max:
+    raise SystemExit(
+        f"processed size {total_bytes} bytes is outside the allowed range [{size_min}, {size_max}]"
+    )
+
+print(
+    f"validated preprocessing output: total_bytes={total_bytes} "
+    f"train_files={len(split_files['train'])} "
+    f"validation_files={len(split_files['validation'])} "
+    f"test_files={len(split_files['test'])}"
+)
+PY
+}
+
+validate_training_output() {
+  local band="$1"
+  local workspace="$2"
+  local work_dir="${workspace}/models/${band}_stage1"
+
+  python - "${work_dir}" <<'PY'
+from pathlib import Path
+import sys
+
+work_dir = Path(sys.argv[1])
+required = (
+    work_dir / "config.resolved.json",
+    work_dir / "metrics.csv",
+)
+for path in required:
+    if not path.is_file():
+        raise SystemExit(f"missing required training artifact: {path}")
+
+ckpt_dir = work_dir / "checkpoints"
+ckpts = sorted(ckpt_dir.glob("*.ckpt")) if ckpt_dir.is_dir() else []
+if not ckpts:
+    raise SystemExit(f"no checkpoints found in {ckpt_dir}")
+
+print(f"validated training output: checkpoints={len(ckpts)} work_dir={work_dir}")
+PY
+}
 
 # ---- Conda (match the working run.pbs approach) ----
 module purge
@@ -21,12 +200,12 @@ CONDA_BASE="$(conda info --base)"
 # shellcheck disable=SC1090
 source "${CONDA_BASE}/etc/profile.d/conda.sh"
 
-CONDA_ENV="${CONDA_ENV:-pyt2_8_gh}"   # default to the env your run.pbs uses
+CONDA_ENV="${CONDA_ENV:-pyt2_8_gh}"
 set +e
 conda activate "${CONDA_ENV}"
 rc=$?
 set -e
-if [ $rc -ne 0 ]; then
+if [ "${rc}" -ne 0 ]; then
   echo "ERROR: failed to activate conda env: ${CONDA_ENV}"
   echo "Available envs are:"
   conda info --envs || true
@@ -39,11 +218,53 @@ pip uninstall -y h5py || true
 # Install the correct ARM version for GH200 (force no cache to avoid picking up the old file)
 pip install h5py --no-cache-dir
 
-# ---- Same runtime exports as your SLURM script ----
-export HDF5_USE_FILE_LOCKING=FALSE
-#export PYTHONNOUSERSITE=1
-export PYTHONPATH="$(pwd)/src:$(pwd):${PYTHONPATH:-}"
+mkdir -p "${WORKSPACES_DIR}" "${LOG_DIR}"
 
-# PBS: no srun
-#python -u processing/preprocessing.py
-python -u src/main.py
+export HDF5_USE_FILE_LOCKING=FALSE
+export OMP_NUM_THREADS="${THREADS_PER_JOB}"
+export MKL_NUM_THREADS="${THREADS_PER_JOB}"
+export OPENBLAS_NUM_THREADS="${THREADS_PER_JOB}"
+export NUMEXPR_NUM_THREADS="${THREADS_PER_JOB}"
+export PYTHONUNBUFFERED=1
+BASE_PYTHONPATH="${PYTHONPATH:-}"
+
+prepare_shared_raw_subset
+
+declare -A BAND_WORKSPACES=()
+declare -a preprocess_jobs=()
+declare -a train_jobs=()
+
+for band in "${BAND_NAMES[@]}"; do
+  workspace="$(prepare_workspace "${band}")"
+  BAND_WORKSPACES["${band}"]="${workspace}"
+done
+
+log "launching parallel preprocessing"
+for band in "${BAND_NAMES[@]}"; do
+  workspace="${BAND_WORKSPACES[$band]}"
+  log_path="${LOG_DIR}/preprocess_${band}.log"
+  pid="$(run_python_job "${workspace}" "processing/preprocessing.py" "${log_path}")"
+  preprocess_jobs+=( "${band}:${pid}" )
+done
+wait_for_jobs "preprocess" "${preprocess_jobs[@]}"
+
+for band in "${BAND_NAMES[@]}"; do
+  workspace="${BAND_WORKSPACES[$band]}"
+  validate_processed_output "${band}" "${workspace}"
+done
+
+log "launching parallel stage-1 training"
+for band in "${BAND_NAMES[@]}"; do
+  workspace="${BAND_WORKSPACES[$band]}"
+  log_path="${LOG_DIR}/train_${band}.log"
+  pid="$(run_python_job "${workspace}" "src/main.py" "${log_path}")"
+  train_jobs+=( "${band}:${pid}" )
+done
+wait_for_jobs "train" "${train_jobs[@]}"
+
+for band in "${BAND_NAMES[@]}"; do
+  workspace="${BAND_WORKSPACES[$band]}"
+  validate_training_output "${band}" "${workspace}"
+done
+
+log "all four stage-1 dt-band pipelines completed successfully"

@@ -74,6 +74,35 @@ def _resolve_run_dir(models_dir: Path, name: str) -> Path:
     return candidate
 
 
+def _resolve_models_relative_run_dir(models_dir: Path, name: str) -> Path:
+    """
+    Resolve a path relative to models/.
+
+    Accept:
+      - "v1" -> models/v1
+      - "nested/v1" -> models/nested/v1
+      - "models/v1" (tolerated)
+    """
+    raw = Path(name).expanduser()
+    if raw.is_absolute():
+        raise SystemExit(f"-dir expects a path relative to models/: {name}")
+
+    p = raw
+    if len(p.parts) >= 1 and p.parts[0] == "models":
+        p = Path(*p.parts[1:])
+
+    candidate = (models_dir / p).resolve()
+
+    # Confine under models_dir (avoid ../../ escapes).
+    if candidate != models_dir and models_dir not in candidate.parents:
+        raise SystemExit(f"Run dir must be under models/: {name}")
+
+    if not candidate.is_dir():
+        raise SystemExit(f"Run dir not found: {candidate.as_posix()}")
+
+    return candidate
+
+
 def _find_config_json(models_dir: Path) -> Optional[Path]:
     """Best-effort locate repo config.json."""
     cwd = Path.cwd().resolve()
@@ -460,11 +489,70 @@ def _union_header(rows: Sequence[Dict[str, Any]]) -> List[str]:
 # ----------------------------
 
 
+def _usage() -> str:
+    return "Usage: read.py [--tail N] [-dir RELATIVE_RUN_DIR] [RUN_DIR]"
+
+
+def _parse_cli(models_dir: Path, argv: Sequence[str]) -> Tuple[Path, int]:
+    """
+    Accept:
+      - no args -> config / RUN_NAME default
+      - positional run dir or name
+      - -dir <relative path under models/>
+      - --tail <non-negative int> to control recent table length
+    """
+    run_dir_name: Optional[str] = None
+    models_relative_run_dir_name: Optional[str] = None
+    tail_epochs = TAIL_EPOCHS
+
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+
+        if arg == "-dir":
+            if i + 1 >= len(argv):
+                raise SystemExit(_usage())
+            if models_relative_run_dir_name is not None or run_dir_name is not None:
+                raise SystemExit(_usage())
+            models_relative_run_dir_name = argv[i + 1]
+            i += 2
+            continue
+
+        if arg == "--tail":
+            if i + 1 >= len(argv):
+                raise SystemExit(_usage())
+            try:
+                tail_epochs = int(argv[i + 1])
+            except ValueError as exc:
+                raise SystemExit("--tail expects a non-negative integer.") from exc
+            if tail_epochs < 0:
+                raise SystemExit("--tail expects a non-negative integer.")
+            i += 2
+            continue
+
+        if arg.startswith("-"):
+            raise SystemExit(_usage())
+
+        if run_dir_name is not None or models_relative_run_dir_name is not None:
+            raise SystemExit(_usage())
+        run_dir_name = arg
+        i += 1
+
+    if models_relative_run_dir_name is not None:
+        run_dir = _resolve_models_relative_run_dir(models_dir, models_relative_run_dir_name)
+    elif run_dir_name is not None:
+        run_dir = _resolve_run_dir(models_dir, run_dir_name)
+    else:
+        run_dir = _resolve_run_dir(models_dir, _default_run_name(models_dir))
+
+    return run_dir, tail_epochs
+
+
 def main() -> int:
     models_dir = _infer_models_dir()
-    # CLI override: pass run name as first positional arg; otherwise fall back to config / RUN_NAME.
-    run_arg = sys.argv[1] if len(sys.argv) > 1 else _default_run_name(models_dir)
-    run_dir = _resolve_run_dir(models_dir, run_arg)
+    # CLI override: pass a run name/path positionally, use -dir for a models/ relative path,
+    # and optionally override the recent table length with --tail.
+    run_dir, tail_epochs = _parse_cli(models_dir, sys.argv[1:])
 
     metrics_path = _resolve_metrics_path(run_dir)
     cfg_path = _resolve_config_path(run_dir)
@@ -505,8 +593,8 @@ def main() -> int:
     if best_bits:
         print(_pipes(best_bits))
 
-    if TAIL_EPOCHS and TAIL_EPOCHS > 0:
-        tail = rows[-TAIL_EPOCHS :] if len(rows) > TAIL_EPOCHS else rows
+    if tail_epochs > 0:
+        tail = rows[-tail_epochs:] if len(rows) > tail_epochs else rows
 
         headers = cols if cols else header
         table = [[_fmt(r.get(c)) for c in headers] for r in tail]
