@@ -21,9 +21,7 @@ readonly BAND_NAMES=(
 readonly CONFIG_DIR="${PROJECT_ROOT}/configs/stage1_dt_bands"
 readonly THREADS_PER_JOB=8
 readonly RUN_ID="${PBS_JOBID:-manual_$(date +%Y%m%d_%H%M%S)}"
-readonly RUN_ROOT="${PROJECT_ROOT}/pbs_runs/${RUN_ID}"
-readonly WORKSPACES_DIR="${RUN_ROOT}/workspaces"
-readonly LOG_DIR="${RUN_ROOT}/logs"
+readonly LOG_DIR="${PROJECT_ROOT}/logs"
 RUN_PYTHON_JOB_PID=""
 
 log() {
@@ -47,7 +45,7 @@ wait_for_jobs() {
     if wait "${pid}"; then
       log "${phase} completed for ${name}"
     else
-      log "${phase} failed for ${name}; see ${LOG_DIR}/${phase}_${name}.log"
+      log "${phase} failed for ${name}; see ${LOG_DIR}/${RUN_ID}_${phase}_${name}.log"
       failed=1
     fi
   done
@@ -57,64 +55,44 @@ wait_for_jobs() {
   fi
 }
 
-prepare_workspace() {
-  local band="$1"
-  local workspace="${WORKSPACES_DIR}/${band}"
-  local config_src="${CONFIG_DIR}/${band}.json"
-
-  [ -f "${config_src}" ] || fail "missing band config: ${config_src}"
-
-  rm -rf "${workspace}"
-  mkdir -p "${workspace}"
-
-  cp -R "${PROJECT_ROOT}/src" "${workspace}/"
-  cp -R "${PROJECT_ROOT}/processing" "${workspace}/"
-  cp "${config_src}" "${workspace}/config.json"
-  ln -s "${PROJECT_ROOT}/data" "${workspace}/data"
-  ln -s "${PROJECT_ROOT}/models" "${workspace}/models"
-
-  printf '%s\n' "${workspace}"
-}
-
 resolve_config_path() {
-  local workspace="$1"
+  local config_path="$1"
   local key="$2"
 
-  python - "${workspace}" "${key}" <<'PY'
+  python - "${config_path}" "${key}" <<'PY'
 from pathlib import Path
 import json
 import sys
 
-workspace = Path(sys.argv[1])
+config_path = Path(sys.argv[1])
 key = sys.argv[2]
-config_path = workspace / "config.json"
 with config_path.open() as f:
     config = json.load(f)
 
 resolved = Path(config["paths"][key])
 if not resolved.is_absolute():
-    resolved = workspace / resolved
+    resolved = config_path.parent / resolved
 
 print(resolved.resolve())
 PY
 }
 
 run_python_job() {
-  local workspace="$1"
-  local script_path="$2"
-  local log_path="$3"
+  local config_path="$1"
+  local log_path="$2"
   (
-    cd "${workspace}"
-    export PYTHONPATH="${workspace}/src:${workspace}${BASE_PYTHONPATH:+:${BASE_PYTHONPATH}}"
-    python -u "${script_path}"
+    cd "${PROJECT_ROOT}"
+    export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}${BASE_PYTHONPATH:+:${BASE_PYTHONPATH}}"
+    export AUTOCHEM_CONFIG_PATH="${config_path}"
+    python -u src/main.py
   ) >"${log_path}" 2>&1 &
   RUN_PYTHON_JOB_PID="$!"
 }
 
 validate_training_input() {
-  local workspace="$1"
+  local config_path="$1"
   local processed_dir
-  processed_dir="$(resolve_config_path "${workspace}" "processed_dir")"
+  processed_dir="$(resolve_config_path "${config_path}" "processed_dir")"
 
   python - "${processed_dir}" <<'PY'
 from pathlib import Path
@@ -153,9 +131,9 @@ PY
 }
 
 validate_training_target() {
-  local workspace="$1"
+  local config_path="$1"
   local work_dir
-  work_dir="$(resolve_config_path "${workspace}" "work_dir")"
+  work_dir="$(resolve_config_path "${config_path}" "work_dir")"
 
   python - "${work_dir}" <<'PY'
 from pathlib import Path
@@ -170,9 +148,9 @@ PY
 }
 
 validate_training_output() {
-  local workspace="$1"
+  local config_path="$1"
   local work_dir
-  work_dir="$(resolve_config_path "${workspace}" "work_dir")"
+  work_dir="$(resolve_config_path "${config_path}" "work_dir")"
 
   python - "${work_dir}" <<'PY'
 from pathlib import Path
@@ -223,8 +201,7 @@ pip uninstall -y h5py || true
 # Install the correct ARM version for GH200 (force no cache to avoid picking up the old file)
 pip install h5py --no-cache-dir
 
-mkdir -p "${WORKSPACES_DIR}" "${LOG_DIR}"
-mkdir -p "${PROJECT_ROOT}/data" "${PROJECT_ROOT}/models"
+mkdir -p "${LOG_DIR}" "${PROJECT_ROOT}/data" "${PROJECT_ROOT}/models"
 
 export HDF5_USE_FILE_LOCKING=FALSE
 export OMP_NUM_THREADS="${THREADS_PER_JOB}"
@@ -234,33 +211,34 @@ export NUMEXPR_NUM_THREADS="${THREADS_PER_JOB}"
 export PYTHONUNBUFFERED=1
 BASE_PYTHONPATH="${PYTHONPATH:-}"
 
-declare -A BAND_WORKSPACES=()
+declare -A BAND_CONFIGS=()
 declare -a train_jobs=()
 
 for band in "${BAND_NAMES[@]}"; do
-  workspace="$(prepare_workspace "${band}")"
-  BAND_WORKSPACES["${band}"]="${workspace}"
+  config_path="${CONFIG_DIR}/${band}.json"
+  [ -f "${config_path}" ] || fail "missing band config: ${config_path}"
+  BAND_CONFIGS["${band}"]="${config_path}"
 done
 
 for band in "${BAND_NAMES[@]}"; do
-  workspace="${BAND_WORKSPACES[$band]}"
-  validate_training_input "${workspace}"
-  validate_training_target "${workspace}"
+  config_path="${BAND_CONFIGS[$band]}"
+  validate_training_input "${config_path}"
+  validate_training_target "${config_path}"
 done
 
 log "launching parallel stage-1 training"
 for band in "${BAND_NAMES[@]}"; do
-  workspace="${BAND_WORKSPACES[$band]}"
-  log_path="${LOG_DIR}/train_${band}.log"
-  run_python_job "${workspace}" "src/main.py" "${log_path}"
+  config_path="${BAND_CONFIGS[$band]}"
+  log_path="${LOG_DIR}/${RUN_ID}_train_${band}.log"
+  run_python_job "${config_path}" "${log_path}"
   pid="${RUN_PYTHON_JOB_PID}"
   train_jobs+=( "${band}:${pid}" )
 done
 wait_for_jobs "train" "${train_jobs[@]}"
 
 for band in "${BAND_NAMES[@]}"; do
-  workspace="${BAND_WORKSPACES[$band]}"
-  validate_training_output "${workspace}"
+  config_path="${BAND_CONFIGS[$band]}"
+  validate_training_output "${config_path}"
 done
 
 log "all four stage-1 training-only dt-band pipelines completed successfully"
