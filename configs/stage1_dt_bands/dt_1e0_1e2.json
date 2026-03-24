@@ -252,14 +252,12 @@
     "predict_delta": true,
     "mlp": {
       "hidden_dims": [
-        1024,
-        1024,
-        1024,
-        1024,
-        1024,
-        1024,
-        1024,
-        1024
+        2048,
+        2048,
+        2048,
+        2048,
+        2048,
+        2048
       ],
       "residual": true
     },
@@ -290,7 +288,7 @@
       "1: required for one-jump mode",
       ">1: needs autoregressive enabled"
     ],
-    "batch_size": 1024,
+    "batch_size": 2048,
     "max_epochs": 1000,
     "checkpoint_mode": "none",
     "num_workers": 0,
