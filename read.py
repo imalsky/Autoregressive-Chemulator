@@ -424,6 +424,7 @@ def _select_table_cols(header: Sequence[str], max_cols: int = 8) -> List[str]:
         "val_loss_log10_mae",
         "val_loss_z_mse",
         "epoch_time_sec",
+        "lr/pg1",
         "lr",
         "test_loss",
         "test_loss_log10_mae",

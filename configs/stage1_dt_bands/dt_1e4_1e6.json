@@ -25,7 +25,7 @@
   "paths": {
     "raw_dir": "data/raw",
     "processed_dir": "data/processed_dt_1e4_1e6",
-    "work_dir": "models/dt_1e4_1e6_stage1"
+    "work_dir": "models/3"
   },
   "system": {
     "device": "auto",
@@ -68,11 +68,11 @@
     "torch_compile": {
       "enabled": true,
       "backend": "inductor",
-      "mode": "default",
+      "mode": "max-autotune",
       "dynamic": false,
       "fullgraph": true,
       "compile_forward_step": true,
-      "compile_open_loop_unroll": true
+      "compile_open_loop_unroll": false
     }
   },
   "data": {

@@ -636,8 +636,6 @@ class FlowMapRolloutModule(pl.LightningModule):
         # Use the underlying torch optimizer for inspection/unscale when available.
         torch_opt = opt.optimizer if hasattr(opt, "optimizer") else opt
 
-        self.log("lr", float(torch_opt.param_groups[0]["lr"]), on_step=False, on_epoch=True)
-
         # Unscale gradients so logged grad_norm is in true scale.
         # Only needed when a GradScaler is active (fp16 AMP); bf16/fp32 do not use one.
         _plugin = getattr(self.trainer.strategy, "precision_plugin", None) or getattr(self.trainer, "precision_plugin", None)
@@ -759,10 +757,6 @@ class FlowMapRolloutModule(pl.LightningModule):
         self.log("train_loss", losses["loss_total"].detach(), on_step=False, on_epoch=True, prog_bar=True)
         self.log("train_loss_log10_mae", losses["loss_log10_mae"], on_step=False, on_epoch=True)
         self.log("train_loss_z_mse", losses["loss_z_mse"], on_step=False, on_epoch=True)
-
-        opt0 = self.trainer.optimizers[0]
-        torch_opt0 = opt0.optimizer if hasattr(opt0, "optimizer") else opt0
-        self.log("lr", float(torch_opt0.param_groups[0]["lr"]), on_step=False, on_epoch=True)
 
         self.log("train_rollout_steps", float(1.0), on_step=False, on_epoch=True)
 
