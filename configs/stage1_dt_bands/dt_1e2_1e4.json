@@ -23,9 +23,9 @@
     "loss_dtype": "float32"
   },
   "paths": {
-    "raw_dir": "data/raw",
-    "processed_dir": "data/processed_dt_1e2_1e4",
-    "work_dir": "models/2"
+    "raw_dir": "../../data/raw",
+    "processed_dir": "../../data/processed_dt_1e2_1e4",
+    "work_dir": "../../models/2"
   },
   "system": {
     "device": "auto",

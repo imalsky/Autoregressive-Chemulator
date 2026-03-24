@@ -49,7 +49,11 @@ torch.backends.cudnn.allow_tf32 = True
 
 log = logging.getLogger(__name__)
 
-DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
+def _default_config_path() -> Path:
+    cfg_override = os.environ.get("AUTOCHEM_CONFIG_PATH", "").strip()
+    if cfg_override:
+        return Path(cfg_override).expanduser().resolve()
+    return Path(__file__).resolve().parents[1] / "config.json"
 
 # Strict required config keys so saved config.resolved.json is always complete for debugging.
 _REQUIRED_CONFIG_KEYS: Tuple[str, ...] = (
@@ -620,7 +624,7 @@ def _load_weights_only(module: torch.nn.Module, ckpt_path: Path, *, strict: bool
 
 
 def main() -> None:
-    cfg_path = DEFAULT_CONFIG_PATH.expanduser().resolve()
+    cfg_path = _default_config_path().expanduser().resolve()
     if not cfg_path.exists():
         raise FileNotFoundError("config not found")
 
