@@ -19,19 +19,11 @@ readonly BAND_NAMES=(
   "dt_1e4_1e6"
 )
 readonly CONFIG_DIR="${PROJECT_ROOT}/configs/stage1_dt_bands"
-readonly RAW_SUBSET_COUNT=400
-readonly SIZE_MIN_BYTES=19500000000
-readonly SIZE_MAX_BYTES=20500000000
 readonly THREADS_PER_JOB=8
 readonly RUN_ID="${PBS_JOBID:-manual_$(date +%Y%m%d_%H%M%S)}"
 readonly RUN_ROOT="${PROJECT_ROOT}/pbs_runs/${RUN_ID}"
 readonly WORKSPACES_DIR="${RUN_ROOT}/workspaces"
 readonly LOG_DIR="${RUN_ROOT}/logs"
-readonly SHARED_RAW_DIR="${RUN_ROOT}/shared_raw_subset"
-readonly SOURCE_RAW_DIR="${PROJECT_ROOT}/data/raw"
-SELECTED_RAW_COUNT=0
-SELECTED_SIZE_MIN_BYTES=0
-SELECTED_SIZE_MAX_BYTES=0
 RUN_PYTHON_JOB_PID=""
 
 log() {
@@ -65,39 +57,6 @@ wait_for_jobs() {
   fi
 }
 
-prepare_shared_raw_subset() {
-  local -a raw_files=()
-  local src
-  local discovered_count
-
-  [ -d "${SOURCE_RAW_DIR}" ] || fail "raw_dir not found: ${SOURCE_RAW_DIR}"
-  mkdir -p "${SHARED_RAW_DIR}"
-
-  mapfile -t raw_files < <(
-    find "${SOURCE_RAW_DIR}" -maxdepth 1 -type f \( -name '*.h5' -o -name '*.hdf5' \) | LC_ALL=C sort
-  )
-
-  discovered_count="${#raw_files[@]}"
-  if [ "${discovered_count}" -eq 0 ]; then
-    fail "expected at least 1 raw file under ${SOURCE_RAW_DIR}, found 0"
-  fi
-
-  if [ "${discovered_count}" -gt "${RAW_SUBSET_COUNT}" ]; then
-    raw_files=( "${raw_files[@]:0:${RAW_SUBSET_COUNT}}" )
-  fi
-
-  SELECTED_RAW_COUNT="${#raw_files[@]}"
-  SELECTED_SIZE_MIN_BYTES=$((SIZE_MIN_BYTES * SELECTED_RAW_COUNT / RAW_SUBSET_COUNT))
-  SELECTED_SIZE_MAX_BYTES=$((SIZE_MAX_BYTES * SELECTED_RAW_COUNT / RAW_SUBSET_COUNT))
-
-  for src in "${raw_files[@]}"; do
-    ln -s "${src}" "${SHARED_RAW_DIR}/$(basename "${src}")"
-  done
-
-  log "prepared deterministic raw subset with ${SELECTED_RAW_COUNT} files at ${SHARED_RAW_DIR} (discovered ${discovered_count}, cap ${RAW_SUBSET_COUNT})"
-  log "scaled processed-size gate to [${SELECTED_SIZE_MIN_BYTES}, ${SELECTED_SIZE_MAX_BYTES}] bytes"
-}
-
 prepare_workspace() {
   local band="$1"
   local workspace="${WORKSPACES_DIR}/${band}"
@@ -106,14 +65,38 @@ prepare_workspace() {
   [ -f "${config_src}" ] || fail "missing band config: ${config_src}"
 
   rm -rf "${workspace}"
-  mkdir -p "${workspace}" "${workspace}/data" "${workspace}/models"
+  mkdir -p "${workspace}"
 
   cp -R "${PROJECT_ROOT}/src" "${workspace}/"
   cp -R "${PROJECT_ROOT}/processing" "${workspace}/"
   cp "${config_src}" "${workspace}/config.json"
-  ln -s "${SHARED_RAW_DIR}" "${workspace}/data/raw"
+  ln -s "${PROJECT_ROOT}/data" "${workspace}/data"
+  ln -s "${PROJECT_ROOT}/models" "${workspace}/models"
 
   printf '%s\n' "${workspace}"
+}
+
+resolve_config_path() {
+  local workspace="$1"
+  local key="$2"
+
+  python - "${workspace}" "${key}" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+workspace = Path(sys.argv[1])
+key = sys.argv[2]
+config_path = workspace / "config.json"
+with config_path.open() as f:
+    config = json.load(f)
+
+resolved = Path(config["paths"][key])
+if not resolved.is_absolute():
+    resolved = workspace / resolved
+
+print(resolved.resolve())
+PY
 }
 
 run_python_job() {
@@ -128,18 +111,16 @@ run_python_job() {
   RUN_PYTHON_JOB_PID="$!"
 }
 
-validate_processed_output() {
-  local band="$1"
-  local workspace="$2"
-  local processed_dir="${workspace}/data/processed_${band}"
+validate_training_input() {
+  local workspace="$1"
+  local processed_dir
+  processed_dir="$(resolve_config_path "${workspace}" "processed_dir")"
 
-  python - "${processed_dir}" "${SELECTED_SIZE_MIN_BYTES}" "${SELECTED_SIZE_MAX_BYTES}" <<'PY'
+  python - "${processed_dir}" <<'PY'
 from pathlib import Path
 import sys
 
 processed_dir = Path(sys.argv[1])
-size_min = int(sys.argv[2])
-size_max = int(sys.argv[3])
 
 required_files = (
     processed_dir / "normalization.json",
@@ -161,13 +142,9 @@ if not split_files["train"]:
     raise SystemExit(f"train split is empty: {processed_dir / 'train'}")
 if not split_files["validation"]:
     raise SystemExit(f"validation split is empty: {processed_dir / 'validation'}")
-if total_bytes < size_min or total_bytes > size_max:
-    raise SystemExit(
-        f"processed size {total_bytes} bytes is outside the allowed range [{size_min}, {size_max}]"
-    )
 
 print(
-    f"validated preprocessing output: total_bytes={total_bytes} "
+    f"validated training input: total_bytes={total_bytes} "
     f"train_files={len(split_files['train'])} "
     f"validation_files={len(split_files['validation'])} "
     f"test_files={len(split_files['test'])}"
@@ -175,10 +152,27 @@ print(
 PY
 }
 
+validate_training_target() {
+  local workspace="$1"
+  local work_dir
+  work_dir="$(resolve_config_path "${workspace}" "work_dir")"
+
+  python - "${work_dir}" <<'PY'
+from pathlib import Path
+import sys
+
+work_dir = Path(sys.argv[1])
+if work_dir.exists() and any(work_dir.iterdir()):
+    raise SystemExit(f"training target exists and is not empty: {work_dir}")
+
+print(f"validated empty training target: {work_dir}")
+PY
+}
+
 validate_training_output() {
-  local band="$1"
-  local workspace="$2"
-  local work_dir="${workspace}/models/${band}_stage1"
+  local workspace="$1"
+  local work_dir
+  work_dir="$(resolve_config_path "${workspace}" "work_dir")"
 
   python - "${work_dir}" <<'PY'
 from pathlib import Path
@@ -230,6 +224,7 @@ pip uninstall -y h5py || true
 pip install h5py --no-cache-dir
 
 mkdir -p "${WORKSPACES_DIR}" "${LOG_DIR}"
+mkdir -p "${PROJECT_ROOT}/data" "${PROJECT_ROOT}/models"
 
 export HDF5_USE_FILE_LOCKING=FALSE
 export OMP_NUM_THREADS="${THREADS_PER_JOB}"
@@ -239,10 +234,7 @@ export NUMEXPR_NUM_THREADS="${THREADS_PER_JOB}"
 export PYTHONUNBUFFERED=1
 BASE_PYTHONPATH="${PYTHONPATH:-}"
 
-prepare_shared_raw_subset
-
 declare -A BAND_WORKSPACES=()
-declare -a preprocess_jobs=()
 declare -a train_jobs=()
 
 for band in "${BAND_NAMES[@]}"; do
@@ -250,19 +242,10 @@ for band in "${BAND_NAMES[@]}"; do
   BAND_WORKSPACES["${band}"]="${workspace}"
 done
 
-log "launching parallel preprocessing"
 for band in "${BAND_NAMES[@]}"; do
   workspace="${BAND_WORKSPACES[$band]}"
-  log_path="${LOG_DIR}/preprocess_${band}.log"
-  run_python_job "${workspace}" "processing/preprocessing.py" "${log_path}"
-  pid="${RUN_PYTHON_JOB_PID}"
-  preprocess_jobs+=( "${band}:${pid}" )
-done
-wait_for_jobs "preprocess" "${preprocess_jobs[@]}"
-
-for band in "${BAND_NAMES[@]}"; do
-  workspace="${BAND_WORKSPACES[$band]}"
-  validate_processed_output "${band}" "${workspace}"
+  validate_training_input "${workspace}"
+  validate_training_target "${workspace}"
 done
 
 log "launching parallel stage-1 training"
@@ -277,7 +260,7 @@ wait_for_jobs "train" "${train_jobs[@]}"
 
 for band in "${BAND_NAMES[@]}"; do
   workspace="${BAND_WORKSPACES[$band]}"
-  validate_training_output "${band}" "${workspace}"
+  validate_training_output "${workspace}"
 done
 
-log "all four stage-1 dt-band pipelines completed successfully"
+log "all four stage-1 training-only dt-band pipelines completed successfully"
