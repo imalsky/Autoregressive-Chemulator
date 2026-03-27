@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # -----------------------------------------------------------------------------
 
 # Run/artifact selection (main knobs).
-RUN_DIR: str = "models/v3_even_smaller_time_range"  # Absolute path or repo-relative path
+RUN_DIR: str = "models/0"  # Absolute path or repo-relative path
 METRICS_FILE: str = "metrics.csv"
 
 # Output.

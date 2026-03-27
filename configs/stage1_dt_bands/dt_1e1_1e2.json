@@ -24,8 +24,8 @@
   },
   "paths": {
     "raw_dir": "../../data/raw",
-    "processed_dir": "../../data/processed_dt_1e2_1e4",
-    "work_dir": "../../models/2"
+    "processed_dir": "../../data/processed_dt_1e1_1e2",
+    "work_dir": "../../models/4"
   },
   "system": {
     "device": "auto",
@@ -153,8 +153,8 @@
       "Require: 0 < dt_min < dt_max.",
       "dt normalization uses: dt_norm = clip((log10(dt) - log10(dt_min)) / (log10(dt_max) - log10(dt_min)), 0, 1)."
     ],
-    "dt_min": 100.0,
-    "dt_max": 10000.0,
+    "dt_min": 10.0,
+    "dt_max": 100.0,
     "dt_sampling": "loguniform",
     "_comment_n_steps": [
       "Number of uniformly-spaced time points per resampled chunk.",
@@ -175,7 +175,7 @@
       "Sampling stops once this many chunks have been successfully written.",
       "If the file has fewer viable trajectories, fewer chunks are produced."
     ],
-    "output_trajectories_per_file": 9608,
+    "output_trajectories_per_file": 2000,
     "_comment_shard_size": [
       "Maximum number of samples (resampled chunks) per NPZ shard file.",
       "Buffers are flushed to disk when this count is reached.",

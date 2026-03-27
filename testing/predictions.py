@@ -31,7 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # -----------------------------------------------------------------------------
 
 # Model/artifact selection (main knobs you typically edit first).
-MODEL_RUN_DIR: str = "models/v3_even_smaller_time_range"  # Absolute path or repo-relative path
+MODEL_RUN_DIR: str = "models/0"  # Absolute path or repo-relative path
 MODEL_EXPORT_FILE: str = "export_cpu_dynB_1step_phys.pt2"
 
 # Inference settings.
@@ -47,7 +47,7 @@ EVAL_SAMPLE_RANDOM_SEED: int | None = None  # Optional reproducible seed; None =
 
 # Rollout window.
 ROLLOUT_START_INDEX: int = 1
-ROLLOUT_STEPS: int = 200
+ROLLOUT_STEPS: int = 50
 
 # Plotting/output.
 PLOTS_SUBDIR: str = "plots"  # Relative to MODEL_RUN_DIR

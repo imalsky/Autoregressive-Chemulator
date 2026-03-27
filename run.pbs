@@ -1,5 +1,5 @@
 #!/bin/bash
-#PBS -N AUTOCHEM4
+#PBS -N AUTOCHEM8
 #PBS -q gpu_long
 #PBS -W group_list=s2458
 #PBS -l select=1:ncpus=72:ngpus=1:mem=400gb:model=gh200
@@ -13,10 +13,14 @@ cd -P "${PROJECT_ROOT:-${PBS_O_WORKDIR:?}}"
 PROJECT_ROOT="$(pwd -P)"
 
 readonly BAND_NAMES=(
-  "dt_1e-2_1e0"
-  "dt_1e0_1e2"
-  "dt_1e2_1e4"
-  "dt_1e4_1e6"
+  "dt_1e-3_1e-2"
+  "dt_1e-2_1e-1"
+  "dt_1e-1_1e0"
+  "dt_1e0_1e1"
+  "dt_1e1_1e2"
+  "dt_1e2_1e3"
+  "dt_1e3_1e4"
+  "dt_1e4_1e5"
 )
 readonly CONFIG_DIR="${PROJECT_ROOT}/configs/stage1_dt_bands"
 readonly THREADS_PER_JOB=8
@@ -75,6 +79,18 @@ if not resolved.is_absolute():
 
 print(resolved.resolve())
 PY
+}
+
+run_preprocess_job() {
+  local config_path="$1"
+  local log_path="$2"
+  (
+    cd "${PROJECT_ROOT}"
+    export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}${BASE_PYTHONPATH:+:${BASE_PYTHONPATH}}"
+    export AUTOCHEM_CONFIG_PATH="${config_path}"
+    python -u processing/preprocessing.py
+  ) >"${log_path}" 2>&1 &
+  RUN_PYTHON_JOB_PID="$!"
 }
 
 run_python_job() {
@@ -212,7 +228,6 @@ export PYTHONUNBUFFERED=1
 BASE_PYTHONPATH="${PYTHONPATH:-}"
 
 declare -A BAND_CONFIGS=()
-declare -a train_jobs=()
 
 for band in "${BAND_NAMES[@]}"; do
   config_path="${CONFIG_DIR}/${band}.json"
@@ -220,13 +235,29 @@ for band in "${BAND_NAMES[@]}"; do
   BAND_CONFIGS["${band}"]="${config_path}"
 done
 
+# ---- Phase 1: Parallel preprocessing (CPU-only, all 8 bands) ----
+log "launching parallel preprocessing for ${#BAND_NAMES[@]} bands"
+declare -a preprocess_jobs=()
+for band in "${BAND_NAMES[@]}"; do
+  config_path="${BAND_CONFIGS[$band]}"
+  log_path="${LOG_DIR}/${RUN_ID}_preprocess_${band}.log"
+  run_preprocess_job "${config_path}" "${log_path}"
+  pid="${RUN_PYTHON_JOB_PID}"
+  preprocess_jobs+=( "${band}:${pid}" )
+done
+wait_for_jobs "preprocess" "${preprocess_jobs[@]}"
+log "all ${#BAND_NAMES[@]} preprocessing jobs completed successfully"
+
+# ---- Phase 2: Validate preprocessing output, then parallel training ----
+declare -a train_jobs=()
+
 for band in "${BAND_NAMES[@]}"; do
   config_path="${BAND_CONFIGS[$band]}"
   validate_training_input "${config_path}"
   validate_training_target "${config_path}"
 done
 
-log "launching parallel stage-1 training"
+log "launching parallel stage-1 training for ${#BAND_NAMES[@]} bands"
 for band in "${BAND_NAMES[@]}"; do
   config_path="${BAND_CONFIGS[$band]}"
   log_path="${LOG_DIR}/${RUN_ID}_train_${band}.log"
@@ -241,4 +272,4 @@ for band in "${BAND_NAMES[@]}"; do
   validate_training_output "${config_path}"
 done
 
-log "all four stage-1 training-only dt-band pipelines completed successfully"
+log "all ${#BAND_NAMES[@]} stage-1 dt-band pipelines completed successfully"
