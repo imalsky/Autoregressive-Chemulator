@@ -1,0 +1,92 @@
+model:
+  activation: silu
+  autoencoder:
+    decoder_hidden: 512
+    dynamics_hidden: 512
+    dynamics_residual: true
+    encoder_hidden: 512
+    latent_dim: 256
+    residual: true
+  dropout: 0.0
+  layer_norm: true
+  layer_norm_eps: 1.0e-05
+  mlp:
+    hidden_dims:
+    - 2048
+    - 2048
+    - 2048
+    - 2048
+    - 2048
+    - 2048
+    residual: true
+  predict_delta: true
+  type: mlp
+training:
+  _comment_autoregressive:
+  - 'false: one-jump mode'
+  - 'true: unroll for rollout_steps'
+  _comment_checkpoint_mode:
+  - 'none: fresh training, empty work_dir'
+  - 'resume: restore model+optimizer+epoch'
+  - 'weights_only: load weights, reset state'
+  _comment_curriculum:
+  - 'true: ramp rollout_steps over training'
+  - 'mode: linear or cosine'
+  _comment_rollout_steps:
+  - '1: required for one-jump mode'
+  - '>1: needs autoregressive enabled'
+  autoregressive_training:
+    _comment_backward_per_step:
+    - 'true: backward each step, saves memory'
+    - 'false: accumulate graph, faster'
+    _comment_detach:
+    - 'true: no BPTT, independent gradients'
+    - 'false: full BPTT through sequence'
+    _comment_skip_steps:
+    - '0: no warmup'
+    - 'N: run N steps without gradient'
+    backward_per_step: true
+    detach_between_steps: true
+    enabled: false
+    skip_steps: 0
+  batch_size: 8192
+  checkpoint_mode: none
+  curriculum:
+    enabled: false
+    end_steps: 1
+    mode: linear
+    ramp_epochs: 0
+    start_steps: 1
+  loss:
+    lambda_log10_mae: 1.0
+    lambda_z_mse: 0.25
+  max_epochs: 1000
+  num_workers: 0
+  optimizer:
+    betas:
+    - 0.9
+    - 0.999
+    eps: 1.0e-08
+    exclude_norm_and_bias_from_weight_decay: true
+    foreach: false
+    fused: true
+    lr: 0.0001
+    name: adamw
+    weight_decay: 0.0001
+  persistent_workers: false
+  pin_memory: false
+  prefetch_factor: null
+  rollout_steps: 1
+  scheduler:
+    _comment_plateau:
+    - Keys below are only used when scheduler.type == 'ReduceLROnPlateau'.
+    enabled: true
+    factor: 0.5
+    min_lr: 0.0
+    min_lr_ratio: 0.01
+    mode: min
+    monitor: val_loss
+    patience: 10
+    threshold: 0.0001
+    type: cosine_with_warmup
+    warmup_epochs: 50

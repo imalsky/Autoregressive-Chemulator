@@ -1256,7 +1256,11 @@ def write_summary(
 
 
 def main() -> None:
-    cfg_path = DEFAULT_CONFIG_PATH.expanduser().resolve()
+    cfg_override = os.environ.get("AUTOCHEM_CONFIG_PATH", "").strip()
+    if cfg_override:
+        cfg_path = Path(cfg_override).expanduser().resolve()
+    else:
+        cfg_path = DEFAULT_CONFIG_PATH.expanduser().resolve()
     cfg_dict = load_json(cfg_path)
     validate_required_config_keys(cfg_dict)
 
