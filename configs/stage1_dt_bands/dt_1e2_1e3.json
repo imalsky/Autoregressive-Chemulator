@@ -28,7 +28,7 @@
     "work_dir": "../../models/5"
   },
   "system": {
-    "device": "auto",
+    "device": "cpu",
     "log_level": "INFO",
     "seed": 1234
   },
@@ -175,7 +175,7 @@
       "Sampling stops once this many chunks have been successfully written.",
       "If the file has fewer viable trajectories, fewer chunks are produced."
     ],
-    "output_trajectories_per_file": 2000,
+    "output_trajectories_per_file": 16000,
     "_comment_shard_size": [
       "Maximum number of samples (resampled chunks) per NPZ shard file.",
       "Buffers are flushed to disk when this count is reached.",
@@ -291,10 +291,10 @@
     "batch_size": 2048,
     "max_epochs": 1000,
     "checkpoint_mode": "none",
-    "num_workers": 0,
-    "pin_memory": false,
-    "persistent_workers": false,
-    "prefetch_factor": null,
+    "num_workers": 4,
+    "pin_memory": true,
+    "persistent_workers": true,
+    "prefetch_factor": 2,
     "rollout_steps": 1,
     "loss": {
       "lambda_log10_mae": 1.0,
