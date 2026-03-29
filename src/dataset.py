@@ -41,10 +41,9 @@ Batch format (default collate on map-style dataset):
 
 Performance note:
 If `preload_to_device=True`, using a map-style dataset with large `batch_size`
-forces Python to call `__getitem__` B times per step, producing thousands of
-tiny device indexing ops. To avoid that, `create_dataloader()` automatically
-switches to a vectorized, GPU-native IterableDataset that yields pre-batched
-tensors with a few large kernels per step.
+forces Python to call `__getitem__` B times per step. To avoid that,
+`create_dataloader()` automatically switches to a vectorized IterableDataset
+that samples from the preloaded tensors and yields pre-batched tensors.
 """
 
 from __future__ import annotations
@@ -186,8 +185,8 @@ class FlowMapRolloutDataset(Dataset):
             windows_per_trajectory: Controls *epoch size* by repeating each trajectory this many times.
                                   Sampling is still random each time.
             seed: Base seed for per-worker RNG.
-            preload_to_device: If True, all shards are loaded to `device` and a GPU-native batch stream
-                              can be used by create_dataloader().
+            preload_to_device: If True, all shards are loaded to `device` and a vectorized
+                              preloaded batch stream can be used by create_dataloader().
             device: Target device for preload_to_device.
             storage_dtype: dtype for tensors returned by the dataset (float32 recommended).
             shard_cache_size: LRU size for cached shards when loading on-demand on CPU.
@@ -323,7 +322,7 @@ class FlowMapRolloutDataset(Dataset):
             self._traj_to_local[cursor : cursor + n] = np.arange(n, dtype=np.int32)
             cursor += n
 
-        # GPU preload cache
+        # Preload cache
         self._preloaded = False
         self._shard_cache: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         self._preloaded_all: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
@@ -335,8 +334,6 @@ class FlowMapRolloutDataset(Dataset):
         self._rng_cache: Dict[Tuple[int, int], np.random.Generator] = {}
 
         if self.preload_to_device:
-            if self.device.type == "cpu":
-                raise ValueError("preload_to_device=True requires a CUDA/MPS device (data should live on accelerator).")
             self._preload_all()
 
     # -------------------------------------------------------------------------
@@ -344,7 +341,7 @@ class FlowMapRolloutDataset(Dataset):
     # -------------------------------------------------------------------------
 
     def _preload_all(self) -> None:
-        """Load all shards into device memory (requires num_workers=0).
+        """Load all shards into contiguous tensors on *device*.
 
         Implementation note:
           We build a single contiguous [N,T,S] / [N,G] / [N,T-1] buffer and then keep
@@ -363,6 +360,7 @@ class FlowMapRolloutDataset(Dataset):
         g_all = torch.empty((total, self.G), device=self.device, dtype=self.storage_dtype)
         dt_all = torch.empty((total, self.T - 1), device=self.device, dtype=self.storage_dtype)
 
+        # Pass 1: decompress shards and copy into contiguous buffers.
         cursor = 0
         for si in self.shards:
             with np.load(si.path) as z:
@@ -380,15 +378,20 @@ class FlowMapRolloutDataset(Dataset):
             y_all[cursor : cursor + n].copy_(torch.from_numpy(y_np), non_blocking=False)
             g_all[cursor : cursor + n].copy_(torch.from_numpy(g_np), non_blocking=False)
             dt_all[cursor : cursor + n].copy_(torch.from_numpy(dt_np), non_blocking=False)
+            cursor += n
 
-            # Per-shard views (no extra allocation).
+        if cursor != total:
+            raise RuntimeError(f"preload size mismatch: filled {cursor}, expected {total}")
+
+        # Pass 2: build per-shard views (no extra allocation).
+        cursor = 0
+        for si in self.shards:
+            n = int(si.n)
             self._shard_cache.append(
                 (y_all[cursor : cursor + n], g_all[cursor : cursor + n], dt_all[cursor : cursor + n])
             )
             cursor += n
 
-        if cursor != total:
-            raise RuntimeError(f"preload size mismatch: filled {cursor}, expected {total}")
         self._preloaded_all = (y_all, g_all, dt_all)
         self._preloaded = True
 
@@ -518,12 +521,14 @@ class FlowMapRolloutDataset(Dataset):
         return {"y": y_full, "dt": dt_seq, "g": g}
 
 
-class _GPUPreloadedStochasticBatchStream(IterableDataset):
+class _PreloadedStochasticBatchStream(IterableDataset):
     """
-    Vectorized stochastic batch stream for GPU-preloaded FlowMapRolloutDataset.
+    Vectorized stochastic batch stream for preloaded FlowMapRolloutDataset.
 
     This addresses the utilization bottleneck of calling __getitem__ B times per step.
-    The stream yields already-batched tensors directly on the target device.
+    The stream yields already-batched tensors sampled from the contiguous preload
+    buffers. When the preload device is CPU, DataLoader pinning can be used on the
+    yielded batches for efficient host-to-device transfer.
 
     Sampling is with replacement (SGD-style).
     """
@@ -539,9 +544,9 @@ class _GPUPreloadedStochasticBatchStream(IterableDataset):
         super().__init__()
 
         if not getattr(base, "_preloaded", False):
-            raise ValueError("_GPUPreloadedStochasticBatchStream requires a preloaded base dataset")
+            raise ValueError("_PreloadedStochasticBatchStream requires a preloaded base dataset")
         if base._preloaded_all is None:
-            raise ValueError("_GPUPreloadedStochasticBatchStream requires base._preloaded_all (contiguous preload)")
+            raise ValueError("_PreloadedStochasticBatchStream requires base._preloaded_all (contiguous preload)")
         if batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {batch_size}")
 
@@ -565,16 +570,15 @@ class _GPUPreloadedStochasticBatchStream(IterableDataset):
 
         self._seed = int(seed if seed is not None else base.seed)
 
-        # Sample indices on-device for efficiency.
         try:
-            self._gen_dev = torch.Generator(device=self.device)
+            self._generator = torch.Generator(device=self.device)
         except TypeError as e:
             raise RuntimeError(
                 "preload_to_device=True requires torch.Generator(device=...) support. "
                 "Upgrade PyTorch or set dataset.preload_to_device=false."
             ) from e
-        # Use +1 to preserve the historical separation between CPU and device RNG streams.
-        self._gen_dev.manual_seed(self._seed + 1)
+        # Use +1 to preserve the historical separation between CPU and preload-stream RNGs.
+        self._generator.manual_seed(self._seed + 1)
 
     def __len__(self) -> int:
         total = len(self.base)
@@ -597,13 +601,13 @@ class _GPUPreloadedStochasticBatchStream(IterableDataset):
             if B <= 0:
                 break
 
-            traj = torch.randint(0, self.N, (B,), device=self.device, generator=self._gen_dev, dtype=torch.long)
+            traj = torch.randint(0, self.N, (B,), device=self.device, generator=self._generator, dtype=torch.long)
             start = torch.randint(
                 0,
                 self.base.max_start + 1,
                 (B,),
                 device=self.device,
-                generator=self._gen_dev,
+                generator=self._generator,
                 dtype=torch.long,
             )
 
@@ -636,13 +640,14 @@ def create_dataloader(
     Create a DataLoader with safe defaults for this codebase.
 
     Notes for preload_to_device=True:
-    - The loader will switch to a GPU-native stochastic batch stream (sampling with replacement).
+    - The loader switches to a vectorized stochastic batch stream (sampling with replacement).
+    - Preloaded datasets use a single-process stream; num_workers must be 0.
     """
     preload = bool(getattr(dataset, "preload_to_device", False))
     if preload and num_workers != 0:
         raise ValueError(
-            "preload_to_device=True requires num_workers=0. "
-            "Preloaded data cannot be shared across worker processes."
+            "preload_to_device=True requires num_workers=0 because preloaded data uses "
+            "the vectorized prebatched stream."
         )
     # Dataset size checks
     try:
@@ -659,7 +664,12 @@ def create_dataloader(
         )
 
     if preload and pin_memory:
-        raise ValueError("pin_memory=True is incompatible with preload_to_device=True (data is already on device).")
+        ds_device = getattr(dataset, "device", None)
+        if ds_device is not None and ds_device.type != "cpu":
+            raise ValueError(
+                "pin_memory=True is incompatible with preload_to_device=True "
+                "when data is on an accelerator device."
+            )
 
     if num_workers == 0 and persistent_workers:
         raise ValueError("persistent_workers=True requires num_workers>0.")
@@ -667,21 +677,23 @@ def create_dataloader(
     if num_workers == 0 and prefetch_factor is not None:
         raise ValueError("prefetch_factor requires num_workers>0.")
 
-    # ---- Optimized GPU stream for preloaded FlowMapRolloutDataset ----
+    # ---- Optimized stream for preloaded FlowMapRolloutDataset ----
     if preload and isinstance(dataset, FlowMapRolloutDataset) and getattr(dataset, "_preloaded", False):
-        stream: IterableDataset = _GPUPreloadedStochasticBatchStream(
+        stream: IterableDataset = _PreloadedStochasticBatchStream(
             dataset,
             batch_size=batch_size,
             drop_last=bool(drop_last),
             seed=getattr(dataset, "seed", 1234),
         )
 
+        stream_pin_memory = bool(pin_memory and dataset.device.type == "cpu")
+
         return DataLoader(
             dataset=stream,
             batch_size=None,  # stream yields already-batched tensors
             shuffle=False,
             num_workers=0,
-            pin_memory=False,
+            pin_memory=stream_pin_memory,
             persistent_workers=False,
         )
 

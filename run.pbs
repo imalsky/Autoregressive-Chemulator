@@ -13,17 +13,13 @@ cd -P "${PROJECT_ROOT:-${PBS_O_WORKDIR:?}}"
 PROJECT_ROOT="$(pwd -P)"
 
 readonly BAND_NAMES=(
-  "dt_1e-3_1e-2"
-  "dt_1e-2_1e-1"
-  "dt_1e-1_1e0"
-  "dt_1e0_1e1"
-  "dt_1e1_1e2"
-  "dt_1e2_1e3"
-  "dt_1e3_1e4"
-  "dt_1e4_1e5"
+  "dt_1e-3_1e-1"
+  "dt_1e-1_1e1"
+  "dt_1e1_1e3"
+  "dt_1e3_1e5"
 )
 readonly CONFIG_DIR="${PROJECT_ROOT}/configs/stage1_dt_bands"
-readonly THREADS_PER_JOB=8
+readonly THREADS_PER_JOB=16
 readonly RUN_ID="${PBS_JOBID:-manual_$(date +%Y%m%d_%H%M%S)}"
 readonly LOG_DIR="${PROJECT_ROOT}/logs"
 RUN_PYTHON_JOB_PID=""
@@ -235,7 +231,7 @@ for band in "${BAND_NAMES[@]}"; do
   BAND_CONFIGS["${band}"]="${config_path}"
 done
 
-# ---- Phase 1: Parallel preprocessing (CPU-only, all 8 bands) ----
+# ---- Phase 1: Parallel preprocessing (CPU-only, all 4 bands) ----
 log "launching parallel preprocessing for ${#BAND_NAMES[@]} bands"
 declare -a preprocess_jobs=()
 for band in "${BAND_NAMES[@]}"; do
