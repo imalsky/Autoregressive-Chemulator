@@ -92,14 +92,14 @@
     "drop_below": 1e-30
   },
   "dataset": {
-    "windows_per_trajectory": 100,
+    "windows_per_trajectory": 10,
     "preload_to_device": true,
     "shard_cache_size": 2
   },
   "model": {
     "type": "mlp",
     "activation": "silu",
-    "dropout": 0.0,
+    "dropout": 0.01,
     "layer_norm": true,
     "layer_norm_eps": 1e-05,
     "predict_delta": true,
