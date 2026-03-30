@@ -491,7 +491,7 @@ def _union_header(rows: Sequence[Dict[str, Any]]) -> List[str]:
 
 
 def _usage() -> str:
-    return "Usage: read.py [--tail N] [-dir RELATIVE_RUN_DIR] [RUN_DIR]"
+    return "Usage: read.py [--tail N | -tail N] [--dir RELATIVE_RUN_DIR | -dir RELATIVE_RUN_DIR] [RUN_DIR]"
 
 
 def _parse_cli(models_dir: Path, argv: Sequence[str]) -> Tuple[Path, int]:
@@ -499,8 +499,8 @@ def _parse_cli(models_dir: Path, argv: Sequence[str]) -> Tuple[Path, int]:
     Accept:
       - no args -> config / RUN_NAME default
       - positional run dir or name
-      - -dir <relative path under models/>
-      - --tail <non-negative int> to control recent table length
+      - --dir/-dir <relative path under models/>
+      - --tail/-tail <non-negative int> to control recent table length
     """
     run_dir_name: Optional[str] = None
     models_relative_run_dir_name: Optional[str] = None
@@ -510,7 +510,7 @@ def _parse_cli(models_dir: Path, argv: Sequence[str]) -> Tuple[Path, int]:
     while i < len(argv):
         arg = argv[i]
 
-        if arg == "-dir":
+        if arg in ("-dir", "--dir"):
             if i + 1 >= len(argv):
                 raise SystemExit(_usage())
             if models_relative_run_dir_name is not None or run_dir_name is not None:
@@ -519,15 +519,15 @@ def _parse_cli(models_dir: Path, argv: Sequence[str]) -> Tuple[Path, int]:
             i += 2
             continue
 
-        if arg == "--tail":
+        if arg in ("-tail", "--tail"):
             if i + 1 >= len(argv):
                 raise SystemExit(_usage())
             try:
                 tail_epochs = int(argv[i + 1])
             except ValueError as exc:
-                raise SystemExit("--tail expects a non-negative integer.") from exc
+                raise SystemExit("--tail/-tail expects a non-negative integer.") from exc
             if tail_epochs < 0:
-                raise SystemExit("--tail expects a non-negative integer.")
+                raise SystemExit("--tail/-tail expects a non-negative integer.")
             i += 2
             continue
 
@@ -551,8 +551,8 @@ def _parse_cli(models_dir: Path, argv: Sequence[str]) -> Tuple[Path, int]:
 
 def main() -> int:
     models_dir = _infer_models_dir()
-    # CLI override: pass a run name/path positionally, use -dir for a models/ relative path,
-    # and optionally override the recent table length with --tail.
+    # CLI override: pass a run name/path positionally, use --dir/-dir for a models/ relative path,
+    # and optionally override the recent table length with --tail/-tail.
     run_dir, tail_epochs = _parse_cli(models_dir, sys.argv[1:])
 
     metrics_path = _resolve_metrics_path(run_dir)

@@ -77,18 +77,6 @@ print(resolved.resolve())
 PY
 }
 
-run_preprocess_job() {
-  local config_path="$1"
-  local log_path="$2"
-  (
-    cd "${PROJECT_ROOT}"
-    export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}${BASE_PYTHONPATH:+:${BASE_PYTHONPATH}}"
-    export AUTOCHEM_CONFIG_PATH="${config_path}"
-    python -u processing/preprocessing.py
-  ) >"${log_path}" 2>&1 &
-  RUN_PYTHON_JOB_PID="$!"
-}
-
 run_python_job() {
   local config_path="$1"
   local log_path="$2"
@@ -231,20 +219,7 @@ for band in "${BAND_NAMES[@]}"; do
   BAND_CONFIGS["${band}"]="${config_path}"
 done
 
-# ---- Phase 1: Parallel preprocessing (CPU-only, all 4 bands) ----
-log "launching parallel preprocessing for ${#BAND_NAMES[@]} bands"
-declare -a preprocess_jobs=()
-for band in "${BAND_NAMES[@]}"; do
-  config_path="${BAND_CONFIGS[$band]}"
-  log_path="${LOG_DIR}/${RUN_ID}_preprocess_${band}.log"
-  run_preprocess_job "${config_path}" "${log_path}"
-  pid="${RUN_PYTHON_JOB_PID}"
-  preprocess_jobs+=( "${band}:${pid}" )
-done
-wait_for_jobs "preprocess" "${preprocess_jobs[@]}"
-log "all ${#BAND_NAMES[@]} preprocessing jobs completed successfully"
-
-# ---- Phase 2: Validate preprocessing output, then parallel training ----
+# ---- Validate existing preprocessing output, then parallel training ----
 declare -a train_jobs=()
 
 for band in "${BAND_NAMES[@]}"; do
@@ -268,4 +243,4 @@ for band in "${BAND_NAMES[@]}"; do
   validate_training_output "${config_path}"
 done
 
-log "all ${#BAND_NAMES[@]} stage-1 dt-band pipelines completed successfully"
+log "all ${#BAND_NAMES[@]} stage-1 dt-band training jobs completed successfully"
