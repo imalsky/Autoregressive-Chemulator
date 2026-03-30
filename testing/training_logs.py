@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-plot_losses.py - Plot epoch-level training/validation losses from models/<run>/metrics.csv.
+training_logs.py - Plot epoch-level training/validation losses from models/<run>/metrics.csv
+and export a cleaned epoch-level metrics table.
 
 Assumes repo layout:
   <repo>/
@@ -10,6 +11,7 @@ Assumes repo layout:
     models/<run>/metrics.csv
 
 Saves:
+  <run_dir>/metrics_cleaned.csv
   <run_dir>/plots/loss_curves.png
 """
 
@@ -28,11 +30,12 @@ ROOT = Path(__file__).resolve().parents[1]
 # -----------------------------------------------------------------------------
 
 # Run/artifact selection (main knobs).
-RUN_DIR: str = "models/0"  # Absolute path or repo-relative path
+RUN_DIR: str = "models_old/v3"  # Absolute path or repo-relative path
 METRICS_FILE: str = "metrics.csv"
 
 # Output.
 OUT_NAME: str = "loss_curves.png"
+OUT_CLEAN_METRICS_NAME: str = "metrics_cleaned.csv"
 PLOTS_SUBDIR: str = "plots"  # Relative to RUN_DIR
 
 # Plot behavior.
@@ -44,6 +47,31 @@ STYLE_CANDIDATES: tuple[Path | str, ...] = (
     ROOT / "science.mplstyle",
     ROOT / "testing" / "science.mplstyle",
     "science.mplstyle",
+)
+
+REQUIRED_PLOT_METRICS: tuple[str, ...] = (
+    "train_loss",
+    "val_loss",
+    "train_loss_log10_mae",
+    "val_loss_log10_mae",
+    "train_loss_z_mse",
+    "val_loss_z_mse",
+)
+
+PREFERRED_METRIC_ORDER: tuple[str, ...] = (
+    "step",
+    "epoch_time_sec",
+    "lr",
+    "grad_norm",
+    "train_loss",
+    "val_loss",
+    "train_loss_log10_mae",
+    "val_loss_log10_mae",
+    "train_loss_z_mse",
+    "val_loss_z_mse",
+    "train_rollout_steps",
+    "train_skip_steps",
+    "train_detach_between_steps",
 )
 
 
@@ -76,7 +104,7 @@ def apply_style() -> None:
 # IO
 # =============================================================================
 
-def _to_float(x: str):
+def _to_float(x: str) -> float | None:
     x = (x or "").strip()
     if not x:
         return None
@@ -86,28 +114,25 @@ def _to_float(x: str):
         return None
 
 
-def load_metrics_csv(path: Path):
+def _ordered_metric_names(metric_names: tuple[str, ...]) -> tuple[str, ...]:
+    preferred = [name for name in PREFERRED_METRIC_ORDER if name in metric_names]
+    remaining = sorted(name for name in metric_names if name not in PREFERRED_METRIC_ORDER)
+    return tuple(preferred + remaining)
+
+
+def load_metrics_csv(path: Path) -> dict[str, np.ndarray]:
     if not path.exists():
         raise FileNotFoundError(f"metrics.csv not found: {path}")
 
-    rows = []
     with path.open("r", newline="") as f:
         reader = csv.DictReader(f)
-        for r in reader:
-            rows.append(r)
+        rows = list(reader)
+        metric_names = tuple(name for name in (reader.fieldnames or []) if name and name != "epoch")
 
     if not rows:
         raise ValueError(f"No rows in: {path}")
 
     # Merge rows per epoch because train/val metrics may be logged on separate rows.
-    metric_names = (
-        "train_loss",
-        "val_loss",
-        "train_loss_log10_mae",
-        "val_loss_log10_mae",
-        "train_loss_z_mse",
-        "val_loss_z_mse",
-    )
     by_epoch: dict[int, dict[str, float | None]] = {}
     for r in rows:
         e = _to_float(r.get("epoch", ""))
@@ -120,23 +145,62 @@ def load_metrics_csv(path: Path):
             if v is not None:
                 metrics[k] = v
 
+    if not by_epoch:
+        raise ValueError(f"No epoch rows in: {path}")
+
     epochs = np.array(sorted(by_epoch.keys()), dtype=np.int64)
 
-    def col(name: str):
+    kept_metric_names = tuple(
+        name
+        for name in metric_names
+        if name in REQUIRED_PLOT_METRICS
+        or any(by_epoch[int(epoch)][name] is not None for epoch in epochs)
+    )
+    ordered_metric_names = _ordered_metric_names(kept_metric_names)
+
+    def col(name: str) -> np.ndarray:
         return np.array(
-            [by_epoch[int(e)][name] if by_epoch[int(e)][name] is not None else np.nan for e in epochs],
+            [
+                by_epoch[int(epoch)][name] if by_epoch[int(epoch)][name] is not None else np.nan
+                for epoch in epochs
+            ],
             dtype=np.float64,
         )
 
-    return {
-        "epoch": epochs,
-        "train_loss": col("train_loss"),
-        "val_loss": col("val_loss"),
-        "train_loss_log10_mae": col("train_loss_log10_mae"),
-        "val_loss_log10_mae": col("val_loss_log10_mae"),
-        "train_loss_z_mse": col("train_loss_z_mse"),
-        "val_loss_z_mse": col("val_loss_z_mse"),
-    }
+    data: dict[str, np.ndarray] = {"epoch": epochs}  # shape: (num_epochs,)
+    for name in ordered_metric_names:
+        data[name] = col(name)  # shape: (num_epochs,)
+    return data
+
+
+def _format_csv_value(value: float, *, integer: bool = False) -> str:
+    if not np.isfinite(value):
+        return ""
+    if integer:
+        return str(int(round(float(value))))
+    return f"{float(value):.16g}"
+
+
+def save_clean_metrics_csv(metrics: dict[str, np.ndarray], out_path: Path) -> None:
+    fieldnames = list(metrics.keys())
+    integer_columns = {"epoch", "step"}
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        num_rows = int(metrics["epoch"].shape[0])
+        for row_idx in range(num_rows):
+            row = {
+                name: _format_csv_value(
+                    float(metrics[name][row_idx]),
+                    integer=name in integer_columns,
+                )
+                for name in fieldnames
+            }
+            writer.writerow(row)
+
+    print(f"Saved: {out_path}")
 
 
 def moving_average(y: np.ndarray, w: int) -> np.ndarray:
@@ -170,6 +234,10 @@ def _format_final_metric(y: np.ndarray) -> str:
 
 def _resolve_metrics_path(run_dir: Path) -> Path:
     return (run_dir / METRICS_FILE).resolve()
+
+
+def _resolve_clean_metrics_path(run_dir: Path) -> Path:
+    return (run_dir / OUT_CLEAN_METRICS_NAME).resolve()
 
 
 def _resolve_output_path(run_dir: Path) -> Path:
@@ -247,9 +315,15 @@ def main() -> None:
     apply_style()
     run_dir = _resolve_repo_path(RUN_DIR)
     metrics_path = _resolve_metrics_path(run_dir)
+    clean_metrics_path = _resolve_clean_metrics_path(run_dir)
     out_path = _resolve_output_path(run_dir)
-    print(f"[config] run_dir={run_dir} metrics={metrics_path} out={out_path}")
+    print(
+        "[config] "
+        f"run_dir={run_dir} metrics={metrics_path} "
+        f"clean_csv={clean_metrics_path} out={out_path}"
+    )
     m = load_metrics_csv(metrics_path)
+    save_clean_metrics_csv(m, clean_metrics_path)
     plot_losses(m, out_path, run_name=run_dir.name)
 
 
