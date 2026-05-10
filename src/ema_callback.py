@@ -37,6 +37,17 @@ class EMACallback(pl.Callback):
         if self.ema_sd is None:
             self._init_ema_from_module(pl_module)
 
+    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        # Lightning's strategy moves the module to the accelerator AFTER Callback.setup()
+        # runs, so the shadow cloned in setup() can live on CPU while the live module is
+        # on GPU. Migrate the shadow now that the module is on its final device.
+        if self.ema_sd is None:
+            return
+        target = next(pl_module.parameters()).device
+        for k, v in list(self.ema_sd.items()):
+            if v.device != target:
+                self.ema_sd[k] = v.to(target)
+
     @torch.no_grad()
     def on_train_batch_end(
         self,
@@ -53,6 +64,9 @@ class EMACallback(pl.Callback):
         live = pl_module.state_dict()
         for k, ema_t in self.ema_sd.items():
             new_t = live[k]
+            if ema_t.device != new_t.device:
+                ema_t = ema_t.to(new_t.device)
+                self.ema_sd[k] = ema_t
             if ema_t.dtype.is_floating_point:
                 ema_t.mul_(d).add_(new_t.detach(), alpha=1.0 - d)
             else:
