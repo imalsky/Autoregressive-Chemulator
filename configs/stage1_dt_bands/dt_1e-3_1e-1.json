@@ -92,7 +92,7 @@
     "drop_below": 1e-30
   },
   "dataset": {
-    "windows_per_trajectory": 99,
+    "windows_per_trajectory": 32,
     "preload_to_device": true,
     "shard_cache_size": 2
   },
