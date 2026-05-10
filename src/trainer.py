@@ -37,7 +37,7 @@ Note on "pushforward trick":
 
 from __future__ import annotations
 
-import inspect
+import copy
 import logging
 import math
 import time
@@ -48,11 +48,13 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 
-from model import normalize_dt_shape
+from model import autoregressive_rollout, normalize_dt_shape
 
 from utils import PrecisionConfig, parse_precision_config
 import lightning.pytorch as pl
-from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
+
+from ema_callback import EMACallback
 from lightning.pytorch.loggers import CSVLogger
 from lightning_utilities.core.rank_zero import rank_zero_warn
 
@@ -268,19 +270,8 @@ def _try_torch_compile(fn: Any, *, cfg: Mapping[str, Any], context: str) -> Any:
         log.info("Skipping torch.compile for %s (inductor backend on MPS).", context)
         return fn
 
-    sig = inspect.signature(torch.compile)
-    kwargs: Dict[str, Any] = {}
-    if "backend" in sig.parameters:
-        kwargs["backend"] = backend
-    if "mode" in sig.parameters:
-        kwargs["mode"] = mode
-    if "dynamic" in sig.parameters:
-        kwargs["dynamic"] = dynamic
-    if "fullgraph" in sig.parameters:
-        kwargs["fullgraph"] = fullgraph
-
     try:
-        return torch.compile(fn, **kwargs)  # type: ignore[misc]
+        return torch.compile(fn, backend=backend, mode=mode, dynamic=dynamic, fullgraph=fullgraph)  # type: ignore[misc]
     except Exception as e:
         raise RuntimeError(f"torch.compile failed for {context}: {e}") from e
 
@@ -455,8 +446,9 @@ class FlowMapRolloutModule(pl.LightningModule):
         # UX warnings
         self._warned_metric_mismatch = False
 
-        # Preserve for checkpoint reproducibility
-        self.save_hyperparameters({"training": dict(tcfg), "model": dict(mcfg)})
+        # Preserve for checkpoint reproducibility. Deep-copy so later config mutations
+        # (or Lightning internals) can't alias the live training config.
+        self.save_hyperparameters({"training": copy.deepcopy(dict(tcfg)), "model": copy.deepcopy(dict(mcfg))})
 
     # ------------------------
     # Dataloader wiring
@@ -572,17 +564,9 @@ class FlowMapRolloutModule(pl.LightningModule):
         g: torch.Tensor,      # [B,G]
     ) -> torch.Tensor:
         """Open-loop rollout: feed predictions back in (no teacher forcing)."""
-        B, K = int(dt_bk.shape[0]), int(dt_bk.shape[1])
-        g_t = self._coerce_g(g, B, y0)
-
+        g_t = self._coerce_g(g, int(dt_bk.shape[0]), y0)
         step_fn = self._compiled_forward_step if self._compiled_forward_step is not None else self.model.forward_step  # type: ignore[attr-defined]
-
-        y_pred = torch.empty((B, K, y0.shape[-1]), device=y0.device, dtype=y0.dtype)
-        y_prev = y0
-        for k in range(K):
-            y_prev = step_fn(y_prev, dt_bk[:, k], g_t)  # type: ignore[misc]
-            y_pred[:, k, :] = y_prev
-        return y_pred
+        return autoregressive_rollout(step_fn, y0, dt_bk, g_t)
 
     def _open_loop_unroll_raw_step(
         self,
@@ -596,17 +580,8 @@ class FlowMapRolloutModule(pl.LightningModule):
         This is used when compiling the unroll itself (compile_open_loop_unroll=True) so the
         compiler can see the full step-to-step dependency chain and fuse across steps.
         """
-        B, K = int(dt_bk.shape[0]), int(dt_bk.shape[1])
-        g_t = self._coerce_g(g, B, y0)
-
-        step_fn = self.model.forward_step  # type: ignore[attr-defined]
-
-        y_pred = torch.empty((B, K, y0.shape[-1]), device=y0.device, dtype=y0.dtype)
-        y_prev = y0
-        for k in range(K):
-            y_prev = step_fn(y_prev, dt_bk[:, k], g_t)  # type: ignore[misc]
-            y_pred[:, k, :] = y_prev
-        return y_pred
+        g_t = self._coerce_g(g, int(dt_bk.shape[0]), y0)
+        return autoregressive_rollout(self.model.forward_step, y0, dt_bk, g_t)  # type: ignore[attr-defined]
 
     # ------------------------
     # Manual optimization helpers (autoregressive mode)
@@ -628,7 +603,16 @@ class FlowMapRolloutModule(pl.LightningModule):
 
     def _maybe_step_optimizer(self, opt: torch.optim.Optimizer, batch_idx: int) -> None:
         acc = self._accumulate_grad_batches()
-        is_last = (batch_idx + 1) >= int(getattr(self.trainer, "num_training_batches", batch_idx + 1))
+        n_batches = getattr(self.trainer, "num_training_batches", batch_idx + 1)
+        # num_training_batches can be float('inf') for unsized iterables; fall back to accumulation-only stepping.
+        try:
+            n_batches_f = float(n_batches)
+        except (TypeError, ValueError):
+            n_batches_f = float("inf")
+        if math.isfinite(n_batches_f):
+            is_last = (batch_idx + 1) >= int(n_batches_f)
+        else:
+            is_last = False
         should_step = (((batch_idx + 1) % acc) == 0) or is_last
         if not should_step:
             return
@@ -643,15 +627,15 @@ class FlowMapRolloutModule(pl.LightningModule):
             _plugin.unscale_gradients(torch_opt)
 
         if self.log_grad_norm:
-            gn2 = torch.zeros((), device=self.device, dtype=torch.float32)
-            for pg in torch_opt.param_groups:
-                for p in pg["params"]:
-                    if p.grad is None:
-                        continue
-                    # Cast only the scalar norm to fp32 to avoid allocating a full fp32 gradient copy.
-                    n = p.grad.detach().norm(2).float()
-                    gn2 = gn2 + n * n
-            self.log("grad_norm", torch.sqrt(gn2), on_step=False, on_epoch=True)
+            grads = [p.grad.detach() for pg in torch_opt.param_groups for p in pg["params"] if p.grad is not None]
+            if grads:
+                # torch._foreach_norm is a single fused kernel over the full list, much cheaper than a Python loop.
+                per_tensor = torch._foreach_norm(grads, 2)  # type: ignore[attr-defined]
+                gn2 = torch.zeros((), device=self.device, dtype=torch.float32)
+                for n in per_tensor:
+                    nf = n.float()
+                    gn2 = gn2 + nf * nf
+                self.log("grad_norm", torch.sqrt(gn2), on_step=False, on_epoch=True)
 
         clip_val = getattr(self.trainer, "gradient_clip_val", None)
         if clip_val is not None and float(clip_val) > 0:
@@ -679,6 +663,10 @@ class FlowMapRolloutModule(pl.LightningModule):
             sch.step()
 
     def optimizer_step(self, *args: Any, **kwargs: Any) -> None:
+        # Automatic-optimization path: Lightning already drives step/epoch LR schedulers
+        # (cosine LambdaLR with interval="step", plateau on validation_end). The only
+        # scheduler we must hand-advance is the custom WarmupReduceLROnPlateau's
+        # per-step warmup ramp, which is not driven by either of those mechanisms.
         super().optimizer_step(*args, **kwargs)
         if not self.automatic_optimization:
             return
@@ -1120,6 +1108,10 @@ def build_lightning_trainer(
 
     callbacks: List[pl.Callback] = [LearningRateMonitor(logging_interval="epoch")]
 
+    ema_cfg = tcfg.get("ema", {}) or {}
+    if bool(ema_cfg.get("enabled", False)):
+        callbacks.append(EMACallback(decay=float(ema_cfg.get("decay", 0.9995))))
+
     if enable_ckpt:
         ckpt_dir = work_dir / "checkpoints"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -1132,6 +1124,19 @@ def build_lightning_trainer(
                 mode="min",
                 every_n_epochs=ckpt_every_n_epochs,
                 save_last=save_last,
+            )
+        )
+
+    es_cfg = tcfg.get("early_stopping", {}) or {}
+    if bool(es_cfg.get("enabled", False)):
+        callbacks.append(
+            EarlyStopping(
+                monitor="val_loss",
+                mode="min",
+                patience=int(es_cfg.get("patience", 30)),
+                min_delta=float(es_cfg.get("min_delta", 1e-5)),
+                check_finite=True,
+                verbose=True,
             )
         )
 
