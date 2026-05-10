@@ -1,0 +1,21 @@
+[project]
+name = "auto-chem"
+version = "1.6.0"
+description = "Autoregressive flow-map neural emulator for stiff chemical kinetics in exoplanet atmospheres."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.8.0,<3.0",
+    "lightning>=2.2,<3.0",
+    "numpy>=1.26",
+    "h5py>=3.10",
+    "tqdm>=4.66",
+    "matplotlib>=3.8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "pyflakes",
+    "vulture",
+]

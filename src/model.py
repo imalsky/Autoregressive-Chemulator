@@ -89,6 +89,24 @@ def normalize_dt_shape(
     raise ValueError(f"{context}: unsupported dt shape {dt.shape}.")
 
 
+def prepare_dt_batch(
+        dt_norm: torch.Tensor,
+        batch_size: torch.SymInt,
+        *,
+        context: str,
+        seq_len: Optional[int] = None,
+) -> tuple[torch.Tensor, torch.SymInt]:
+    """Return (dt_bk, K) using the same rules as normalize_dt_shape.
+
+    Replaces the common `infer_seq_len` + `normalize_dt_shape` call pair.
+    """
+    K = infer_seq_len(dt_norm, batch_size, context=context)
+    if seq_len is not None:
+        torch._check(K == seq_len)
+    dt_bk = normalize_dt_shape(dt_norm, batch_size, K, context=context)
+    return dt_bk, K
+
+
 def normalize_dt_step(dt_norm: torch.Tensor, batch_size: torch.SymInt, *, context: str) -> torch.Tensor:
     """Return a single-step dt as shape [B, 1].
 
@@ -148,6 +166,29 @@ def _validate_g_shape(g: torch.Tensor, batch_size: torch.SymInt, global_dim: int
     torch._check(g.ndim == 2)
     torch._check(g.shape[0] == batch_size)
     torch._check(g.shape[1] == global_dim)
+
+
+def autoregressive_rollout(
+        forward_step: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+        y0: torch.Tensor,      # [B, S]
+        dt_bk: torch.Tensor,   # [B, K]
+        g: torch.Tensor,       # [B, G]
+) -> torch.Tensor:
+    """Roll a per-step forward_step K times, feeding predictions back in.
+
+    Shared by FlowMapMLP.forward, FlowMapAutoencoder.forward, and the trainer's
+    open-loop evaluation unroll.
+    """
+    B = y0.shape[0]
+    K = dt_bk.shape[1]
+    S = y0.shape[-1]
+    y_pred = torch.empty(B, K, S, device=y0.device, dtype=y0.dtype)
+    state = y0
+    # Intentionally avoid int(K) to stay export-safe with symbolic K.
+    for t in range(K):
+        state = forward_step(state, dt_bk[:, t], g)
+        y_pred[:, t, :] = state
+    return y_pred
 
 
 # ==============================================================================
@@ -405,12 +446,7 @@ class LatentDynamics(nn.Module):
         """Vectorized per-step prediction (not autoregressive)."""
         torch._check(z.ndim == 2)
         B = z.shape[0]  # Keep as symbolic
-
-        K = infer_seq_len(dt_norm, B, context="LatentDynamics.forward")
-        if seq_len is not None:
-            torch._check(K == seq_len)
-
-        dt = normalize_dt_shape(dt_norm, B, K, context="LatentDynamics.forward")
+        dt, K = prepare_dt_batch(dt_norm, B, context="LatentDynamics.forward", seq_len=seq_len)
 
         z_exp = z.unsqueeze(1).expand(B, K, -1)
         g_exp = g.unsqueeze(1).expand(B, K, -1)
@@ -551,23 +587,10 @@ class FlowMapAutoencoder(nn.Module):
     ) -> torch.Tensor:
         """Autoregressive rollout for K steps."""
         torch._check(y_i.ndim == 2)
-
         B = y_i.shape[0]  # Keep as symbolic
-        S = y_i.shape[1]
         _validate_g_shape(g, B, self.G, context="FlowMapAutoencoder.forward")
-
-        K = infer_seq_len(dt_norm, B, context="FlowMapAutoencoder.forward")
-        if seq_len is not None:
-            torch._check(K == seq_len)
-
-        dt_seq = normalize_dt_shape(dt_norm, B, K, context="FlowMapAutoencoder.forward")
-
-        y_pred = torch.empty(B, K, S, device=y_i.device, dtype=y_i.dtype)
-        state = y_i
-        for t in range(K):
-            state = self.forward_step(state, dt_seq[:, t], g)
-            y_pred[:, t, :] = state
-        return y_pred
+        dt_seq, _ = prepare_dt_batch(dt_norm, B, context="FlowMapAutoencoder.forward", seq_len=seq_len)
+        return autoregressive_rollout(self.forward_step, y_i, dt_seq, g)
 
 
 class FlowMapMLP(nn.Module):
@@ -635,23 +658,10 @@ class FlowMapMLP(nn.Module):
     ) -> torch.Tensor:
         """Autoregressive rollout for K steps."""
         torch._check(y_i.ndim == 2)
-
         B = y_i.shape[0]  # Keep as symbolic
-        S = y_i.shape[1]
         _validate_g_shape(g, B, self.G, context="FlowMapMLP.forward")
-
-        K = infer_seq_len(dt_norm, B, context="FlowMapMLP.forward")
-        if seq_len is not None:
-            torch._check(K == seq_len)
-
-        dt_seq = normalize_dt_shape(dt_norm, B, K, context="FlowMapMLP.forward")
-
-        y_pred = torch.empty(B, K, S, device=y_i.device, dtype=y_i.dtype)
-        state = y_i
-        for t in range(K):
-            state = self.forward_step(state, dt_seq[:, t], g)
-            y_pred[:, t, :] = state
-        return y_pred
+        dt_seq, _ = prepare_dt_batch(dt_norm, B, context="FlowMapMLP.forward", seq_len=seq_len)
+        return autoregressive_rollout(self.forward_step, y_i, dt_seq, g)
 
 
 # ==============================================================================

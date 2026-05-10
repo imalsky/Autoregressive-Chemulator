@@ -20,7 +20,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Union
+from typing import Any, Dict, Mapping, Optional, Union
 
 import torch
 
@@ -128,16 +128,55 @@ def parse_torch_dtype(value: Any, *, key: str) -> torch.dtype:
     return _ALLOWED_DTYPES[name]
 
 
-def _require(mapping: Mapping[str, Any], key: str) -> Any:
+def require(mapping: Mapping[str, Any], key: str) -> Any:
     if key not in mapping:
         raise KeyError(f"missing: {key}")
     return mapping[key]
 
 
-def _as_str(value: Any, key: str) -> str:
+def require_dict(mapping: Mapping[str, Any], key: str) -> Dict[str, Any]:
+    val = require(mapping, key)
+    if not isinstance(val, dict):
+        raise TypeError(f"bad type: {key}")
+    return val
+
+
+def require_dotted(mapping: Mapping[str, Any], dotted_key: str) -> Any:
+    cur: Any = mapping
+    for part in dotted_key.split("."):
+        if not isinstance(cur, Mapping) or part not in cur:
+            raise KeyError(f"missing: {dotted_key}")
+        cur = cur[part]
+    return cur
+
+
+def as_str(value: Any, key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise TypeError(f"bad type: {key}")
     return value.strip()
+
+
+def as_int(value: Any, key: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"bad type: {key}")
+    return int(value)
+
+
+def as_bool(value: Any, key: str) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f"bad type: {key}")
+    return bool(value)
+
+
+def as_opt_int(value: Any, key: str) -> "Optional[int]":
+    if value is None:
+        return None
+    return as_int(value, key)
+
+
+# Internal aliases preserved for this module's own use.
+_require = require
+_as_str = as_str
 
 
 @dataclass(frozen=True)

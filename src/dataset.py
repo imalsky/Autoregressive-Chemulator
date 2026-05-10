@@ -49,6 +49,7 @@ that samples from the preloaded tensors and yields pre-batched tensors.
 from __future__ import annotations
 
 import json
+import logging
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,6 +61,8 @@ from numpy.lib import format as npy_format
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset, get_worker_info
+
+_log = logging.getLogger(__name__)
 
 
 _DT_PROBE_MAX = 1024
@@ -92,8 +95,13 @@ def _npz_read_array_header(path: Path, *, key: str) -> Tuple[Tuple[int, ...], np
                     shape, fortran_order, dtype = npy_format._read_array_header(f, ver)
         shape_t = tuple(int(s) for s in shape)
         return shape_t, np.dtype(dtype), bool(fortran_order)
-    except Exception:
+    except Exception as e:
         # Fallback for unusual containers: materialize via NumPy (slow).
+        _log.warning(
+            "NPZ header probe failed for %s:%s (%s); falling back to full np.load. "
+            "This decompresses the whole shard — consider regenerating shards.",
+            path, key, e,
+        )
         with np.load(path) as z:
             arr = z[key]
         return tuple(int(s) for s in arr.shape), arr.dtype, bool(arr.flags["F_CONTIGUOUS"])
@@ -139,7 +147,12 @@ def _npz_read_row0_prefix(path: Path, *, key: str, max_elems: int) -> np.ndarray
                 if len(buf) != nbytes:
                     raise ValueError(f"Truncated member {inner} in {path}")
                 return np.frombuffer(buf, dtype=dt, count=take_eff)
-    except Exception:
+    except Exception as e:
+        _log.warning(
+            "NPZ row0 probe failed for %s:%s (%s); falling back to full np.load. "
+            "This decompresses the whole shard — consider regenerating shards.",
+            path, key, e,
+        )
         with np.load(path) as z:
             arr = z[key]
         if arr.ndim != 2:

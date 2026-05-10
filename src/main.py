@@ -40,12 +40,20 @@ from lightning.pytorch import seed_everything
 from dataset import FlowMapRolloutDataset, create_dataloader
 from model import create_model
 from trainer import FlowMapRolloutModule, build_lightning_trainer
-from utils import PrecisionConfig, atomic_write_json, ensure_dir, load_json_config, parse_precision_config
-
-# Prefer fast matmul where supported.
-torch.set_float32_matmul_precision("high")
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+from utils import (
+    PrecisionConfig,
+    as_bool,
+    as_int,
+    as_opt_int,
+    as_str,
+    atomic_write_json,
+    ensure_dir,
+    load_json_config,
+    parse_precision_config,
+    require,
+    require_dict,
+    require_dotted,
+)
 
 log = logging.getLogger(__name__)
 
@@ -178,6 +186,13 @@ _OPTIONAL_CONFIG_KEYS: Tuple[str, ...] = (
     "training.scheduler.min_lr",
     "training.scheduler.mode",
     "training.scheduler.monitor",
+    # EMA of weights (Lightning callback wired in trainer.py).
+    "training.ema.enabled",
+    "training.ema.decay",
+    # Early stopping (Lightning callback wired in trainer.py).
+    "training.early_stopping.enabled",
+    "training.early_stopping.patience",
+    "training.early_stopping.min_delta",
 )
 
 # Mapping keys under these dotted paths are dynamic (validated elsewhere).
@@ -187,54 +202,16 @@ _OPEN_MAP_CONFIG_KEYS: Tuple[str, ...] = (
 
 
 # ==============================================================================
-# Small strict helpers
+# Small strict helpers (imported from utils; local aliases kept for brevity)
 # ==============================================================================
 
-
-def _require(mapping: Mapping[str, Any], key: str) -> Any:
-    if key not in mapping:
-        raise KeyError(f"missing: {key}")
-    return mapping[key]
-
-
-def _require_dict(mapping: Mapping[str, Any], key: str) -> Dict[str, Any]:
-    val = _require(mapping, key)
-    if not isinstance(val, dict):
-        raise TypeError(f"bad type: {key}")
-    return val
-
-
-def _as_int(val: Any, key: str) -> int:
-    if isinstance(val, bool) or not isinstance(val, int):
-        raise TypeError(f"bad type: {key}")
-    return int(val)
-
-
-def _as_bool(val: Any, key: str) -> bool:
-    if not isinstance(val, bool):
-        raise TypeError(f"bad type: {key}")
-    return bool(val)
-
-
-def _as_str(val: Any, key: str) -> str:
-    if not isinstance(val, str) or not val.strip():
-        raise TypeError(f"bad type: {key}")
-    return val.strip()
-
-
-def _as_opt_int(val: Any, key: str) -> Optional[int]:
-    if val is None:
-        return None
-    return _as_int(val, key)
-
-
-def _require_dotted(mapping: Mapping[str, Any], dotted_key: str) -> Any:
-    cur: Any = mapping
-    for part in dotted_key.split("."):
-        if not isinstance(cur, Mapping) or part not in cur:
-            raise KeyError(f"missing: {dotted_key}")
-        cur = cur[part]
-    return cur
+_require = require
+_require_dict = require_dict
+_as_int = as_int
+_as_bool = as_bool
+_as_str = as_str
+_as_opt_int = as_opt_int
+_require_dotted = require_dotted
 
 
 def _build_allowed_config_prefixes() -> set[str]:
@@ -280,6 +257,7 @@ def validate_required_config_keys(cfg: Mapping[str, Any]) -> None:
         _require_dotted(cfg, key)
     _validate_no_unknown_config_keys(cfg)
     _validate_scheduler_config(cfg)
+    _validate_runtime_constraints(cfg)
 
 
 def _validate_scheduler_config(cfg: Mapping[str, Any]) -> None:
@@ -297,6 +275,45 @@ def _validate_scheduler_config(cfg: Mapping[str, Any]) -> None:
         return
 
     raise ValueError("bad training.scheduler.type")
+
+
+def _validate_runtime_constraints(cfg: Mapping[str, Any]) -> None:
+    # Single-device, no-accumulation invariants. The autoregressive manual-optimization
+    # path in trainer.py was never validated against DDP or grad accumulation.
+    runtime = _require_dict(cfg, "runtime")
+
+    accum = runtime.get("accumulate_grad_batches")
+    if accum != 1:
+        raise ValueError(
+            "runtime.accumulate_grad_batches must be 1 (gradient accumulation is unsupported)"
+        )
+
+    devices = runtime.get("devices")
+    if devices not in ("auto", 1):
+        raise ValueError(
+            'runtime.devices must be "auto" or 1 (multi-GPU is unsupported)'
+        )
+
+    strategy = runtime.get("strategy")
+    if strategy != "auto":
+        raise ValueError(
+            'runtime.strategy must be "auto" (DDP / multi-process strategies are unsupported)'
+        )
+
+
+def _apply_compute_globals(cfg: Mapping[str, Any]) -> None:
+    # TF32 must be off when runtime.deterministic=True; otherwise the user's reproducibility
+    # contract is silently broken regardless of Lightning's deterministic flag.
+    runtime = _require_dict(cfg, "runtime")
+    deterministic = _as_bool(_require(runtime, "deterministic"), "runtime.deterministic")
+    if deterministic:
+        torch.set_float32_matmul_precision("highest")
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    else:
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
 
 def _repo_root(cfg_path: Path) -> Path:
@@ -604,17 +621,23 @@ def create_dataloaders(
 
 
 def _load_weights_only(module: torch.nn.Module, ckpt_path: Path, *, strict: bool) -> None:
-    """Load Lightning checkpoint weights only (no optimizer/scheduler state)."""
+    """Load Lightning checkpoint weights only (no optimizer/scheduler state).
+
+    Prefers ``ema_state_dict`` when present (saved by EMACallback) since it
+    holds the smoothed weights that produced the checkpoint's val_loss.
+    """
     if not ckpt_path.exists():
         raise FileNotFoundError("ckpt not found")
 
     obj = torch.load(str(ckpt_path), map_location="cpu")
     if not isinstance(obj, dict):
         raise TypeError("bad ckpt")
-    if "state_dict" not in obj:
-        raise KeyError("missing state_dict")
 
-    state_dict = obj["state_dict"]
+    state_dict = obj.get("ema_state_dict")
+    if not (isinstance(state_dict, dict) and state_dict):
+        if "state_dict" not in obj:
+            raise KeyError("missing state_dict")
+        state_dict = obj["state_dict"]
     if not isinstance(state_dict, dict):
         raise TypeError("bad state_dict")
 
@@ -635,6 +658,7 @@ def main() -> None:
 
     cfg = resolve_paths(cfg, cfg_path)
     configure_logging(cfg)
+    _apply_compute_globals(cfg)
 
     # Required top-level sections (strict).
     tcfg = _require_dict(cfg, "training")
@@ -660,7 +684,12 @@ def main() -> None:
     # Resume mode allows non-empty work_dir (continuing in same directory).
     if ckpt_mode != "resume":
         if work_dir.exists() and any(work_dir.iterdir()):
-            raise RuntimeError("work_dir not empty")
+            raise RuntimeError(
+                f"work_dir not empty: {work_dir}. "
+                "Fresh training (checkpoint_mode != 'resume') requires an empty directory. "
+                "Either clear/move its contents, point paths.work_dir elsewhere, or set "
+                "training.checkpoint_mode='resume' to continue in-place."
+            )
     ensure_dir(work_dir)
 
     processed_dir = Path(_as_str(_require(paths, "processed_dir"), "paths.processed_dir")).expanduser().resolve()

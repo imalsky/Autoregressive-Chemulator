@@ -1,0 +1,282 @@
+#!/bin/bash
+#PBS -N AUTOCHEM_S2
+#PBS -q gpu_long
+#PBS -W group_list=s2458
+#PBS -l select=1:ncpus=72:ngpus=1:mem=400gb:model=gh200
+#PBS -l walltime=72:00:00
+#PBS -j oe
+#PBS -m abe
+
+set -euo pipefail
+
+cd -P "${PROJECT_ROOT:-${PBS_O_WORKDIR:?}}"
+PROJECT_ROOT="$(pwd -P)"
+
+readonly BAND_NAMES=(
+  "dt_1e-3_1e-1"
+  "dt_1e-1_1e1"
+  "dt_1e1_1e3"
+  "dt_1e3_1e5"
+)
+readonly CONFIG_DIR="${PROJECT_ROOT}/configs/stage2_dt_bands"
+readonly THREADS_PER_JOB=16
+readonly RUN_ID="${PBS_JOBID:-manual_$(date +%Y%m%d_%H%M%S)}"
+readonly LOG_DIR="${PROJECT_ROOT}/logs"
+RUN_PYTHON_JOB_PID=""
+
+log() {
+  printf '[%(%Y-%m-%dT%H:%M:%S%z)T] %s\n' -1 "$*"
+}
+
+fail() {
+  log "ERROR: $*"
+  exit 1
+}
+
+wait_for_jobs() {
+  local phase="$1"
+  shift
+  local failed=0
+  local job_spec name pid
+
+  for job_spec in "$@"; do
+    name="${job_spec%%:*}"
+    pid="${job_spec##*:}"
+    if wait "${pid}"; then
+      log "${phase} completed for ${name}"
+    else
+      log "${phase} failed for ${name}; see ${LOG_DIR}/${RUN_ID}_${phase}_${name}.log"
+      failed=1
+    fi
+  done
+
+  if [ "${failed}" -ne 0 ]; then
+    fail "${phase} phase failed"
+  fi
+}
+
+resolve_config_path() {
+  local config_path="$1"
+  local key="$2"
+
+  python - "${config_path}" "${key}" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+config_path = Path(sys.argv[1])
+key = sys.argv[2]
+with config_path.open() as f:
+    config = json.load(f)
+
+resolved = Path(config["paths"][key])
+if not resolved.is_absolute():
+    resolved = config_path.parent / resolved
+
+print(resolved.resolve())
+PY
+}
+
+resolve_runtime_checkpoint() {
+  local config_path="$1"
+
+  python - "${config_path}" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+config_path = Path(sys.argv[1])
+with config_path.open() as f:
+    config = json.load(f)
+
+ckpt = config.get("runtime", {}).get("checkpoint")
+if not isinstance(ckpt, str) or not ckpt:
+    raise SystemExit(f"runtime.checkpoint must be a non-empty string in {config_path}")
+
+resolved = Path(ckpt)
+if not resolved.is_absolute():
+    resolved = config_path.parent / resolved
+
+print(resolved.resolve())
+PY
+}
+
+run_python_job() {
+  local config_path="$1"
+  local log_path="$2"
+  (
+    cd "${PROJECT_ROOT}"
+    export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}${BASE_PYTHONPATH:+:${BASE_PYTHONPATH}}"
+    export AUTOCHEM_CONFIG_PATH="${config_path}"
+    python -u src/main.py
+  ) >"${log_path}" 2>&1 &
+  RUN_PYTHON_JOB_PID="$!"
+}
+
+validate_stage1_checkpoint() {
+  local config_path="$1"
+  local ckpt_path
+  ckpt_path="$(resolve_runtime_checkpoint "${config_path}")"
+
+  if [ ! -f "${ckpt_path}" ]; then
+    fail "stage-1 checkpoint missing for $(basename "${config_path}"): ${ckpt_path}"
+  fi
+  log "validated stage-1 checkpoint: ${ckpt_path}"
+}
+
+validate_training_input() {
+  local config_path="$1"
+  local processed_dir
+  processed_dir="$(resolve_config_path "${config_path}" "processed_dir")"
+
+  python - "${processed_dir}" <<'PY'
+from pathlib import Path
+import sys
+
+processed_dir = Path(sys.argv[1])
+
+required_files = (
+    processed_dir / "normalization.json",
+    processed_dir / "preprocessing_summary.json",
+)
+for path in required_files:
+    if not path.is_file():
+        raise SystemExit(f"missing required preprocessing artifact: {path}")
+
+split_files = {}
+total_bytes = 0
+for split in ("train", "validation", "test"):
+    split_dir = processed_dir / split
+    files = sorted(split_dir.glob("*.npz")) if split_dir.is_dir() else []
+    split_files[split] = files
+    total_bytes += sum(path.stat().st_size for path in files)
+
+if not split_files["train"]:
+    raise SystemExit(f"train split is empty: {processed_dir / 'train'}")
+if not split_files["validation"]:
+    raise SystemExit(f"validation split is empty: {processed_dir / 'validation'}")
+
+print(
+    f"validated training input: total_bytes={total_bytes} "
+    f"train_files={len(split_files['train'])} "
+    f"validation_files={len(split_files['validation'])} "
+    f"test_files={len(split_files['test'])}"
+)
+PY
+}
+
+validate_training_target() {
+  local config_path="$1"
+  local work_dir
+  work_dir="$(resolve_config_path "${config_path}" "work_dir")"
+
+  python - "${work_dir}" <<'PY'
+from pathlib import Path
+import sys
+
+work_dir = Path(sys.argv[1])
+if work_dir.exists() and any(work_dir.iterdir()):
+    raise SystemExit(f"training target exists and is not empty: {work_dir}")
+
+print(f"validated empty training target: {work_dir}")
+PY
+}
+
+validate_training_output() {
+  local config_path="$1"
+  local work_dir
+  work_dir="$(resolve_config_path "${config_path}" "work_dir")"
+
+  python - "${work_dir}" <<'PY'
+from pathlib import Path
+import sys
+
+work_dir = Path(sys.argv[1])
+required = (
+    work_dir / "config.resolved.json",
+    work_dir / "metrics.csv",
+)
+for path in required:
+    if not path.is_file():
+        raise SystemExit(f"missing required training artifact: {path}")
+
+ckpt_dir = work_dir / "checkpoints"
+ckpts = sorted(ckpt_dir.glob("*.ckpt")) if ckpt_dir.is_dir() else []
+if not ckpts:
+    raise SystemExit(f"no checkpoints found in {ckpt_dir}")
+
+print(f"validated training output: checkpoints={len(ckpts)} work_dir={work_dir}")
+PY
+}
+
+# ---- Conda (match the working run.pbs approach) ----
+module purge
+module use -a /swbuild/analytix/tools/modulefiles
+module load miniconda3/gh2
+
+CONDA_BASE="$(conda info --base)"
+# shellcheck disable=SC1090
+source "${CONDA_BASE}/etc/profile.d/conda.sh"
+
+CONDA_ENV="${CONDA_ENV:-pyt2_8_gh}"
+set +e
+conda activate "${CONDA_ENV}"
+rc=$?
+set -e
+if [ "${rc}" -ne 0 ]; then
+  echo "ERROR: failed to activate conda env: ${CONDA_ENV}"
+  echo "Available envs are:"
+  conda info --envs || true
+  exit 2
+fi
+
+# Remove the incompatible x86 version
+pip uninstall -y h5py || true
+
+# Install the correct ARM version for GH200 (force no cache to avoid picking up the old file)
+pip install h5py --no-cache-dir
+
+mkdir -p "${LOG_DIR}" "${PROJECT_ROOT}/data" "${PROJECT_ROOT}/models"
+
+export HDF5_USE_FILE_LOCKING=FALSE
+export OMP_NUM_THREADS="${THREADS_PER_JOB}"
+export MKL_NUM_THREADS="${THREADS_PER_JOB}"
+export OPENBLAS_NUM_THREADS="${THREADS_PER_JOB}"
+export NUMEXPR_NUM_THREADS="${THREADS_PER_JOB}"
+export PYTHONUNBUFFERED=1
+BASE_PYTHONPATH="${PYTHONPATH:-}"
+
+declare -A BAND_CONFIGS=()
+
+for band in "${BAND_NAMES[@]}"; do
+  config_path="${CONFIG_DIR}/${band}.json"
+  [ -f "${config_path}" ] || fail "missing band config: ${config_path}"
+  BAND_CONFIGS["${band}"]="${config_path}"
+done
+
+# ---- Validate stage-1 checkpoints + preprocessing artifacts, then parallel training ----
+declare -a train_jobs=()
+
+for band in "${BAND_NAMES[@]}"; do
+  config_path="${BAND_CONFIGS[$band]}"
+  validate_stage1_checkpoint "${config_path}"
+  validate_training_input "${config_path}"
+  validate_training_target "${config_path}"
+done
+
+log "launching parallel stage-2 training for ${#BAND_NAMES[@]} bands"
+for band in "${BAND_NAMES[@]}"; do
+  config_path="${BAND_CONFIGS[$band]}"
+  log_path="${LOG_DIR}/${RUN_ID}_train_${band}.log"
+  run_python_job "${config_path}" "${log_path}"
+  pid="${RUN_PYTHON_JOB_PID}"
+  train_jobs+=( "${band}:${pid}" )
+done
+wait_for_jobs "train" "${train_jobs[@]}"
+
+for band in "${BAND_NAMES[@]}"; do
+  config_path="${BAND_CONFIGS[$band]}"
+  validate_training_output "${config_path}"
+done
+
+log "all ${#BAND_NAMES[@]} stage-2 dt-band training jobs completed successfully"

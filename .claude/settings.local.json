@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /Users/imalsky/Desktop/Emulators/Auto-Chem ls-files models_old)",
+      "Bash(git -C /Users/imalsky/Desktop/Emulators/Auto-Chem check-ignore models_old/)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(python *)"
+    ]
+  }
+}
