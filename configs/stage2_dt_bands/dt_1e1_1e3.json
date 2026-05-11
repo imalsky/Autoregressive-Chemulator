@@ -99,7 +99,7 @@
   "model": {
     "type": "mlp",
     "activation": "silu",
-    "dropout": 0.01,
+    "dropout": 0.0,
     "layer_norm": true,
     "layer_norm_eps": 1e-05,
     "predict_delta": true,
@@ -132,7 +132,7 @@
     "optimizer": {
       "name": "adamw",
       "lr": 2e-05,
-      "weight_decay": 0.0001,
+      "weight_decay": 0.005,
       "exclude_norm_and_bias_from_weight_decay": true,
       "betas": [0.9, 0.999],
       "eps": 1e-08,
