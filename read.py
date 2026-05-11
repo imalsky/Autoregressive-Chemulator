@@ -307,6 +307,31 @@ def _first_existing(header_set: set, keys: Sequence[str]) -> Optional[str]:
     return None
 
 
+def _pick_lr_col(header_set: set) -> Optional[str]:
+    """Find the per-epoch learning-rate column logged by Lightning.
+
+    Lightning's LearningRateMonitor names the column based on the scheduler's
+    `name` field, the optimizer class, and the number of param groups, so the
+    actual header varies between runs: bare `lr`, `lr/pg1`, `lr-AdamW`, etc.
+    """
+    for name in ("lr", "lr/pg1", "lr-AdamW", "lr-Adam", "lr-SGD"):
+        if name in header_set:
+            return name
+    for name in header_set:
+        if name == "lr" or name.startswith("lr/") or name.startswith("lr-"):
+            return name
+    return None
+
+
+def _latest_non_null(rows: Sequence[Dict[str, Any]], key: str) -> Any:
+    """Return the most recent non-null value for `key` across rows."""
+    for r in reversed(rows):
+        v = r.get(key)
+        if v is not None:
+            return v
+    return None
+
+
 # ----------------------------
 # summaries (concise)
 # ----------------------------
@@ -413,8 +438,10 @@ def _train_summary(cfg: Dict[str, Any]) -> str:
 # ----------------------------
 
 
-def _select_table_cols(header: Sequence[str], max_cols: int = 8) -> List[str]:
+def _select_table_cols(header: Sequence[str], max_cols: int = 9) -> List[str]:
     header_set = set(header)
+
+    lr_col = _pick_lr_col(header_set)
 
     priority = [
         "epoch",
@@ -424,8 +451,10 @@ def _select_table_cols(header: Sequence[str], max_cols: int = 8) -> List[str]:
         "val_loss_log10_mae",
         "val_loss_z_mse",
         "epoch_time_sec",
-        "lr/pg1",
-        "lr",
+    ]
+    if lr_col is not None:
+        priority.append(lr_col)
+    priority += [
         "test_loss",
         "test_loss_log10_mae",
     ]
@@ -569,9 +598,17 @@ def main() -> int:
     cfg = _read_json(cfg_path)
 
     header = _union_header(rows)
-    cols = _select_table_cols(header, max_cols=8)
+    cols = _select_table_cols(header, max_cols=9)
 
     last = rows[-1]
+    lr_col = _pick_lr_col(set(header))
+    if lr_col is not None and last.get(lr_col) is None:
+        # Coalesce can leave the final row missing lr if Lightning split that
+        # epoch into train/val phases; backfill from the most recent non-null.
+        fallback = _latest_non_null(rows, lr_col)
+        if fallback is not None:
+            last = dict(last)
+            last[lr_col] = fallback
 
     print(_pipes([f"run={run_dir.name}", f"metrics={metrics_path.parent.name}/{metrics_path.name}"]))
 

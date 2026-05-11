@@ -282,7 +282,7 @@
       ">1: needs autoregressive enabled"
     ],
     "batch_size": 8192,
-    "max_epochs": 1000,
+    "max_epochs": 125,
     "checkpoint_mode": "none",
     "num_workers": 4,
     "pin_memory": true,

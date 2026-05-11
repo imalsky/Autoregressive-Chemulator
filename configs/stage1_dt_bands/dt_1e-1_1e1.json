@@ -99,7 +99,7 @@
   "model": {
     "type": "mlp",
     "activation": "silu",
-    "dropout": 0.01,
+    "dropout": 0.0,
     "layer_norm": true,
     "layer_norm_eps": 1e-05,
     "predict_delta": true,
@@ -118,7 +118,7 @@
   },
   "training": {
     "batch_size": 2048,
-    "max_epochs": 1000,
+    "max_epochs": 125,
     "checkpoint_mode": "none",
     "num_workers": 0,
     "pin_memory": true,
@@ -132,7 +132,7 @@
     "optimizer": {
       "name": "adamw",
       "lr": 0.0001,
-      "weight_decay": 0.0001,
+      "weight_decay": 0.005,
       "exclude_norm_and_bias_from_weight_decay": true,
       "betas": [0.9, 0.999],
       "eps": 1e-08,
