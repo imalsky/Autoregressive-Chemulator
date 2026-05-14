@@ -13,10 +13,10 @@ cd -P "${PROJECT_ROOT:-${PBS_O_WORKDIR:?}}"
 PROJECT_ROOT="$(pwd -P)"
 
 readonly BAND_NAMES=(
-  "dt_1e-3_1e-1"
-  "dt_1e-1_1e1"
-  "dt_1e1_1e3"
-  "dt_1e3_1e5"
+  "dt_1e-2_1e0"
+  "dt_1e0_1e2"
+  "dt_1e2_1e4"
+  "dt_1e4_1e6"
 )
 readonly CONFIG_DIR="${PROJECT_ROOT}/configs/stage2_dt_bands"
 readonly THREADS_PER_JOB=16

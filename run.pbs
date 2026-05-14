@@ -13,15 +13,16 @@ cd -P "${PROJECT_ROOT:-${PBS_O_WORKDIR:?}}"
 PROJECT_ROOT="$(pwd -P)"
 
 readonly BAND_NAMES=(
-  "dt_1e-3_1e-1"
-  "dt_1e-1_1e1"
-  "dt_1e1_1e3"
-  "dt_1e3_1e5"
+  "dt_1e-2_1e0"
+  "dt_1e0_1e2"
+  "dt_1e2_1e4"
+  "dt_1e4_1e6"
 )
 readonly CONFIG_DIR="${PROJECT_ROOT}/configs/stage1_dt_bands"
 readonly THREADS_PER_JOB=16
 readonly RUN_ID="${PBS_JOBID:-manual_$(date +%Y%m%d_%H%M%S)}"
 readonly LOG_DIR="${PROJECT_ROOT}/logs"
+readonly RUNTIME_CFG_DIR="${LOG_DIR}/_runtime"
 RUN_PYTHON_JOB_PID=""
 
 log() {
@@ -130,20 +131,53 @@ print(
 PY
 }
 
-validate_training_target() {
-  local config_path="$1"
-  local work_dir
-  work_dir="$(resolve_config_path "${config_path}" "work_dir")"
+prepare_band_config() {
+  # Decide between fresh and resume launch for a single band.
+  # On resume, writes a rewritten config to RUNTIME_CFG_DIR with checkpoint_mode=resume
+  # and runtime.checkpoint set to the absolute path of last.ckpt.
+  # On fresh, validates that work_dir is empty (or absent) and uses the canonical config.
+  # Echoes the path to the config that should be used for training.
+  local band="$1"
+  local canonical_config="$2"
+  local runtime_dir="$3"
 
-  python - "${work_dir}" <<'PY'
+  python - "${band}" "${canonical_config}" "${runtime_dir}" <<'PY'
 from pathlib import Path
+import json
 import sys
 
-work_dir = Path(sys.argv[1])
-if work_dir.exists() and any(work_dir.iterdir()):
-    raise SystemExit(f"training target exists and is not empty: {work_dir}")
+band, canonical_path, runtime_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+canonical_path = Path(canonical_path)
+runtime_dir = Path(runtime_dir)
+runtime_dir.mkdir(parents=True, exist_ok=True)
 
-print(f"validated empty training target: {work_dir}")
+with canonical_path.open() as f:
+    cfg = json.load(f)
+
+work_dir = Path(cfg["paths"]["work_dir"])
+if not work_dir.is_absolute():
+    work_dir = (canonical_path.parent / work_dir).resolve()
+
+last_ckpt = work_dir / "checkpoints" / "last.ckpt"
+
+if last_ckpt.is_file():
+    # Resume: rewrite a copy of the config.
+    cfg["training"]["checkpoint_mode"] = "resume"
+    cfg.setdefault("runtime", {})["checkpoint"] = str(last_ckpt.resolve())
+    out_path = runtime_dir / f"{band}.resume.json"
+    with out_path.open("w") as f:
+        json.dump(cfg, f, indent=2)
+    print(f"RESUME {band}: last.ckpt={last_ckpt} -> {out_path}", file=sys.stderr)
+    print(out_path)
+else:
+    # Fresh: work_dir must be empty (or absent).
+    if work_dir.exists() and any(work_dir.iterdir()):
+        raise SystemExit(
+            f"fresh-launch precondition failed for band {band}: work_dir not empty and no "
+            f"last.ckpt to resume from: {work_dir}. Clear it or restore last.ckpt."
+        )
+    print(f"FRESH  {band}: work_dir={work_dir} -> {canonical_path}", file=sys.stderr)
+    print(canonical_path)
 PY
 }
 
@@ -201,7 +235,7 @@ pip uninstall -y h5py || true
 # Install the correct ARM version for GH200 (force no cache to avoid picking up the old file)
 pip install h5py --no-cache-dir
 
-mkdir -p "${LOG_DIR}" "${PROJECT_ROOT}/data" "${PROJECT_ROOT}/models"
+mkdir -p "${LOG_DIR}" "${RUNTIME_CFG_DIR}" "${PROJECT_ROOT}/data" "${PROJECT_ROOT}/models"
 
 export HDF5_USE_FILE_LOCKING=FALSE
 export OMP_NUM_THREADS="${THREADS_PER_JOB}"
@@ -219,20 +253,25 @@ for band in "${BAND_NAMES[@]}"; do
   BAND_CONFIGS["${band}"]="${config_path}"
 done
 
-# ---- Validate existing preprocessing output, then parallel training ----
+# ---- Validate preprocessing input, prepare per-band launch config, then parallel training ----
+declare -A LAUNCH_CONFIGS=()
 declare -a train_jobs=()
 
 for band in "${BAND_NAMES[@]}"; do
   config_path="${BAND_CONFIGS[$band]}"
   validate_training_input "${config_path}"
-  validate_training_target "${config_path}"
+  # prepare_band_config emits the launch-config path on stdout (canonical for fresh,
+  # rewritten resume copy for restart). Diagnostic logs go to stderr.
+  launch_path="$(prepare_band_config "${band}" "${config_path}" "${RUNTIME_CFG_DIR}")"
+  LAUNCH_CONFIGS["${band}"]="${launch_path}"
+  log "prepared band ${band}: ${launch_path}"
 done
 
 log "launching parallel stage-1 training for ${#BAND_NAMES[@]} bands"
 for band in "${BAND_NAMES[@]}"; do
-  config_path="${BAND_CONFIGS[$band]}"
+  launch_path="${LAUNCH_CONFIGS[$band]}"
   log_path="${LOG_DIR}/${RUN_ID}_train_${band}.log"
-  run_python_job "${config_path}" "${log_path}"
+  run_python_job "${launch_path}" "${log_path}"
   pid="${RUN_PYTHON_JOB_PID}"
   train_jobs+=( "${band}:${pid}" )
 done
