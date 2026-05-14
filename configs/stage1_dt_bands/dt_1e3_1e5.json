@@ -10,8 +10,8 @@
   },
   "paths": {
     "raw_dir": "../../data/raw",
-    "processed_dir": "../../data/processed_dt_1e2_1e4",
-    "work_dir": "../../models/v4_dt_1e2_1e4"
+    "processed_dir": "../../data/processed_dt_1e3_1e5",
+    "work_dir": "../../models/v4_dt_1e3_1e5"
   },
   "system": {
     "device": "cpu",
@@ -74,8 +74,8 @@
   },
   "preprocessing": {
     "raw_file_patterns": ["*.h5", "*.hdf5"],
-    "dt_min": 100.0,
-    "dt_max": 10000.0,
+    "dt_min": 1000.0,
+    "dt_max": 100000.0,
     "dt_sampling": "loguniform",
     "n_steps": 100,
     "t_min": 0.0,
