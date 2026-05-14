@@ -241,26 +241,49 @@ def _coalesce_by_epoch(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     Lightning CSVLogger can write multiple rows per epoch (train-phase vs val-phase).
     Coalesce rows by epoch by taking the last non-null value per key.
     Output: one row per epoch (in epoch order of first appearance).
+
+    Some rows have no `epoch` value because they are emitted on step boundaries
+    (notably LearningRateMonitor with `logging_interval="epoch"`, which logs at
+    the start of each training epoch before the epoch field is filled in). We
+    stash their fields in `pending` and attach them to the next epoch row; any
+    trailing pending fields (e.g. a final LR row after the last epoch) get
+    attached to the last epoch row so they still appear in the output.
     """
     merged: "OrderedDict[int, Dict[str, Any]]" = OrderedDict()
+    pending: Dict[str, Any] = {}
 
     for r in rows:
         ep = r.get("epoch")
         if isinstance(ep, float):
             ep = int(ep)
         if not isinstance(ep, int):
+            for k, v in r.items():
+                if k == "epoch" or v is None:
+                    continue
+                pending[k] = v
             continue
 
         if ep not in merged:
             merged[ep] = {"epoch": ep}
 
         dst = merged[ep]
+        if pending:
+            for k, v in pending.items():
+                dst[k] = v
+            pending.clear()
         for k, v in r.items():
             if k == "epoch":
                 continue
             if v is None:
                 continue
             dst[k] = v
+
+    if pending and merged:
+        last_ep = next(reversed(merged))
+        last = merged[last_ep]
+        for k, v in pending.items():
+            if k not in last:
+                last[k] = v
 
     return list(merged.values())
 

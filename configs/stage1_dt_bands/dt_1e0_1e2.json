@@ -10,8 +10,8 @@
   },
   "paths": {
     "raw_dir": "../../data/raw",
-    "processed_dir": "../../data/processed_dt_1e3_1e5",
-    "work_dir": "../../models/3"
+    "processed_dir": "../../data/processed_dt_1e0_1e2",
+    "work_dir": "../../models/v4_dt_1e0_1e2"
   },
   "system": {
     "device": "cpu",
@@ -39,11 +39,11 @@
     "torch_compile": {
       "enabled": true,
       "backend": "inductor",
-      "mode": "reduce-overhead",
+      "mode": "default",
       "dynamic": false,
       "fullgraph": true,
       "compile_forward_step": true,
-      "compile_open_loop_unroll": false
+      "compile_open_loop_unroll": true
     }
   },
   "data": {
@@ -74,8 +74,8 @@
   },
   "preprocessing": {
     "raw_file_patterns": ["*.h5", "*.hdf5"],
-    "dt_min": 1000.0,
-    "dt_max": 100000.0,
+    "dt_min": 1.0,
+    "dt_max": 100.0,
     "dt_sampling": "loguniform",
     "n_steps": 100,
     "t_min": 0.0,
@@ -104,7 +104,7 @@
     "layer_norm_eps": 1e-05,
     "predict_delta": true,
     "mlp": {
-      "hidden_dims": [1536, 1536, 1536, 1536, 1536, 1536, 1536, 1536],
+      "hidden_dims": [2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048],
       "residual": true
     },
     "autoencoder": {
@@ -118,7 +118,7 @@
   },
   "training": {
     "batch_size": 2048,
-    "max_epochs": 125,
+    "max_epochs": 400,
     "checkpoint_mode": "none",
     "num_workers": 0,
     "pin_memory": true,
@@ -127,12 +127,12 @@
     "rollout_steps": 1,
     "loss": {
       "lambda_log10_mae": 1.0,
-      "lambda_z_mse": 0.25
+      "lambda_z_mse": 0.10
     },
     "optimizer": {
       "name": "adamw",
-      "lr": 0.0001,
-      "weight_decay": 0.005,
+      "lr": 3e-04,
+      "weight_decay": 1e-05,
       "exclude_norm_and_bias_from_weight_decay": true,
       "betas": [0.9, 0.999],
       "eps": 1e-08,
@@ -142,10 +142,10 @@
     "scheduler": {
       "enabled": true,
       "type": "reduce_on_plateau",
-      "warmup_epochs": 10,
+      "warmup_epochs": 30,
       "factor": 0.5,
       "patience": 15,
-      "threshold": 1e-04,
+      "threshold": 1e-03,
       "min_lr": 1e-07,
       "mode": "min",
       "monitor": "val_loss"
