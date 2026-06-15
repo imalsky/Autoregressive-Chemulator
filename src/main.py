@@ -57,11 +57,20 @@ from utils import (
 
 log = logging.getLogger(__name__)
 
-def _default_config_path() -> Path:
+def _resolve_config_path() -> Path:
+    """Resolve the training config path from the AUTOCHEM_CONFIG_PATH env var.
+
+    There is no implicit default config. The env var must point at an explicit
+    config file (e.g. ``configs/stage1.json``); this keeps every run reproducible
+    and prevents silently training against a stale checked-in default.
+    """
     cfg_override = os.environ.get("AUTOCHEM_CONFIG_PATH", "").strip()
-    if cfg_override:
-        return Path(cfg_override).expanduser().resolve()
-    return Path(__file__).resolve().parents[1] / "config.json"
+    if not cfg_override:
+        raise RuntimeError(
+            "AUTOCHEM_CONFIG_PATH is not set. Point it at an explicit config file, e.g.:\n"
+            "  AUTOCHEM_CONFIG_PATH=configs/stage1.json python -u src/main.py"
+        )
+    return Path(cfg_override).expanduser().resolve()
 
 # Strict required config keys so saved config.resolved.json is always complete for debugging.
 _REQUIRED_CONFIG_KEYS: Tuple[str, ...] = (
@@ -170,6 +179,15 @@ _REQUIRED_CONFIG_KEYS: Tuple[str, ...] = (
     "training.curriculum.end_steps",
     "training.curriculum.mode",
     "training.curriculum.ramp_epochs",
+    # EMA of weights (Lightning callback wired in trainer.py). Required so every
+    # config states the policy explicitly (no silent default decay).
+    "training.ema.enabled",
+    "training.ema.decay",
+    # Early stopping (Lightning callback wired in trainer.py). Required so every
+    # config states the policy explicitly (no silent default patience/min_delta).
+    "training.early_stopping.enabled",
+    "training.early_stopping.patience",
+    "training.early_stopping.min_delta",
 )
 
 # Optional keys accepted by schema validation.
@@ -186,13 +204,6 @@ _OPTIONAL_CONFIG_KEYS: Tuple[str, ...] = (
     "training.scheduler.min_lr",
     "training.scheduler.mode",
     "training.scheduler.monitor",
-    # EMA of weights (Lightning callback wired in trainer.py).
-    "training.ema.enabled",
-    "training.ema.decay",
-    # Early stopping (Lightning callback wired in trainer.py).
-    "training.early_stopping.enabled",
-    "training.early_stopping.patience",
-    "training.early_stopping.min_delta",
     # Optional: zero-init the dynamics network's output Linear under residual=True
     # so dz == 0 at step 0 and the z+dz skip provides an exact identity prior.
     # Default False preserves the existing Xavier-init behavior.
@@ -229,6 +240,7 @@ _require_dotted = require_dotted
 
 
 def _build_allowed_config_prefixes() -> set[str]:
+    """Expand every known dotted key into the set of allowed key prefixes (for unknown-key checks)."""
     out: set[str] = set()
     keys = list(_REQUIRED_CONFIG_KEYS) + list(_OPTIONAL_CONFIG_KEYS) + list(_OPEN_MAP_CONFIG_KEYS)
     for dotted in keys:
@@ -243,6 +255,7 @@ _OPEN_MAP_KEY_SET = set(_OPEN_MAP_CONFIG_KEYS)
 
 
 def _validate_no_unknown_config_keys(mapping: Mapping[str, Any], *, prefix: str = "") -> None:
+    """Recursively reject any non-comment key not present in the allowed-prefix set."""
     for raw_key, val in mapping.items():
         if not isinstance(raw_key, str):
             raise TypeError("bad config key type")
@@ -267,6 +280,7 @@ def _validate_no_unknown_config_keys(mapping: Mapping[str, Any], *, prefix: str 
 
 
 def validate_required_config_keys(cfg: Mapping[str, Any]) -> None:
+    """Strictly validate the full training config: required keys, no unknown keys, scheduler + runtime constraints."""
     for key in _REQUIRED_CONFIG_KEYS:
         _require_dotted(cfg, key)
     _validate_no_unknown_config_keys(cfg)
@@ -275,6 +289,7 @@ def validate_required_config_keys(cfg: Mapping[str, Any]) -> None:
 
 
 def _validate_scheduler_config(cfg: Mapping[str, Any]) -> None:
+    """Require the scheduler-type-specific keys (cosine vs reduce_on_plateau); reject unknown types."""
     tcfg = _require_dict(cfg, "training")
     sched_cfg = _require_dict(tcfg, "scheduler")
     sched_type = _as_str(_require(sched_cfg, "type"), "training.scheduler.type").lower()
@@ -292,8 +307,11 @@ def _validate_scheduler_config(cfg: Mapping[str, Any]) -> None:
 
 
 def _validate_runtime_constraints(cfg: Mapping[str, Any]) -> None:
-    # Single-device, no-accumulation invariants. The autoregressive manual-optimization
-    # path in trainer.py was never validated against DDP or grad accumulation.
+    """Enforce single-device, no-accumulation invariants (DDP / grad-accum are unsupported).
+
+    The autoregressive manual-optimization path in trainer.py was never validated against
+    multi-process strategies or gradient accumulation, so those configs hard-fail here.
+    """
     runtime = _require_dict(cfg, "runtime")
 
     accum = runtime.get("accumulate_grad_batches")
@@ -316,8 +334,11 @@ def _validate_runtime_constraints(cfg: Mapping[str, Any]) -> None:
 
 
 def _apply_compute_globals(cfg: Mapping[str, Any]) -> None:
-    # TF32 must be off when runtime.deterministic=True; otherwise the user's reproducibility
-    # contract is silently broken regardless of Lightning's deterministic flag.
+    """Set process-wide matmul/TF32 precision flags consistent with runtime.deterministic.
+
+    TF32 is forced off under deterministic=True; otherwise the reproducibility contract would
+    be silently broken regardless of Lightning's own deterministic flag.
+    """
     runtime = _require_dict(cfg, "runtime")
     deterministic = _as_bool(_require(runtime, "deterministic"), "runtime.deterministic")
     if deterministic:
@@ -331,10 +352,12 @@ def _apply_compute_globals(cfg: Mapping[str, Any]) -> None:
 
 
 def _repo_root(cfg_path: Path) -> Path:
+    """Return the directory that relative config paths are resolved against (the config's parent)."""
     return cfg_path.parent.resolve()
 
 
 def _resolve_path(root: Path, p: str) -> str:
+    """Resolve a possibly-relative path string against `root`; absolute paths pass through."""
     pth = Path(p).expanduser()
     if pth.is_absolute():
         return str(pth)
@@ -399,6 +422,7 @@ def resolve_paths(cfg: Dict[str, Any], cfg_path: Path) -> Dict[str, Any]:
 
 
 def configure_logging(cfg: Mapping[str, Any]) -> None:
+    """Initialize root logging from system.log_level and route warnings through logging."""
     sys_cfg = _require_dict(cfg, "system")
     level_str = str(_require(sys_cfg, "log_level")).upper().strip()
     level = getattr(logging, level_str, None)
@@ -516,27 +540,18 @@ def load_manifest_and_validate_config(
 
 
 def max_rollout_steps_for_training(tcfg: Mapping[str, Any]) -> int:
-    """Dataset sizing K for training split."""
+    """Dataset sizing K for the training split (accounts for the curriculum end horizon)."""
     base_k = _as_int(_require(tcfg, "rollout_steps"), "training.rollout_steps")
     if base_k < 1:
         raise ValueError("bad rollout_steps")
 
-    cur = tcfg.get("curriculum", None)
-    if cur is None:
-        return base_k
-    if not isinstance(cur, dict):
-        raise TypeError("bad training.curriculum")
-
-    enabled = cur.get("enabled", False)
-    if not isinstance(enabled, bool):
-        raise TypeError("bad curriculum.enabled")
+    cur = _require_dict(tcfg, "curriculum")
+    enabled = _as_bool(_require(cur, "enabled"), "training.curriculum.enabled")
     if not enabled:
         return base_k
 
-    # Canonical keys only (no aliases).
     start_steps = _as_int(_require(cur, "start_steps"), "training.curriculum.start_steps")
     end_steps = _as_int(_require(cur, "end_steps"), "training.curriculum.end_steps")
-
     if start_steps < 1 or end_steps < 1:
         raise ValueError("bad curriculum steps")
 
@@ -661,9 +676,14 @@ def _load_weights_only(module: torch.nn.Module, ckpt_path: Path, *, strict: bool
 
 
 def main() -> None:
-    cfg_path = _default_config_path().expanduser().resolve()
+    """Entry point: load + validate the config, build datasets/model, and run Lightning training.
+
+    Config path comes from AUTOCHEM_CONFIG_PATH (required). Checkpoint behavior follows
+    training.checkpoint_mode (none / resume / weights_only) strictly, with no implicit search.
+    """
+    cfg_path = _resolve_config_path().expanduser().resolve()
     if not cfg_path.exists():
-        raise FileNotFoundError("config not found")
+        raise FileNotFoundError(f"config not found: {cfg_path}")
 
     cfg = load_json_config(cfg_path)
     if not isinstance(cfg, dict):
@@ -748,7 +768,7 @@ def main() -> None:
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info("model: type=%s S=%d G=%d params=%d trainable=%d",
-             str(_require_dict(cfg, "model").get("type", "")),
+             str(_require(_require_dict(cfg, "model"), "type")),
              len(species_vars), len(global_vars), total_params, trainable_params)
 
     lit_module = FlowMapRolloutModule(
@@ -778,7 +798,7 @@ def main() -> None:
     )
     atomic_write_json(work_dir / "config.resolved.json", _portable_config_snapshot(cfg, save_dir=work_dir))
 
-    ckpt_val = runtime.get("checkpoint", None)
+    ckpt_val = _require(runtime, "checkpoint")  # required key; may be null
     ckpt_path: Optional[Path] = None
 
     if ckpt_val is not None:

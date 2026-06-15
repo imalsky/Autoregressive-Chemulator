@@ -1,7 +1,7 @@
 # Autoregressive Chemical Kinetics Emulator Specification
 
-Version: 1.6
-Date: 2026-03-10
+Version: 1.7
+Date: 2026-06-15
 Audience: Professional collaborators and maintainers
 
 ## 0. Execution Environment
@@ -30,11 +30,13 @@ Audience: Professional collaborators and maintainers
 5. Keep logic explicit and simple.
 6. Avoid magic numbers in logic bodies.
 7. Place stable defaults as named module-level constants in each executable script.
+8. There is no default config file; all entrypoints require `AUTOCHEM_CONFIG_PATH` and hard-fail if it is unset.
+9. Required config keys are read directly (absence is an error); only optional feature blocks may carry named-constant defaults.
 
 ## 4. Canonical Workflow
 
 ## 4.1 Preprocessing
-1. Preprocessing is canonical via `processing/preprocessing.py`.
+1. Preprocessing is canonical via `processing/preprocessing.py`, selected by `AUTOCHEM_CONFIG_PATH` (required).
 2. Fixed `dt` mode is removed.
 3. Variable `dt` is mandatory.
 4. Required preprocessing `dt` config uses `dt_min` and `dt_max` only.
@@ -46,7 +48,7 @@ Audience: Professional collaborators and maintainers
 10. Multi-column or higher-rank species datasets are unsupported and must hard-fail.
 
 ## 4.2 Training
-1. Training entrypoint is `src/main.py`.
+1. Training entrypoint is `src/main.py`, selected by `AUTOCHEM_CONFIG_PATH` (required; there is no default config file).
 2. Training mode is the only supported runtime mode.
 3. Post-train automatic test execution is removed.
 4. Validation remains enabled during training.
@@ -70,6 +72,10 @@ Audience: Professional collaborators and maintainers
 22. Training framework imports must use `lightning.pytorch`.
 23. Direct source imports from `pytorch_lightning` are unsupported and must not appear in the repository.
 24. Trainer/logger integration targets the current `lightning.pytorch` API directly; legacy PyTorch Lightning compatibility shims are not part of the supported codebase.
+25. The production configs are `configs/stage1.json` (one-jump pretrain) and `configs/stage2.json` (autoregressive fine-tune); these are the only files in `configs/`.
+26. The production layout is a single dt-conditioned model. The band-specialist (per-`dt`-range) layout was evaluated and rejected; see `docs/DECISIONS.md`.
+27. `training.ema` and `training.early_stopping` are required config blocks, each gated by its own `enabled` flag.
+28. `model.fourier_dt` and `training.autoregressive_training.loss_discount_gamma` are optional, validated feature blocks; absent keys use named-constant defaults that reproduce legacy behavior.
 
 ## 4.3 Export and Inference
 1. Export contract is physical-space one-step inference.
@@ -92,15 +98,11 @@ Audience: Professional collaborators and maintainers
 18. No sidecar metadata JSON is required.
 19. For `torch.export` artifacts, inference loaders must not call `model.eval()` or `model.train()` on `ep.module()` because these mode-switch APIs are unsupported; run inference under `torch.inference_mode()` instead.
 
-## 4.4 Testing Script Canonicalization
-1. `testing/` is the only place where temporary duplicate workflows are tolerated.
-2. Scripts under `testing/` are diagnostic utilities and may use explicit best-effort behavior for portability and local usability.
-3. The `new_` scripts become canonical and are renamed to remove the prefix.
-4. Canonical script names after consolidation are:
-5. `testing/export.py`
-6. `testing/predictions.py`
-7. Legacy duplicate scripts are removed.
-8. Misspelled legacy script `testing/prections.py` is removed.
+## 4.4 Diagnostic and Testing Scripts
+1. `testing/` holds diagnostic and deployment utilities; they are not release gates.
+2. `testing/export.py` and `testing/aoti_export.py` produce/validate deployment artifacts and follow the strict no-fallback contract.
+3. The plotting/inspection diagnostics (`testing/predictions.py`, `testing/benchmark.py`, `testing/training_logs.py`) may use explicit best-effort behavior for portability and local usability.
+4. `testing/run_local_smoke.sh` exercises the full preprocess -> stage-1 -> stage-2 pipeline on synthetic data.
 
 ## 5. Data and Schema Contracts
 1. Raw input data schema is stable and assumed unchanged.

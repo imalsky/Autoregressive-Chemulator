@@ -65,7 +65,7 @@ from model import create_model  # noqa: E402
 REQUIRED_GLOBALS: Tuple[str, str] = ("P", "T")
 
 # Runtime settings (edit here; no argparse).
-RUN_DIR = (REPO_ROOT / "models" / "0").resolve()
+RUN_DIR = (REPO_ROOT / "models" / "stage2").resolve()  # deployable model = stage-2 output
 CHECKPOINT = "checkpoints/last.ckpt"  # relative paths are resolved against run config directory
 EXPORT_DEVICES = "cpu,cuda"  # requested targets; unavailable devices are skipped with CPU fallback
 EXPORT_DTYPE = "float32"
@@ -76,6 +76,10 @@ EXAMPLE_BATCH = 4
 B_MIN = 1
 B_MAX = 16384
 
+# Numerical constants for the baked normalizer (mirror processing/preprocessing.py semantics).
+_DENOM_EPS = 1e-12          # floor for normalization denominators (avoids divide-by-zero)
+_FALLBACK_EPSILON = 1e-30   # log10 floor used only if a manifest omits "epsilon"
+
 
 # =============================================================================
 # Small device diagnostics
@@ -83,6 +87,7 @@ B_MAX = 16384
 
 
 def _cuda_available() -> bool:
+    """True if a usable CUDA device is present (best-effort; never raises)."""
     try:
         return bool(torch.cuda.is_available() and torch.cuda.device_count() > 0)
     except Exception:
@@ -90,6 +95,7 @@ def _cuda_available() -> bool:
 
 
 def _mps_available() -> bool:
+    """True if the Apple MPS backend is available (best-effort; never raises)."""
     try:
         return bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
     except Exception:
@@ -97,6 +103,7 @@ def _mps_available() -> bool:
 
 
 def _print_device_diag() -> None:
+    """Print a one-line summary of torch version and CUDA/MPS availability."""
     cuda_ok = _cuda_available()
     mps_ok = _mps_available()
     print(
@@ -121,6 +128,7 @@ def _print_device_diag() -> None:
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
+    """Load a JSON file, requiring a top-level object."""
     obj = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(obj, dict):
         raise TypeError(f"JSON root must be an object: {path}")
@@ -128,6 +136,7 @@ def _load_json(path: Path) -> Dict[str, Any]:
 
 
 def _resolve_path_like(raw: str, *, base: Path) -> Path:
+    """Resolve a possibly-relative path string against `base` (absolute paths pass through)."""
     p = Path(raw).expanduser()
     if not p.is_absolute():
         return (base / p).resolve()
@@ -135,6 +144,7 @@ def _resolve_path_like(raw: str, *, base: Path) -> Path:
 
 
 def _to_repo_relative_str(path: Path) -> str:
+    """Return `path` relative to the repo root for portable metadata (absolute on failure)."""
     try:
         return os.path.relpath(str(path.resolve()), str(REPO_ROOT.resolve()))
     except Exception:
@@ -184,6 +194,7 @@ _STRIP_PREFIXES = (
 
 
 def _strip_prefixes(key: str) -> str:
+    """Strip common Lightning/compile state_dict key prefixes (model./module./_orig_mod./...)."""
     changed = True
     while changed:
         changed = False
@@ -200,6 +211,7 @@ _IGNORED_STATE_PREFIXES = (
 
 
 def _is_ignored_state_key(key: str) -> bool:
+    """True for training-only checkpoint keys (e.g. loss buffers) that the inference model omits."""
     return any(key.startswith(p) for p in _IGNORED_STATE_PREFIXES)
 
 
@@ -257,6 +269,7 @@ def _load_weights_strict(model: nn.Module, ckpt_path: Path) -> None:
 
 
 def _freeze_for_inference(model: nn.Module) -> nn.Module:
+    """Put the model in eval mode and disable grads on all parameters (in place)."""
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
@@ -269,6 +282,7 @@ def _freeze_for_inference(model: nn.Module) -> nn.Module:
 
 
 def _canonical_method(method: str) -> str:
+    """Normalize a normalization-method name to lowercase/stripped form."""
     m = str(method).lower().strip()
     return m
 
@@ -349,12 +363,13 @@ class BakedNormalizer(nn.Module):
         return int(self.g_mean.numel())
 
     def normalize_dt_seconds(self, dt_seconds: torch.Tensor) -> torch.Tensor:
+        """Normalize physical dt (seconds) to [0,1] via log10 + min-max, matching preprocessing.py."""
         # preprocessing.py:
         #   dt_norm = clip((log10(max(dt, eps)) - log10(dt_min)) / (log10(dt_max) - log10(dt_min)), 0, 1)
         dt_f = torch.clamp_min(dt_seconds.to(torch.float32), self.dt_eps)
         log_dt = torch.log10(dt_f)
 
-        denom = (self.dt_log_max - self.dt_log_min).clamp_min(1e-12)
+        denom = (self.dt_log_max - self.dt_log_min).clamp_min(_DENOM_EPS)
         dt_norm = (log_dt - self.dt_log_min) / denom
         dt_norm = torch.clamp(dt_norm, 0.0, 1.0)
         return dt_norm.to(dt_seconds.dtype)
@@ -398,16 +413,16 @@ class BakedNormalizer(nn.Module):
             xj = g_f[:, j]
 
             if mj == "standard":
-                denom = self.g_std[j].clamp_min(1e-12)
+                denom = self.g_std[j].clamp_min(_DENOM_EPS)
                 zj = (xj - self.g_mean[j]) / denom
             elif mj == "min-max":
-                denom = (self.g_max[j] - self.g_min[j]).clamp_min(1e-12)
+                denom = (self.g_max[j] - self.g_min[j]).clamp_min(_DENOM_EPS)
                 zj = (xj - self.g_min[j]) / denom
             elif mj == "log-min-max":
-                denom = (self.g_log_max[j] - self.g_log_min[j]).clamp_min(1e-12)
+                denom = (self.g_log_max[j] - self.g_log_min[j]).clamp_min(_DENOM_EPS)
                 zj = (torch.log10(torch.clamp_min(xj, self.g_eps[j])) - self.g_log_min[j]) / denom
             elif mj == "log-standard":
-                denom = self.g_log_std[j].clamp_min(1e-12)
+                denom = self.g_log_std[j].clamp_min(_DENOM_EPS)
                 zj = (torch.log10(torch.clamp_min(xj, self.g_eps[j])) - self.g_log_mean[j]) / denom
             else:
                 raise RuntimeError(f"Unsupported global normalization method: {m}")
@@ -424,6 +439,11 @@ def build_baked_normalizer(
     species_vars: Sequence[str],
     global_vars: Sequence[str],
 ) -> BakedNormalizer:
+    """Build a BakedNormalizer from normalization.json (species/global stats + dt log range).
+
+    Validates that species use log-standard and globals use a supported method, then packs the
+    per-key statistics into float32 buffers for the exported module.
+    """
     methods_map = manifest.get("normalization_methods")
     if not isinstance(methods_map, Mapping):
         raise TypeError("normalization.json: expected 'normalization_methods' mapping.")
@@ -432,7 +452,7 @@ def build_baked_normalizer(
     if not isinstance(stats, Mapping):
         raise TypeError("normalization.json: expected 'per_key_stats' mapping.")
 
-    eps_global = float(manifest.get("epsilon", 1e-30))
+    eps_global = float(manifest.get("epsilon", _FALLBACK_EPSILON))
 
     def _method_for(k: str, *, allowed: set[str]) -> str:
         raw = methods_map.get(k)
@@ -520,6 +540,7 @@ class OneStepPhysical(nn.Module):
             raise TypeError("Base model must implement forward_step(y_z, dt_norm, g_z)")
 
     def forward(self, y_phys: torch.Tensor, dt_seconds: torch.Tensor, g_phys: torch.Tensor) -> torch.Tensor:
+        """Physical-space one step: normalize (y, dt, g) -> base.forward_step -> denormalize to y_next_phys."""
         y_z = self.norm.normalize_species(y_phys)
         dt_norm = self.norm.normalize_dt_seconds(dt_seconds)  # [B]
         g_z = self.norm.normalize_globals(g_phys)
@@ -651,19 +672,7 @@ def _resolve_processed_dir(cfg: Mapping[str, Any], *, cfg_path: Path) -> Path:
             if len(suffix.parts) >= 2:
                 _add_candidate((REPO_ROOT / suffix))
 
-    # Fallback to repo config and canonical default.
-    repo_cfg_path = REPO_ROOT / "config.json"
-    if repo_cfg_path.exists():
-        try:
-            repo_cfg = _load_json(repo_cfg_path)
-            repo_paths = repo_cfg.get("paths", {}) or {}
-            if isinstance(repo_paths, Mapping):
-                repo_processed = repo_paths.get("processed_dir")
-                if isinstance(repo_processed, str) and repo_processed.strip():
-                    _add_candidate(_resolve_path_like(repo_processed, base=repo_cfg_path.parent))
-        except Exception:
-            pass
-
+    # Last resort: the canonical default processed dir (still validated for normalization.json below).
     _add_candidate((REPO_ROOT / "data" / "processed"))
 
     for cand in candidates:
@@ -680,6 +689,7 @@ def _resolve_processed_dir(cfg: Mapping[str, Any], *, cfg_path: Path) -> Path:
 
 
 def _parse_dtype(dtype_str: str) -> torch.dtype:
+    """Map an export dtype string to a torch.dtype (float32 | bfloat16)."""
     s = dtype_str.strip().lower()
     if s == "float32":
         return torch.float32
@@ -689,6 +699,7 @@ def _parse_dtype(dtype_str: str) -> torch.dtype:
 
 
 def _parse_devices(raw_devices: str) -> List[str]:
+    """Parse the comma-separated EXPORT_DEVICES string into a de-duplicated device list."""
     raw = str(raw_devices).strip().lower()
     if not raw:
         raise ValueError("EXPORT_DEVICES produced empty list")
@@ -708,6 +719,7 @@ def _parse_devices(raw_devices: str) -> List[str]:
 
 
 def _resolve_export_devices(devices: Sequence[str]) -> List[str]:
+    """Filter requested devices to those actually available, falling back to CPU if none are."""
     resolved: List[str] = []
     for dev in devices:
         if dev == "cpu":
@@ -741,6 +753,7 @@ def _resolve_export_devices(devices: Sequence[str]) -> List[str]:
 
 
 def _default_out_for(run_dir: Path, device_tag: str) -> Path:
+    """Return the canonical export artifact path: <run_dir>/export_<device>_dynB_1step_phys.pt2."""
     return (run_dir / f"export_{device_tag}_dynB_1step_phys.pt2").resolve()
 
 
@@ -771,6 +784,7 @@ def _export_one(
     verify_cuda: bool,
     verify_mps: bool,
 ) -> None:
+    """Export one device target: wrap base+normalizer, torch.export with dynamic batch, verify, and save with metadata."""
     # Move model and normalizer to device/dtype for this export.
     base = base_cpu.to(device=device, dtype=dtype)
     base = _freeze_for_inference(base)
@@ -811,7 +825,7 @@ def _export_one(
         "species_variables": list(species_vars),
         "global_variables": list(global_vars),
         "normalization_methods": dict(manifest["normalization_methods"]),
-        "epsilon": float(manifest.get("epsilon", 1e-30)),
+        "epsilon": float(manifest.get("epsilon", _FALLBACK_EPSILON)),
         "dt_log10_min": float(manifest["dt"]["log_min"]),
         "dt_log10_max": float(manifest["dt"]["log_max"]),
         "dt_min_seconds": float(10.0 ** float(manifest["dt"]["log_min"])),
@@ -842,6 +856,7 @@ def _export_one(
 
 
 def main() -> None:
+    """Load the run's resolved config + checkpoint + normalization, then export per requested device."""
     _print_device_diag()
 
     run_dir = RUN_DIR.expanduser().resolve()

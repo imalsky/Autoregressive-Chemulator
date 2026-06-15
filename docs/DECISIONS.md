@@ -29,8 +29,8 @@ Consequences:
   no-Fourier trunk.
 - The fourier_dt sigma/num_freqs rows below now apply only to the fallback variant.
 
-Date: 2026-06-09 (revised 2026-06-11). Scope: the autoregressive production configs in this directory
-(`stage1_dt_1e-1_1e3.json` + `stage2_dt_1e-1_1e3.json`, plus `fallback_banded/`),
+Date: 2026-06-09 (revised 2026-06-11; configs flattened/renamed and band/fallback configs removed 2026-06-15).
+Scope: the autoregressive production configs (`configs/stage1.json` + `configs/stage2.json`),
 the two src changes that support them (`model.fourier_dt`, `loss_discount_gamma`),
 and the validation protocol. Campaign log with full numbers:
 `Chemulator_Project/notes.md`. Experiment artifacts:
@@ -91,7 +91,7 @@ no inversion of any adopted finding.
 | `preprocessing.output_trajectories_per_file`, `pool_size` | 1e6 (consume all) | "Use the full dataset" (user decision); ~62M samples across ~160 raw files. | decision |
 | `training.batch_size` | 2048 | Paper finding: >2048 degraded generalization; v2_bigger_batch (8192) plateaued at val ~9e-3. | high (production-scale evidence) |
 | stage-1 `lr` / `wd` / scheduler / EMA 0.9995 / early-stop | template values | v3-lineage; converged to val ~7e-4 historically. EMA window rule (1/(1−d) ≈ 1–10% of updates, ACE uses 0.9999) — with full-dataset epochs, consider 0.9999; not locally discriminable. | inherited |
-| **stage-2 model block = stage-1 model block** | 10×2048 + fourier_dt | Fixes the historical inconsistency: old `configs/stage2_dt_bands/` declared 8×1536 but strict-load 10×2048 checkpoints from wrong paths — would hard-fail at startup. | high (correctness fix) |
+| **stage-2 model block = stage-1 model block** | 10×2048 (fourier_dt OFF) | Fixes the historical inconsistency: the now-removed `configs/stage2_dt_bands/` declared 8×1536 but strict-load 10×2048 checkpoints from wrong paths — would hard-fail at startup. | high (correctness fix) |
 | `training.rollout_steps` (stage 2) | 10 | **E3 K_MAX sweep**: inverted-U on geometric — K=1: 6.5e-3–1.9e-2, K=5: 4.4e-3, K=10: 2.4e-3 (±3%, 3 seeds), K=20: 1.2–3.3e-2 + one 1.0-dex fixed-dt blow-up. Matches List et al. 2024 (detached unrolling counterproductive beyond ~6; BPTT helps further but K=10 is inside every published envelope — GraphCast 12 max). Training horizon ≪ deployment horizon is universal practice. | medium-high |
 | `curriculum` 2→10, linear, 30 epochs | enabled | All multi-step SOTA use staged/ramped horizons (GraphCast +1/1k-updates 1→12; Stormer 1→4→8; NeuralGCM "critical"); sandbox used the equivalent ramp in every successful run. | high (literature + used throughout locally) |
 | `autoregressive_training.skip_steps` | 1 | Brandstetter 2022 canonical pushforward (unroll 2, backprop last; "more stable"); composes with BPTT. Sandbox used skip 2 at K≥4 successfully; 1 is the literature value and wastes fewer target steps. | medium |
@@ -105,13 +105,15 @@ no inversion of any adopted finding.
 | **rejected: K=20 detached training** | — | E3: consistently worse + one 1-dex blow-up; List 2024 agrees. (K>10 with BPTT untested locally — plausible future direction, not a default.) | medium |
 | **not adopted: inference-time renormalization** | off | Sturm 2024: naive projection degrades radicals/trace species (exactly what dominates a log-standardized loss); weighted projection neutral-to-positive. Track conservation drift as an EVAL metric; if the host solver needs hard conservation, the stoichiometric-output-layer route (Sturm & Wexler 2022) is the accuracy-neutral fix. | high (literature) |
 
-## Fallbacks shipped
+## Documented alternatives (evidence-backed; not shipped as default configs)
 
-1. **`fallback_banded/`** — two-band layout (stage1+stage2 × {1e-1–1e1, 1e1–1e3} s).
-   Use only if the single model shows a measured gap at the deployment dt that a
+1. **Banded layout** — two-band stage1+stage2 over {1e-1–1e1, 1e1–1e3} s. Rejected by
+   Gate G2 (band specialists collapsed at deployment-style fixed dt) and **removed** from
+   the repo on 2026-06-15 (the former `configs/production/fallback_banded/`). Recover from
+   git history only if the single model shows a measured deployment-dt gap that a
    deployment-dt-concentrated stage-2 (below) cannot close.
 2. **Detached stage-2 recipe** (lower memory, equally validated locally): in
-   `stage2_dt_1e-1_1e3.json` set `detach_between_steps=true`, `backward_per_step=true`,
+   `configs/stage2.json` set `detach_between_steps=true`, `backward_per_step=true`,
    `loss_discount_gamma=0.9`. Do NOT run detached with γ=1.0 (E3: 4–14× worse).
 3. **Deployment-specialized fine-tune** (if production rollout at dt≈6.4 s underperforms):
    rather than banding, run a second stage-2 pass with preprocessing dt_min/dt_max
@@ -131,7 +133,7 @@ Each ~20 stage-1 epochs (~5% of a full run) on one GH200, comparing val curves:
 
 ## Verification performed (2026-06-09)
 
-- **End-to-end smoke** (`run_local_smoke.sh`): synthetic raw → preprocessing → stage-1
+- **End-to-end smoke** (`testing/run_local_smoke.sh`): synthetic raw → preprocessing → stage-1
   (2 epochs) → stage-2 default (BPTT) AND stage-2 fallback (detached+γ=0.9), with the
   weights_only EMA handoff. PASSED on this machine.
 - **Bugs found and fixed during verification:**

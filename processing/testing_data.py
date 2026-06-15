@@ -145,7 +145,7 @@ def scan_file_for_time_like_datasets(fp: h5py.File, *, max_hits: int) -> List[Tu
 
 # ---- main --------------------------------------------------------------------
 def main() -> None:
-    cfg_path = Path(__file__).resolve().parents[1] / "config.json"
+    cfg_path = Path(__file__).resolve().parents[1] / "configs" / "stage1.json"
     if not cfg_path.exists():
         raise SystemExit(f"Config not found at expected path: {cfg_path}")
 

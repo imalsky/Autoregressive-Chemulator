@@ -3,7 +3,7 @@
 """Build and validate a VULCAN-oriented CPU AOTInductor package.
 
 This script is validation-first:
-- it builds one CPU AOTInductor package from the current ``v3`` checkpoint
+- it builds one CPU AOTInductor package from the current stage-2 checkpoint
 - it validates that package against both a fresh raw export and the installed
   raw VULCAN model on real VULCAN column inputs
 - it benchmarks the direct model-call latency for the raw and AOTI paths
@@ -33,18 +33,18 @@ from torch.export import Dim
 
 ROOT = Path(__file__).resolve().parents[2]
 EXPORT_IMPL_PATH = (ROOT / "Auto-Chem" / "testing" / "export.py").resolve()
-RUN_DIR = (ROOT / "Auto-Chem" / "models" / "v3").resolve()
+RUN_DIR = (ROOT / "Auto-Chem" / "models" / "stage2").resolve()
 CHECKPOINT = "checkpoints/last.ckpt"
 REFERENCE_VULCAN_STATE_PATH = (ROOT / "output" / "HD189_short_thermo.vul").resolve()
 INSTALLED_RAW_MODEL_PATH = (ROOT / "Emulator" / "model" / "model.pt2").resolve()
 OUTPUT_AOTI_PACKAGE_PATH = (
-    ROOT / "Auto-Chem" / "models" / "v3" / "export_cpu_dynB_1step_phys_aoti.pt2"
+    ROOT / "Auto-Chem" / "models" / "stage2" / "export_cpu_dynB_1step_phys_aoti.pt2"
 ).resolve()
 OUTPUT_REPORT_PATH = (
-    ROOT / "Auto-Chem" / "models" / "v3" / "export_cpu_dynB_1step_phys_aoti_validation.md"
+    ROOT / "Auto-Chem" / "models" / "stage2" / "export_cpu_dynB_1step_phys_aoti_validation.md"
 ).resolve()
 OUTPUT_JSON_PATH = (
-    ROOT / "Auto-Chem" / "models" / "v3" / "export_cpu_dynB_1step_phys_aoti_validation.json"
+    ROOT / "Auto-Chem" / "models" / "stage2" / "export_cpu_dynB_1step_phys_aoti_validation.json"
 ).resolve()
 AOTI_EXAMPLE_BATCH: int | None = None
 BENCHMARK_BATCH_SIZES: tuple[int | str, ...] = (1, "nz", "2*nz")

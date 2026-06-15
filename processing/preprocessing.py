@@ -27,12 +27,12 @@ Shard schema:
     dt_norm_mat : [N, n_steps-1]  float32  (normalized dt in [0, 1])
 
 This script is intentionally strict:
-- Configuration must use the canonical schema in config.json.
+- Configuration must use the canonical schema (the file named by AUTOCHEM_CONFIG_PATH).
 - Dataset names must match exactly (no implicit renaming).
 - Globals must be scalar per trajectory (time-series globals are rejected).
 
 Run:
-  python -u processing/preprocessing.py
+  AUTOCHEM_CONFIG_PATH=configs/stage1.json python -u processing/preprocessing.py
 """
 
 from __future__ import annotations
@@ -58,6 +58,7 @@ from tqdm import tqdm
 
 
 def _configure_logging(level: str) -> None:
+    """Initialize root logging at the named level (e.g. "INFO"); raise on a bad level."""
     lvl = getattr(logging, str(level).upper().strip(), None)
     if lvl is None:
         raise ValueError(f"Unsupported log level: {level}")
@@ -73,7 +74,10 @@ log = logging.getLogger(__name__)
 _REQUIRED_GLOBALS: Tuple[str, str] = ("P", "T")
 _REQUIRED_DT_SAMPLING = "loguniform"
 _ALLOWED_GLOBAL_METHODS = {"standard", "min-max", "log-min-max", "log-standard"}
-DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
+# A raw sample is kept in the "valid" mask only if its time is no more than this
+# factor below the chunk floor t_lo = max(t_min, first_positive_time). This drops
+# samples deep in the stiff pre-onset transient before chunk placement/interpolation.
+_VALID_TIME_FLOOR_FACTOR = 0.5
 _REQUIRED_TOP_LEVEL: Tuple[str, ...] = ("paths", "data", "normalization", "preprocessing", "system")
 _ALLOWED_TOP_LEVEL: Tuple[str, ...] = (
     "precision",
@@ -123,6 +127,7 @@ _ALLOWED_SECTION_KEYS: Dict[str, Tuple[str, ...]] = {
 
 
 def _validate_no_unknown_keys(mapping: Mapping[str, Any], *, allowed: Sequence[str], prefix: str = "") -> None:
+    """Reject any non-comment key not in `allowed` (whitespace-ambiguous keys also fail)."""
     allowed_set = set(allowed)
     for raw_key in mapping.keys():
         if not isinstance(raw_key, str):
@@ -137,6 +142,12 @@ def _validate_no_unknown_keys(mapping: Mapping[str, Any], *, allowed: Sequence[s
 
 
 def validate_required_config_keys(cfg: Mapping[str, Any]) -> None:
+    """Strictly validate the preprocessing-relevant config sections and keys.
+
+    Checks top-level sections, rejects unknown keys, and requires every key the
+    pipeline reads. Only the sections preprocessing depends on are validated here
+    (training/runtime/etc. are validated by src/main.py).
+    """
     if not isinstance(cfg, Mapping):
         raise TypeError("bad config")
 
@@ -162,6 +173,7 @@ def validate_required_config_keys(cfg: Mapping[str, Any]) -> None:
 
 
 def _parse_global_method(method: str, *, key: str) -> str:
+    """Normalize and validate a global-normalization method name (raise if unsupported)."""
     m = str(method).lower().strip()
     if m not in _ALLOWED_GLOBAL_METHODS:
         raise ValueError(
@@ -172,12 +184,14 @@ def _parse_global_method(method: str, *, key: str) -> str:
 
 
 def _require(mapping: Dict, key: str) -> object:
+    """Return mapping[key] or raise KeyError naming the missing config key."""
     if key not in mapping:
         raise KeyError(f"missing config key: {key}")
     return mapping[key]
 
 
 def _require_dict(mapping: Dict, key: str) -> Dict:
+    """Return a required nested object (dict), or raise TypeError."""
     obj = _require(mapping, key)
     if not isinstance(obj, dict):
         raise TypeError(f"config.{key} must be an object")
@@ -185,6 +199,7 @@ def _require_dict(mapping: Dict, key: str) -> Dict:
 
 
 def _require_str(mapping: Dict, key: str) -> str:
+    """Return a required non-empty string (stripped), or raise TypeError."""
     obj = _require(mapping, key)
     if not isinstance(obj, str) or not obj.strip():
         raise TypeError(f"config.{key} must be a non-empty string")
@@ -192,6 +207,7 @@ def _require_str(mapping: Dict, key: str) -> str:
 
 
 def _require_int(mapping: Dict, key: str) -> int:
+    """Return a required int (bools rejected), or raise TypeError."""
     obj = _require(mapping, key)
     if isinstance(obj, bool) or not isinstance(obj, int):
         raise TypeError(f"config.{key} must be an int")
@@ -199,6 +215,7 @@ def _require_int(mapping: Dict, key: str) -> int:
 
 
 def _require_float(mapping: Dict, key: str) -> float:
+    """Return a required number as float (bools rejected), or raise TypeError."""
     obj = _require(mapping, key)
     if isinstance(obj, bool) or not isinstance(obj, (int, float)):
         raise TypeError(f"config.{key} must be a number")
@@ -206,6 +223,7 @@ def _require_float(mapping: Dict, key: str) -> float:
 
 
 def _require_bool(mapping: Dict, key: str) -> bool:
+    """Return a required bool, or raise TypeError."""
     obj = _require(mapping, key)
     if not isinstance(obj, bool):
         raise TypeError(f"config.{key} must be a bool")
@@ -213,6 +231,7 @@ def _require_bool(mapping: Dict, key: str) -> bool:
 
 
 def _require_str_list(mapping: Dict, key: str) -> List[str]:
+    """Return a required non-empty list of non-empty strings (each stripped)."""
     obj = _require(mapping, key)
     if not isinstance(obj, list) or not obj:
         raise TypeError(f"config.{key} must be a non-empty list")
@@ -225,12 +244,15 @@ def _require_str_list(mapping: Dict, key: str) -> List[str]:
 
 
 def _resolve_path(root: Path, p: str) -> Path:
+    """Resolve a possibly-relative path against `root` (the config-file directory)."""
     path = Path(p).expanduser()
     return path if path.is_absolute() else (root / path).resolve()
 
 
 @dataclass(frozen=True)
 class PreCfg:
+    """Fully parsed, validated preprocessing configuration (paths resolved to absolute)."""
+
     raw_dir: Path
     processed_dir: Path
     raw_file_patterns: List[str]
@@ -267,6 +289,7 @@ class PreCfg:
 
 
 def load_json(path: Path) -> Dict:
+    """Load a JSON config file, requiring a top-level object."""
     if not path.exists():
         raise FileNotFoundError(f"Config not found: {path}")
     with open(path, "r", encoding="utf-8") as f:
@@ -277,6 +300,11 @@ def load_json(path: Path) -> Dict:
 
 
 def parse_precfg(cfg: Dict, *, cfg_path: Path) -> PreCfg:
+    """Parse and validate the raw config dict into a PreCfg (strict types + range checks).
+
+    Resolves raw_dir/processed_dir relative to the config-file directory, enforces the
+    exact (P, T) global set, the loguniform dt contract, and all positivity constraints.
+    """
     root = cfg_path.parent.resolve()
 
     paths = _require_dict(cfg, "paths")
@@ -411,6 +439,7 @@ def parse_precfg(cfg: Dict, *, cfg_path: Path) -> PreCfg:
 
 
 def list_raw_files(raw_dir: Path, patterns: Sequence[str]) -> List[Path]:
+    """Return the sorted, de-duplicated set of raw files under `raw_dir` matching any pattern."""
     files: List[Path] = []
     for pat in patterns:
         files.extend(sorted(raw_dir.glob(pat)))
@@ -419,6 +448,7 @@ def list_raw_files(raw_dir: Path, patterns: Sequence[str]) -> List[Path]:
 
 
 def clean_dir(path: Path, *, overwrite: bool) -> None:
+    """Create an empty directory; if it exists, recreate it (overwrite) or refuse."""
     if path.exists():
         if not overwrite:
             raise RuntimeError(f"Refusing to overwrite existing directory: {path}")
@@ -427,6 +457,7 @@ def clean_dir(path: Path, *, overwrite: bool) -> None:
 
 
 def clean_processed_outputs(processed_dir: Path, *, overwrite: bool) -> None:
+    """Remove existing split dirs and manifest/summary files (overwrite) or refuse if present."""
     processed_dir.mkdir(parents=True, exist_ok=True)
     for split in ("train", "validation", "test"):
         d = processed_dir / split
@@ -446,6 +477,7 @@ def clean_processed_outputs(processed_dir: Path, *, overwrite: bool) -> None:
 
 
 def remove_tmp_dir(path: Path) -> None:
+    """Delete the temporary physical-shard directory; raise if it is missing or not removed."""
     if not path.exists():
         raise RuntimeError(f"Expected temporary directory to exist: {path}")
     if not path.is_dir():
@@ -465,6 +497,11 @@ def flush_shard(
     dt_buf: List[np.ndarray],
     suffix: str,
 ) -> Tuple[int, int]:
+    """Stack the buffered samples and write one NPZ shard; return (next_idx, n_written).
+
+    The `_physical` suffix selects the physical schema (y_mat/globals/dt_mat); otherwise
+    the normalized schema (y_mat/globals/dt_norm_mat) is written. Empty buffers no-op.
+    """
     if not y_buf:
         return shard_idx, 0
 
@@ -486,6 +523,7 @@ def flush_shard(
 
 
 def iter_shards(root: Path, split: str, suffix: str) -> List[Path]:
+    """Return the sorted shard paths for a split matching the given suffix (empty if none)."""
     d = root / split
     return sorted(d.glob(f"shard_*{suffix}.npz")) if d.exists() else []
 
@@ -496,6 +534,7 @@ def iter_shards(root: Path, split: str, suffix: str) -> List[Path]:
 
 
 def reservoir_sample(keys: Iterable[str], k: int, rng: np.random.Generator) -> List[str]:
+    """Uniformly sample up to k items from a stream of keys without materializing it (reservoir)."""
     pool: List[str] = []
     for i, key in enumerate(keys):
         if i < k:
@@ -508,6 +547,7 @@ def reservoir_sample(keys: Iterable[str], k: int, rng: np.random.Generator) -> L
 
 
 def split_for_trajectory(file_name: str, traj_name: str, *, seed: int, val_frac: float, test_frac: float) -> str:
+    """Deterministically assign a trajectory to train/validation/test via SHA-1(seed:file:traj)."""
     key = f"{file_name}:{traj_name}"
     h = hashlib.sha1(f"{seed}:{key}".encode()).digest()
     u = (int.from_bytes(h[:8], "big") + 0.5) / 2**64
@@ -519,6 +559,7 @@ def split_for_trajectory(file_name: str, traj_name: str, *, seed: int, val_frac:
 
 
 def sample_dt(cfg: PreCfg, rng: np.random.Generator) -> float:
+    """Draw a single physical dt log-uniformly from [dt_min, dt_max] (seconds)."""
     lo = np.log10(cfg.dt_min)
     hi = np.log10(cfg.dt_max)
     return float(10.0 ** rng.uniform(lo, hi))
@@ -535,6 +576,11 @@ def pick_t_start(
     anchor_first: bool,
     max_attempts: int,
 ) -> Optional[float]:
+    """Find a chunk start time so the full [n_steps]-point chunk fits inside the valid window.
+
+    The first attempt may anchor at the earliest feasible time (anchor_first); otherwise
+    candidates are drawn log-uniformly in [t_lo, t_hi]. Returns None if no placement fits.
+    """
     pos = t_raw > 0
     if not np.any(pos):
         return None
@@ -574,6 +620,7 @@ def pick_t_start(
 
 
 def leaf_dataset_index(grp: h5py.Group) -> Dict[str, List[str]]:
+    """Map each leaf dataset name to the list of full paths having that leaf (for ambiguity checks)."""
     idx: Dict[str, List[str]] = {}
 
     def visitor(name: str, obj: object) -> None:
@@ -586,6 +633,7 @@ def leaf_dataset_index(grp: h5py.Group) -> Dict[str, List[str]]:
 
 
 def _unique_dataset_path(grp: h5py.Group, leaf_index: Dict[str, List[str]], key: str) -> str:
+    """Resolve a dataset key (full path or unambiguous leaf) to its full path; raise if missing/ambiguous."""
     if "/" in key:
         if key not in grp:
             raise KeyError(f"Dataset path not found in trajectory group: {key}")
@@ -603,6 +651,7 @@ def _unique_dataset_path(grp: h5py.Group, leaf_index: Dict[str, List[str]], key:
 
 
 def read_time(grp: h5py.Group, *, time_key: str, leaf_index: Dict[str, List[str]]) -> np.ndarray:
+    """Read the 1-D time vector (float64), requiring >=2 finite, strictly increasing samples."""
     p = _unique_dataset_path(grp, leaf_index, time_key)
 
     t = np.asarray(grp[p][...], dtype=np.float64).reshape(-1)
@@ -622,6 +671,7 @@ def read_species_matrix(
     species_vars: Sequence[str],
     leaf_index: Dict[str, List[str]],
 ) -> np.ndarray:
+    """Read species into a [t_len, S] float64 matrix; each must be scalar-per-time and finite."""
     s = len(species_vars)
     y = np.empty((t_len, s), dtype=np.float64)
 
@@ -655,6 +705,11 @@ def read_globals_vector(
     global_vars: Sequence[str],
     leaf_index: Dict[str, List[str]],
 ) -> np.ndarray:
+    """Read per-trajectory globals as a [G] float32 vector from group attrs or scalar datasets.
+
+    Each global must be a finite scalar and present as exactly one of attribute OR dataset
+    (both present is ambiguous and rejected).
+    """
     if not global_vars:
         return np.zeros((0,), dtype=np.float32)
 
@@ -694,6 +749,7 @@ def read_globals_vector(
 
 
 def _is_non_finite_raw_error(err: BaseException) -> bool:
+    """True if `err` reports a non-finite raw value (a soft reject, not a schema error)."""
     msg = str(err)
     return (
         "contains non-finite values" in msg
@@ -708,6 +764,7 @@ def _is_non_finite_raw_error(err: BaseException) -> bool:
 
 
 def prepare_log_interp(log_t_valid: np.ndarray, log_t_target: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Precompute (i0, i1, weight) bracketing indices for linear interpolation on the log-time grid."""
     n = int(log_t_valid.shape[0])
     idx = np.searchsorted(log_t_valid, log_t_target, side="left")
     idx = np.clip(idx, 1, n - 1)
@@ -734,8 +791,11 @@ def interp_loglog(
     w: np.ndarray,
     epsilon: float,
 ) -> np.ndarray:
-    # log-log interpolation in physical space:
-    #   log10(y) linear-interpolated in log10(t)
+    """Interpolate species in log-log space: log10(y) is linear in log10(t), then exponentiated.
+
+    Uses the bracketing indices/weights from prepare_log_interp; values are floored at epsilon
+    before log10 to avoid -inf.
+    """
     y0 = np.log10(np.maximum(y_valid[i0, :], epsilon))
     y1 = np.log10(np.maximum(y_valid[i1, :], epsilon))
     w2 = w.reshape(-1, 1)
@@ -859,7 +919,7 @@ def sample_file(
 
             first_pos_time = float(t_raw[pos][0])
             t_lo = max(float(cfg.t_min), first_pos_time)
-            valid = (t_raw > 0) & (t_raw >= t_lo * 0.5)
+            valid = (t_raw > 0) & (t_raw >= t_lo * _VALID_TIME_FLOOR_FACTOR)
             if int(np.count_nonzero(valid)) < 2:
                 rejects["too_few_valid"] += 1
                 continue
@@ -970,6 +1030,7 @@ class RunningMeanVar:
         self.M2 = np.zeros(self.dim, dtype=np.float64)
 
     def update(self, x: np.ndarray) -> None:
+        """Fold a batch of rows into the running mean/M2 via the parallel Welford merge."""
         x2 = x.reshape(-1, self.dim).astype(np.float64, copy=False)
         m = int(x2.shape[0])
         if m == 0:
@@ -991,6 +1052,7 @@ class RunningMeanVar:
         self.n = n_new
 
     def finalize(self, *, min_std: float) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (mean, std) with std floored at min_std; raise if fewer than 2 samples seen."""
         if self.n <= 1:
             raise RuntimeError("Insufficient samples to compute variance")
         var = self.M2 / (self.n - 1)
@@ -1093,6 +1155,11 @@ def normalize_and_write(
     per_key_stats: Dict,
     methods: Dict[str, str],
 ) -> None:
+    """Normalize every physical shard to z-space and write the final shards + normalization.json.
+
+    Species use log-standard normalization; globals use their per-key method; dt is log10 +
+    min-max clipped to [0, 1]. Writes the normalization manifest consumed by training/inference.
+    """
     eps = float(cfg.epsilon)
     S = len(cfg.species_variables)
     G = len(cfg.global_variables)
@@ -1234,6 +1301,7 @@ def write_summary(
     counts_total: Dict[str, int],
     rejects_total: Dict[str, int],
 ) -> None:
+    """Write preprocessing_summary.json (per-split counts, reject breakdown, resolved config)."""
     base = out_final.resolve()
     cfg_serialized: Dict[str, Any] = {}
     for k, v in cfg.__dict__.items():
@@ -1256,11 +1324,19 @@ def write_summary(
 
 
 def main() -> None:
+    """Run the full preprocessing pipeline using the AUTOCHEM_CONFIG_PATH config.
+
+    There is no implicit default config: the env var must point at an explicit
+    config file (the same one used for training), keeping preprocessing and
+    training perfectly in sync.
+    """
     cfg_override = os.environ.get("AUTOCHEM_CONFIG_PATH", "").strip()
-    if cfg_override:
-        cfg_path = Path(cfg_override).expanduser().resolve()
-    else:
-        cfg_path = DEFAULT_CONFIG_PATH.expanduser().resolve()
+    if not cfg_override:
+        raise RuntimeError(
+            "AUTOCHEM_CONFIG_PATH is not set. Point it at an explicit config file, e.g.:\n"
+            "  AUTOCHEM_CONFIG_PATH=configs/stage1.json python -u processing/preprocessing.py"
+        )
+    cfg_path = Path(cfg_override).expanduser().resolve()
     cfg_dict = load_json(cfg_path)
     validate_required_config_keys(cfg_dict)
 

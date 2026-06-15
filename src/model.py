@@ -41,6 +41,8 @@ ActivationFactory = Callable[[], nn.Module]
 
 # Small output init for delta heads. This reduces early rollout blow-ups.
 _DELTA_OUT_INIT_STD = 1e-3
+# Negative slope for the optional "leaky_relu" activation factory.
+_LEAKY_RELU_SLOPE = 0.1
 _REQUIRED_GLOBALS = ("P", "T")
 
 
@@ -246,6 +248,7 @@ class FourierDtFeatures(nn.Module):
         self.out_dim = 1 + 2 * int(num_freqs)
 
     def forward(self, dt: torch.Tensor) -> torch.Tensor:
+        """Embed dt [..., 1] -> [..., 1 + 2F] as [dt, sin(2*pi*B*dt), cos(2*pi*B*dt)]."""
         torch._check(dt.shape[-1] == 1)
         # Compute the projection and sin/cos in float32 regardless of input dtype:
         # under bf16 the phase 2*pi*b_f*dt loses ~8 mantissa bits, aliasing the
@@ -293,7 +296,7 @@ def get_activation(name: str) -> ActivationFactory:
         "gelu": nn.GELU,
         "silu": nn.SiLU,
         "tanh": nn.Tanh,
-        "leaky_relu": lambda: nn.LeakyReLU(0.1),
+        "leaky_relu": lambda: nn.LeakyReLU(_LEAKY_RELU_SLOPE),
         "elu": nn.ELU,
     }
     if key not in factories:
@@ -510,6 +513,7 @@ class LatentDynamics(nn.Module):
         return self.fourier_dt(dt)
 
     def forward_step(self, z: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        """Advance one latent step: z_next = z + dz (residual) or dz, from (z, embedded dt, g)."""
         B = z.shape[0]  # Keep as symbolic
         dt = normalize_dt_step(dt_norm, B, context="LatentDynamics.forward_step")
         x = torch.cat([z, self._embed_dt(dt, z.dtype), g], dim=-1)
@@ -655,6 +659,7 @@ class FlowMapAutoencoder(nn.Module):
             nn.init.normal_(out_layer.weight, mean=0.0, std=_DELTA_OUT_INIT_STD)
 
     def forward_step(self, y_i: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        """One step y_i -> y_next via encode -> latent dynamics -> decode (+ y_i if predict_delta)."""
         B = y_i.shape[0]  # Keep as symbolic
         _validate_g_shape(g, B, self.G, context="FlowMapAutoencoder.forward_step")
         z_i = self.encoder(y_i, g)
@@ -727,6 +732,7 @@ class FlowMapMLP(nn.Module):
             nn.init.normal_(out.weight, mean=0.0, std=_DELTA_OUT_INIT_STD)
 
     def forward_step(self, y_i: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        """One step y_i -> y_next from concatenated (y_i, embedded dt, g) (+ y_i if predict_delta)."""
         B = y_i.shape[0]  # Keep as symbolic
         _validate_g_shape(g, B, self.G, context="FlowMapMLP.forward_step")
 
@@ -811,12 +817,13 @@ def create_model(
         raise KeyError("model.type required.")
     model_type = str(model_type_raw).lower().strip()
 
-    activation = str(mcfg.get("activation", "gelu")).lower().strip()
-    dropout = float(mcfg.get("dropout", 0.0))
-    predict_delta = bool(mcfg.get("predict_delta", True))
-    layer_norm = bool(mcfg.get("layer_norm", True))
-    layer_norm_eps = float(mcfg.get("layer_norm_eps", 1e-5))
-    fourier_dt = build_fourier_dt(mcfg.get("fourier_dt"))
+    # Architecture knobs are schema-required (validated in main.py); read directly.
+    activation = str(mcfg["activation"]).lower().strip()
+    dropout = float(mcfg["dropout"])
+    predict_delta = bool(mcfg["predict_delta"])
+    layer_norm = bool(mcfg["layer_norm"])
+    layer_norm_eps = float(mcfg["layer_norm_eps"])
+    fourier_dt = build_fourier_dt(mcfg.get("fourier_dt"))  # optional feature block
     if fourier_dt is not None:
         log.info(
             "fourier_dt enabled: num_freqs=%d sigma=%s (dt input dim 1 -> %d)",
@@ -827,8 +834,8 @@ def create_model(
         mlp_cfg = mcfg.get("mlp")
         if not isinstance(mlp_cfg, dict):
             raise KeyError("model.mlp required.")
-        hidden_dims = _as_int_list(mlp_cfg.get("hidden_dims"), name="model.mlp.hidden_dims")
-        residual = bool(mlp_cfg.get("residual", True))
+        hidden_dims = _as_int_list(mlp_cfg["hidden_dims"], name="model.mlp.hidden_dims")
+        residual = bool(mlp_cfg["residual"])
         return FlowMapMLP(
             state_dim=S,
             global_dim=G,
@@ -847,16 +854,14 @@ def create_model(
         if not isinstance(ae_cfg, dict):
             raise KeyError("model.autoencoder required.")
 
-        latent_dim_raw = ae_cfg.get("latent_dim")
-        if latent_dim_raw is None:
-            raise KeyError("model.autoencoder.latent_dim required.")
-        latent_dim = int(latent_dim_raw)
+        latent_dim = int(ae_cfg["latent_dim"])
 
-        encoder_hidden = _as_int_list(ae_cfg.get("encoder_hidden"), name="model.autoencoder.encoder_hidden")
-        dynamics_hidden = _as_int_list(ae_cfg.get("dynamics_hidden"), name="model.autoencoder.dynamics_hidden")
-        decoder_hidden = _as_int_list(ae_cfg.get("decoder_hidden"), name="model.autoencoder.decoder_hidden")
-        residual = bool(ae_cfg.get("residual", True))
-        dynamics_residual = bool(ae_cfg.get("dynamics_residual", True))
+        encoder_hidden = _as_int_list(ae_cfg["encoder_hidden"], name="model.autoencoder.encoder_hidden")
+        dynamics_hidden = _as_int_list(ae_cfg["dynamics_hidden"], name="model.autoencoder.dynamics_hidden")
+        decoder_hidden = _as_int_list(ae_cfg["decoder_hidden"], name="model.autoencoder.decoder_hidden")
+        residual = bool(ae_cfg["residual"])
+        dynamics_residual = bool(ae_cfg["dynamics_residual"])
+        # zero_init_dynamics_output is an optional feature flag (default off).
         zero_init_dynamics_output = bool(ae_cfg.get("zero_init_dynamics_output", False))
 
         return FlowMapAutoencoder(
