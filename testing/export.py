@@ -207,12 +207,22 @@ def _load_weights_strict(model: nn.Module, ckpt_path: Path) -> None:
     """
     Load checkpoint weights into `model` with strict key matching.
 
-    - Accepts either a Lightning checkpoint dict (with "state_dict") or a raw state_dict.
+    - Prefers "ema_state_dict" when present (saved by EMACallback): the EMA weights
+      are what produced the checkpoint's monitored val_loss, so they are what the
+      exported artifact must ship (mirrors src/main.py:_load_weights_only).
+    - Otherwise accepts a Lightning checkpoint dict (with "state_dict") or a raw state_dict.
     - Strips common module prefixes.
     - Errors out on missing keys (strong correctness signal).
     """
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    state = ckpt.get("state_dict", ckpt)
+    state = None
+    if isinstance(ckpt, Mapping):
+        ema_state = ckpt.get("ema_state_dict")
+        if isinstance(ema_state, Mapping) and ema_state:
+            print("Using ema_state_dict from checkpoint (EMA weights drove val_loss selection).")
+            state = ema_state
+    if state is None:
+        state = ckpt.get("state_dict", ckpt)
     if not isinstance(state, Mapping):
         raise TypeError(f"Checkpoint state_dict must be a mapping, got {type(state).__name__}")
     cleaned: Dict[str, Any] = {}

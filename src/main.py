@@ -193,6 +193,20 @@ _OPTIONAL_CONFIG_KEYS: Tuple[str, ...] = (
     "training.early_stopping.enabled",
     "training.early_stopping.patience",
     "training.early_stopping.min_delta",
+    # Optional: zero-init the dynamics network's output Linear under residual=True
+    # so dz == 0 at step 0 and the z+dz skip provides an exact identity prior.
+    # Default False preserves the existing Xavier-init behavior.
+    "model.autoencoder.zero_init_dynamics_output",
+    # Optional fixed random-Fourier embedding of the normalized dt scalar
+    # (Tancik et al. 2020). Absent or enabled=false -> plain scalar dt (legacy).
+    "model.fourier_dt.enabled",
+    "model.fourier_dt.num_freqs",
+    "model.fourier_dt.sigma",
+    "model.fourier_dt.seed",
+    # Optional per-step discount gamma^(k-skip) on the autoregressive rollout loss.
+    # Default 1.0 (uniform) preserves current behavior; only relevant when
+    # autoregressive_training.enabled=true.
+    "training.autoregressive_training.loss_discount_gamma",
 )
 
 # Mapping keys under these dotted paths are dynamic (validated elsewhere).
