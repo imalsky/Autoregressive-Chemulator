@@ -366,6 +366,27 @@ class FlowMapRolloutModule(pl.LightningModule):
             self.ar_skip_steps = 0
             self.ar_detach_between_steps = True
         self.ar_backward_per_step = bool(ar_cfg.get("backward_per_step", True))
+        # Per-step discount gamma^(k-skip) on the rollout loss. 1.0 = uniform (legacy).
+        # Validation/checkpoint selection (_eval_step) intentionally stays uniformly
+        # weighted so val_loss is comparable across gamma settings.
+        self.ar_loss_discount_gamma = float(ar_cfg.get("loss_discount_gamma", 1.0))
+        if not (0.0 < self.ar_loss_discount_gamma <= 1.0):
+            raise ValueError(
+                "training.autoregressive_training.loss_discount_gamma must be in (0, 1], "
+                f"got {self.ar_loss_discount_gamma}"
+            )
+        if not self.autoregressive_training and self.ar_loss_discount_gamma != 1.0:
+            raise ValueError(
+                "training.autoregressive_training.loss_discount_gamma has no effect when "
+                "autoregressive_training.enabled=false; remove it or set it to 1.0."
+            )
+
+        # Manual-optimization gradient clipping: Lightning forbids Trainer(gradient_clip_val=...)
+        # with manual optimization, so in AR mode the module clips via this value instead
+        # (build_lightning_trainer withholds it from the Trainer in that case).
+        runtime_cfg = dict(cfg.get("runtime", {}) or {})
+        clip_raw = runtime_cfg.get("gradient_clip_val", None)
+        self._manual_grad_clip_val: Optional[float] = float(clip_raw) if clip_raw is not None else None
 
         if not self.autoregressive_training and self.rollout_steps != 1:
             raise ValueError(
@@ -548,12 +569,28 @@ class FlowMapRolloutModule(pl.LightningModule):
         return y, dt, g
 
     @staticmethod
-    def _step_weights(k: int, skip_steps: int, *, device: torch.device) -> Optional[torch.Tensor]:
+    def _step_weights(
+        k: int,
+        skip_steps: int,
+        *,
+        device: torch.device,
+        gamma: float = 1.0,
+    ) -> Optional[torch.Tensor]:
+        """Per-step loss weights: 0 for warmup steps, gamma^(k-skip) after.
+
+        Returns None (uniform, no masking) when there is nothing to weight —
+        preserving the legacy fast path.
+        """
         skip = int(skip_steps)
-        if skip <= 0:
+        g = float(gamma)
+        if skip <= 0 and g == 1.0:
             return None
         w = torch.ones((int(k),), device=device, dtype=torch.float32)
-        w[: min(skip, int(k))] = 0.0
+        if skip > 0:
+            w[: min(skip, int(k))] = 0.0
+        if g != 1.0:
+            offsets = torch.arange(int(k), device=device, dtype=torch.float32) - float(skip)
+            w = w * torch.pow(torch.tensor(g, device=device), offsets.clamp_min(0.0))
         return w
 
     def _open_loop_unroll(
@@ -637,12 +674,14 @@ class FlowMapRolloutModule(pl.LightningModule):
                     gn2 = gn2 + nf * nf
                 self.log("grad_norm", torch.sqrt(gn2), on_step=False, on_epoch=True)
 
-        clip_val = getattr(self.trainer, "gradient_clip_val", None)
+        # Manual-optimization path: clip from the module's own config value (the Trainer
+        # is constructed WITHOUT gradient_clip_val in AR mode — Lightning forbids it).
+        clip_val = self._manual_grad_clip_val
         if clip_val is not None and float(clip_val) > 0:
             self.clip_gradients(
                 opt,
                 gradient_clip_val=float(clip_val),
-                gradient_clip_algorithm=getattr(self.trainer, "gradient_clip_algorithm", "norm"),
+                gradient_clip_algorithm="norm",
             )
 
         opt.step()
@@ -788,9 +827,13 @@ class FlowMapRolloutModule(pl.LightningModule):
                     y_prev = self._forward_step(y_prev, dt_train[:, k], g_t)
             y_prev = y_prev.detach()
 
+        gamma = float(self.ar_loss_discount_gamma)
+
         if self.ar_detach_between_steps:
             # Stop-grad between steps: no BPTT across time (but still trained on pushforward states).
-            num_steps = int(k_train - skip)
+            # Per-step weights gamma^(k-skip); gamma=1.0 reproduces the legacy uniform 1/num_steps.
+            weights = [gamma ** (k - skip) for k in range(skip, k_train)]
+            weight_sum = float(sum(weights))
 
             loss_total_sum = y_prev.new_zeros(())
             log10_mae_sum = y_prev.new_zeros(())
@@ -801,24 +844,25 @@ class FlowMapRolloutModule(pl.LightningModule):
                 y_tgt = y_true[:, k, :]
 
                 step_losses = self.criterion(y_next.unsqueeze(1), y_tgt.unsqueeze(1), step_weights=None)
+                w_k = weights[k - skip]
 
                 if self.ar_backward_per_step:
-                    self.manual_backward(step_losses["loss_total"] / float(num_steps * acc))
+                    self.manual_backward(step_losses["loss_total"] * (w_k / (weight_sum * acc)))
                 else:
-                    loss_total_sum = loss_total_sum + step_losses["loss_total"]
+                    loss_total_sum = loss_total_sum + step_losses["loss_total"] * w_k
 
-                log10_mae_sum = log10_mae_sum + step_losses["loss_log10_mae"].detach()
-                z_mse_sum = z_mse_sum + step_losses["loss_z_mse"].detach()
+                log10_mae_sum = log10_mae_sum + step_losses["loss_log10_mae"].detach() * w_k
+                z_mse_sum = z_mse_sum + step_losses["loss_z_mse"].detach() * w_k
 
                 y_prev = y_next.detach()
 
             if not self.ar_backward_per_step:
-                self.manual_backward(loss_total_sum / float(num_steps * acc))
+                self.manual_backward(loss_total_sum / (weight_sum * acc))
 
             self._maybe_step_optimizer(opt, batch_idx)
 
-            loss_log10_mae = log10_mae_sum / float(num_steps)
-            loss_z_mse = z_mse_sum / float(num_steps)
+            loss_log10_mae = log10_mae_sum / weight_sum
+            loss_z_mse = z_mse_sum / weight_sum
             loss_total = self.criterion.lambda_log10_mae * loss_log10_mae + self.criterion.lambda_z_mse * loss_z_mse
 
         else:
@@ -829,7 +873,7 @@ class FlowMapRolloutModule(pl.LightningModule):
                 y_prev = self._forward_step(y_prev, dt_train[:, k], g_t)
                 y_pred[:, k, :] = y_prev
 
-            step_weights = self._step_weights(k_train, skip, device=y_pred.device)
+            step_weights = self._step_weights(k_train, skip, device=y_pred.device, gamma=gamma)
             losses = self.criterion(y_pred, y_true, step_weights=step_weights)
 
             loss_total = losses["loss_total"]
@@ -1142,6 +1186,18 @@ def build_lightning_trainer(
 
     grad_clip = runtime.get("gradient_clip_val", None)
     gradient_clip_val = float(grad_clip) if grad_clip is not None else None
+
+    # Lightning raises if gradient_clip_val is set while the module uses manual
+    # optimization (the autoregressive path). The module clips in-loop instead
+    # (FlowMapRolloutModule._manual_grad_clip_val), so withhold it here.
+    ar_cfg = dict(dict(cfg.get("training", {}) or {}).get("autoregressive_training", {}) or {})
+    if bool(ar_cfg.get("enabled", False)) and gradient_clip_val is not None:
+        log.info(
+            "Autoregressive (manual optimization): gradient clipping (%.3g) is applied "
+            "in-module; not passing gradient_clip_val to the Lightning Trainer.",
+            gradient_clip_val,
+        )
+        gradient_clip_val = None
 
     strategy = runtime.get("strategy", "auto")
     accumulate_grad_batches = int(runtime.get("accumulate_grad_batches", 1))

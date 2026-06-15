@@ -224,6 +224,67 @@ def _as_int_list(value: Any, *, name: str) -> List[int]:
 # Building blocks
 # ==============================================================================
 
+class FourierDtFeatures(nn.Module):
+    """Fixed random-Fourier embedding of the normalized scalar dt (Tancik et al. 2020).
+
+    dt_norm [..., 1] -> [..., 1 + 2F]: the raw dt is kept (strict superset of the
+    plain input) and sin/cos(2*pi*b_f*dt) features are appended. The projection is
+    a seeded, non-trainable buffer (learned frequencies do not help for a 1-D
+    conditioner and add seed variance). Export-safe: fixed shapes, registered buffer.
+    """
+
+    def __init__(self, *, num_freqs: int, sigma: float, seed: int) -> None:
+        super().__init__()
+        if int(num_freqs) < 1:
+            raise ValueError(f"fourier_dt.num_freqs must be >= 1, got {num_freqs}")
+        if float(sigma) <= 0.0:
+            raise ValueError(f"fourier_dt.sigma must be > 0, got {sigma}")
+        gen = torch.Generator().manual_seed(int(seed))
+        freqs = torch.randn(int(num_freqs), generator=gen) * float(sigma)
+        self.register_buffer("freqs", freqs)
+        self.num_freqs = int(num_freqs)
+        self.out_dim = 1 + 2 * int(num_freqs)
+
+    def forward(self, dt: torch.Tensor) -> torch.Tensor:
+        torch._check(dt.shape[-1] == 1)
+        # Compute the projection and sin/cos in float32 regardless of input dtype:
+        # under bf16 the phase 2*pi*b_f*dt loses ~8 mantissa bits, aliasing the
+        # high-frequency features to noise. Cast back to the input dtype at the end.
+        dt32 = dt.to(torch.float32)
+        proj = 2.0 * math.pi * dt32 * self.freqs.to(torch.float32)
+        feats = torch.cat([dt32, torch.sin(proj), torch.cos(proj)], dim=-1)
+        return feats.to(dt.dtype)
+
+
+def build_fourier_dt(fourier_cfg: Any) -> Optional[FourierDtFeatures]:
+    """Construct FourierDtFeatures from a model.fourier_dt config dict (or None).
+
+    Absent config or enabled=False -> None (plain scalar dt, current behavior).
+    """
+    if fourier_cfg is None:
+        return None
+    if not isinstance(fourier_cfg, dict):
+        raise TypeError("model.fourier_dt must be a dict.")
+    if "enabled" not in fourier_cfg:
+        raise KeyError(
+            "model.fourier_dt present but missing 'enabled' — set it explicitly "
+            "(a silent default would be a silent architecture change)."
+        )
+    enabled = fourier_cfg["enabled"]
+    if not isinstance(enabled, bool):
+        raise TypeError("model.fourier_dt.enabled must be a bool.")
+    if not enabled:
+        return None
+    for key in ("num_freqs", "sigma", "seed"):
+        if key not in fourier_cfg:
+            raise KeyError(f"model.fourier_dt.{key} required when fourier_dt.enabled=true.")
+    return FourierDtFeatures(
+        num_freqs=int(fourier_cfg["num_freqs"]),
+        sigma=float(fourier_cfg["sigma"]),
+        seed=int(fourier_cfg["seed"]),
+    )
+
+
 def get_activation(name: str) -> ActivationFactory:
     """Return an activation factory by name."""
     key = str(name).lower().strip()
@@ -413,13 +474,17 @@ class LatentDynamics(nn.Module):
             mlp_residual: bool = True,
             layer_norm: bool = True,
             layer_norm_eps: float = 1e-5,
+            zero_init_residual_output: bool = False,
+            fourier_dt: Optional[FourierDtFeatures] = None,
     ):
         super().__init__()
         self.residual = bool(residual)
+        self.fourier_dt = fourier_dt
+        dt_dim = fourier_dt.out_dim if fourier_dt is not None else 1
 
         net_cls = ResidualMLP if bool(mlp_residual) else MLP
         self.network = net_cls(
-            int(latent_dim) + 1 + int(global_dim),
+            int(latent_dim) + dt_dim + int(global_dim),
             hidden_dims,
             int(latent_dim),
             activation_factory,
@@ -428,10 +493,26 @@ class LatentDynamics(nn.Module):
             layer_norm_eps=layer_norm_eps,
         )
 
+        # When the dynamics is residual (z_next = z + dz), zero-init the output
+        # Linear so dz == 0 at step 0 and the skip provides an exact identity prior.
+        if self.residual and bool(zero_init_residual_output):
+            with torch.no_grad():
+                out = self.network.last_linear()
+                nn.init.zeros_(out.weight)
+                if out.bias is not None:
+                    nn.init.zeros_(out.bias)
+
+    def _embed_dt(self, dt: torch.Tensor, target_dtype: torch.dtype) -> torch.Tensor:
+        """dt [..., 1] -> [..., dt_dim] (identity when fourier_dt is disabled)."""
+        dt = dt.to(target_dtype)
+        if self.fourier_dt is None:
+            return dt
+        return self.fourier_dt(dt)
+
     def forward_step(self, z: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         B = z.shape[0]  # Keep as symbolic
         dt = normalize_dt_step(dt_norm, B, context="LatentDynamics.forward_step")
-        x = torch.cat([z, dt.to(z.dtype), g], dim=-1)
+        x = torch.cat([z, self._embed_dt(dt, z.dtype), g], dim=-1)
         dz = self.network(x)
         return z + dz if self.residual else dz
 
@@ -450,7 +531,7 @@ class LatentDynamics(nn.Module):
 
         z_exp = z.unsqueeze(1).expand(B, K, -1)
         g_exp = g.unsqueeze(1).expand(B, K, -1)
-        x = torch.cat([z_exp, dt.unsqueeze(-1).to(z_exp.dtype), g_exp], dim=-1)
+        x = torch.cat([z_exp, self._embed_dt(dt.unsqueeze(-1), z_exp.dtype), g_exp], dim=-1)
 
         dz = self.network(x)
         return z_exp + dz if self.residual else dz
@@ -513,6 +594,8 @@ class FlowMapAutoencoder(nn.Module):
             predict_delta: bool = True,
             layer_norm: bool = True,
             layer_norm_eps: float = 1e-5,
+            zero_init_dynamics_output: bool = False,
+            fourier_dt: Optional[FourierDtFeatures] = None,
     ):
         super().__init__()
 
@@ -547,6 +630,8 @@ class FlowMapAutoencoder(nn.Module):
             mlp_residual=bool(residual),
             layer_norm=layer_norm,
             layer_norm_eps=layer_norm_eps,
+            zero_init_residual_output=bool(zero_init_dynamics_output),
+            fourier_dt=fourier_dt,
         )
         self.decoder = Decoder(
             self.Z,
@@ -608,14 +693,17 @@ class FlowMapMLP(nn.Module):
             predict_delta: bool = True,
             layer_norm: bool = True,
             layer_norm_eps: float = 1e-5,
+            fourier_dt: Optional[FourierDtFeatures] = None,
     ):
         super().__init__()
 
         self.S, self.G = int(state_dim), int(global_dim)
         self.predict_delta = bool(predict_delta)
+        self.fourier_dt = fourier_dt
 
         act_factory = get_activation(activation_name)
-        input_dim = self.S + 1 + self.G
+        dt_dim = fourier_dt.out_dim if fourier_dt is not None else 1
+        input_dim = self.S + dt_dim + self.G
 
         net_cls = ResidualMLP if bool(residual) else MLP
         self.network = net_cls(
@@ -642,8 +730,9 @@ class FlowMapMLP(nn.Module):
         B = y_i.shape[0]  # Keep as symbolic
         _validate_g_shape(g, B, self.G, context="FlowMapMLP.forward_step")
 
-        dt = normalize_dt_step(dt_norm, B, context="FlowMapMLP.forward_step")
-        x = torch.cat([y_i, dt.to(y_i.dtype), g], dim=-1)
+        dt = normalize_dt_step(dt_norm, B, context="FlowMapMLP.forward_step").to(y_i.dtype)
+        dt_feat = self.fourier_dt(dt) if self.fourier_dt is not None else dt
+        x = torch.cat([y_i, dt_feat, g], dim=-1)
 
         y_pred = self.network(x)
         return y_pred + y_i if self.predict_delta else y_pred
@@ -727,6 +816,12 @@ def create_model(
     predict_delta = bool(mcfg.get("predict_delta", True))
     layer_norm = bool(mcfg.get("layer_norm", True))
     layer_norm_eps = float(mcfg.get("layer_norm_eps", 1e-5))
+    fourier_dt = build_fourier_dt(mcfg.get("fourier_dt"))
+    if fourier_dt is not None:
+        log.info(
+            "fourier_dt enabled: num_freqs=%d sigma=%s (dt input dim 1 -> %d)",
+            fourier_dt.num_freqs, mcfg["fourier_dt"]["sigma"], fourier_dt.out_dim,
+        )
 
     if model_type == "mlp":
         mlp_cfg = mcfg.get("mlp")
@@ -744,6 +839,7 @@ def create_model(
             predict_delta=predict_delta,
             layer_norm=layer_norm,
             layer_norm_eps=layer_norm_eps,
+            fourier_dt=fourier_dt,
         )
 
     if model_type == "autoencoder":
@@ -761,6 +857,7 @@ def create_model(
         decoder_hidden = _as_int_list(ae_cfg.get("decoder_hidden"), name="model.autoencoder.decoder_hidden")
         residual = bool(ae_cfg.get("residual", True))
         dynamics_residual = bool(ae_cfg.get("dynamics_residual", True))
+        zero_init_dynamics_output = bool(ae_cfg.get("zero_init_dynamics_output", False))
 
         return FlowMapAutoencoder(
             state_dim=S,
@@ -776,6 +873,8 @@ def create_model(
             predict_delta=predict_delta,
             layer_norm=layer_norm,
             layer_norm_eps=layer_norm_eps,
+            zero_init_dynamics_output=zero_init_dynamics_output,
+            fourier_dt=fourier_dt,
         )
 
     raise ValueError(f"model.type unsupported: {model_type}")
