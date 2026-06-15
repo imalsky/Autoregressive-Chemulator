@@ -1,5 +1,5 @@
 #!/bin/bash
-#PBS -N AUTOCHEM8
+#PBS -N AUTOCHEM_S1
 #PBS -q gpu_long
 #PBS -W group_list=s2458
 #PBS -l select=1:ncpus=72:ngpus=1:mem=400gb:model=gh200
@@ -7,279 +7,109 @@
 #PBS -j oe
 #PBS -m abe
 
+# Stage 1 (one-jump pretrain) of the single dt-conditioned production model.
+#
+# Pipeline: preprocess once (skipped if the processed dataset already exists) ->
+# train with configs/stage1.json. Re-running the job auto-resumes from the last
+# checkpoint, so it is safe to requeue when a run exceeds the walltime.
+#
+# Submit:  qsub run.pbs
+# Stage 2: qsub -W depend=afterok:<this_jobid> run_stage2.pbs
+#
+# Evidence for every non-default config value: docs/DECISIONS.md.
+
 set -euo pipefail
 
 cd -P "${PROJECT_ROOT:-${PBS_O_WORKDIR:?}}"
 PROJECT_ROOT="$(pwd -P)"
 
-readonly BAND_NAMES=(
-  "dt_1e-3_1e-1"
-  "dt_1e-1_1e1"
-  "dt_1e1_1e3"
-  "dt_1e3_1e5"
-)
-readonly CONFIG_DIR="${PROJECT_ROOT}/configs/stage1_dt_bands"
-readonly THREADS_PER_JOB=16
+readonly CONFIG="${PROJECT_ROOT}/configs/stage1.json"
+readonly THREADS="${AUTOCHEM_THREADS:-16}"
 readonly RUN_ID="${PBS_JOBID:-manual_$(date +%Y%m%d_%H%M%S)}"
 readonly LOG_DIR="${PROJECT_ROOT}/logs"
 readonly RUNTIME_CFG_DIR="${LOG_DIR}/_runtime"
-RUN_PYTHON_JOB_PID=""
 
-log() {
-  printf '[%(%Y-%m-%dT%H:%M:%S%z)T] %s\n' -1 "$*"
-}
+log()  { printf '[%(%Y-%m-%dT%H:%M:%S%z)T] %s\n' -1 "$*"; }
+fail() { log "ERROR: $*"; exit 1; }
 
-fail() {
-  log "ERROR: $*"
-  exit 1
-}
+[ -f "${CONFIG}" ] || fail "missing config: ${CONFIG}"
 
-wait_for_jobs() {
-  local phase="$1"
-  shift
-  local failed=0
-  local job_spec name pid
-
-  for job_spec in "$@"; do
-    name="${job_spec%%:*}"
-    pid="${job_spec##*:}"
-    if wait "${pid}"; then
-      log "${phase} completed for ${name}"
-    else
-      log "${phase} failed for ${name}; see ${LOG_DIR}/${RUN_ID}_${phase}_${name}.log"
-      failed=1
-    fi
-  done
-
-  if [ "${failed}" -ne 0 ]; then
-    fail "${phase} phase failed"
-  fi
-}
-
-resolve_config_path() {
-  local config_path="$1"
-  local key="$2"
-
-  python - "${config_path}" "${key}" <<'PY'
+# resolve_cfg_path <config> <paths-key> -> absolute path (paths are relative to the config dir).
+resolve_cfg_path() {
+  python - "$1" "$2" <<'PY'
+import json, sys
 from pathlib import Path
-import json
-import sys
-
-config_path = Path(sys.argv[1])
-key = sys.argv[2]
-with config_path.open() as f:
-    config = json.load(f)
-
-resolved = Path(config["paths"][key])
-if not resolved.is_absolute():
-    resolved = config_path.parent / resolved
-
-print(resolved.resolve())
+cfg_path, key = Path(sys.argv[1]), sys.argv[2]
+cfg = json.loads(cfg_path.read_text())
+p = Path(cfg["paths"][key])
+print(p if p.is_absolute() else (cfg_path.parent / p).resolve())
 PY
 }
 
-run_python_job() {
-  local config_path="$1"
-  local log_path="$2"
-  (
-    cd "${PROJECT_ROOT}"
-    export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}${BASE_PYTHONPATH:+:${BASE_PYTHONPATH}}"
-    export AUTOCHEM_CONFIG_PATH="${config_path}"
-    python -u src/main.py
-  ) >"${log_path}" 2>&1 &
-  RUN_PYTHON_JOB_PID="$!"
-}
-
-validate_training_input() {
-  local config_path="$1"
-  local processed_dir
-  processed_dir="$(resolve_config_path "${config_path}" "processed_dir")"
-
-  python - "${processed_dir}" <<'PY'
-from pathlib import Path
-import sys
-
-processed_dir = Path(sys.argv[1])
-
-required_files = (
-    processed_dir / "normalization.json",
-    processed_dir / "preprocessing_summary.json",
-)
-for path in required_files:
-    if not path.is_file():
-        raise SystemExit(f"missing required preprocessing artifact: {path}")
-
-split_files = {}
-total_bytes = 0
-for split in ("train", "validation", "test"):
-    split_dir = processed_dir / split
-    files = sorted(split_dir.glob("*.npz")) if split_dir.is_dir() else []
-    split_files[split] = files
-    total_bytes += sum(path.stat().st_size for path in files)
-
-if not split_files["train"]:
-    raise SystemExit(f"train split is empty: {processed_dir / 'train'}")
-if not split_files["validation"]:
-    raise SystemExit(f"validation split is empty: {processed_dir / 'validation'}")
-
-print(
-    f"validated training input: total_bytes={total_bytes} "
-    f"train_files={len(split_files['train'])} "
-    f"validation_files={len(split_files['validation'])} "
-    f"test_files={len(split_files['test'])}"
-)
-PY
-}
-
-prepare_band_config() {
-  # Decide between fresh and resume launch for a single band.
-  # On resume, writes a rewritten config to RUNTIME_CFG_DIR with checkpoint_mode=resume
-  # and runtime.checkpoint set to the absolute path of last.ckpt.
-  # On fresh, validates that work_dir is empty (or absent) and uses the canonical config.
-  # Echoes the path to the config that should be used for training.
-  local band="$1"
-  local canonical_config="$2"
-  local runtime_dir="$3"
-
-  python - "${band}" "${canonical_config}" "${runtime_dir}" <<'PY'
-from pathlib import Path
-import json
-import sys
-
-band, canonical_path, runtime_dir = sys.argv[1], sys.argv[2], sys.argv[3]
-canonical_path = Path(canonical_path)
-runtime_dir = Path(runtime_dir)
-runtime_dir.mkdir(parents=True, exist_ok=True)
-
-with canonical_path.open() as f:
-    cfg = json.load(f)
-
-work_dir = Path(cfg["paths"]["work_dir"])
-if not work_dir.is_absolute():
-    work_dir = (canonical_path.parent / work_dir).resolve()
-
-last_ckpt = work_dir / "checkpoints" / "last.ckpt"
-
-if last_ckpt.is_file():
-    # Resume: rewrite a copy of the config.
-    cfg["training"]["checkpoint_mode"] = "resume"
-    cfg.setdefault("runtime", {})["checkpoint"] = str(last_ckpt.resolve())
-    out_path = runtime_dir / f"{band}.resume.json"
-    with out_path.open("w") as f:
-        json.dump(cfg, f, indent=2)
-    print(f"RESUME {band}: last.ckpt={last_ckpt} -> {out_path}", file=sys.stderr)
-    print(out_path)
-else:
-    # Fresh: work_dir must be empty (or absent).
-    if work_dir.exists() and any(work_dir.iterdir()):
-        raise SystemExit(
-            f"fresh-launch precondition failed for band {band}: work_dir not empty and no "
-            f"last.ckpt to resume from: {work_dir}. Clear it or restore last.ckpt."
-        )
-    print(f"FRESH  {band}: work_dir={work_dir} -> {canonical_path}", file=sys.stderr)
-    print(canonical_path)
-PY
-}
-
-validate_training_output() {
-  local config_path="$1"
-  local work_dir
-  work_dir="$(resolve_config_path "${config_path}" "work_dir")"
-
-  python - "${work_dir}" <<'PY'
-from pathlib import Path
-import sys
-
-work_dir = Path(sys.argv[1])
-required = (
-    work_dir / "config.resolved.json",
-    work_dir / "metrics.csv",
-)
-for path in required:
-    if not path.is_file():
-        raise SystemExit(f"missing required training artifact: {path}")
-
-ckpt_dir = work_dir / "checkpoints"
-ckpts = sorted(ckpt_dir.glob("*.ckpt")) if ckpt_dir.is_dir() else []
-if not ckpts:
-    raise SystemExit(f"no checkpoints found in {ckpt_dir}")
-
-print(f"validated training output: checkpoints={len(ckpts)} work_dir={work_dir}")
-PY
-}
-
-# ---- Conda (match the working run.pbs approach) ----
+# ---- Conda (HPC cluster environment) ----
 module purge
 module use -a /swbuild/analytix/tools/modulefiles
 module load miniconda3/gh2
-
 CONDA_BASE="$(conda info --base)"
 # shellcheck disable=SC1090
 source "${CONDA_BASE}/etc/profile.d/conda.sh"
-
 CONDA_ENV="${CONDA_ENV:-pyt2_8_gh}"
-set +e
-conda activate "${CONDA_ENV}"
-rc=$?
-set -e
-if [ "${rc}" -ne 0 ]; then
-  echo "ERROR: failed to activate conda env: ${CONDA_ENV}"
-  echo "Available envs are:"
-  conda info --envs || true
-  exit 2
-fi
+conda activate "${CONDA_ENV}" || fail "failed to activate conda env: ${CONDA_ENV}"
 
-# Remove the incompatible x86 version
+# GH200 needs the ARM-native h5py build (the x86 wheel may be cached).
 pip uninstall -y h5py || true
-
-# Install the correct ARM version for GH200 (force no cache to avoid picking up the old file)
 pip install h5py --no-cache-dir
 
 mkdir -p "${LOG_DIR}" "${RUNTIME_CFG_DIR}" "${PROJECT_ROOT}/data" "${PROJECT_ROOT}/models"
 
 export HDF5_USE_FILE_LOCKING=FALSE
-export OMP_NUM_THREADS="${THREADS_PER_JOB}"
-export MKL_NUM_THREADS="${THREADS_PER_JOB}"
-export OPENBLAS_NUM_THREADS="${THREADS_PER_JOB}"
-export NUMEXPR_NUM_THREADS="${THREADS_PER_JOB}"
+export OMP_NUM_THREADS="${THREADS}"
+export MKL_NUM_THREADS="${THREADS}"
+export OPENBLAS_NUM_THREADS="${THREADS}"
+export NUMEXPR_NUM_THREADS="${THREADS}"
 export PYTHONUNBUFFERED=1
-BASE_PYTHONPATH="${PYTHONPATH:-}"
+export PYTHONPATH="${PROJECT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+export AUTOCHEM_CONFIG_PATH="${CONFIG}"
 
-declare -A BAND_CONFIGS=()
+PROCESSED_DIR="$(resolve_cfg_path "${CONFIG}" processed_dir)"
+WORK_DIR="$(resolve_cfg_path "${CONFIG}" work_dir)"
 
-for band in "${BAND_NAMES[@]}"; do
-  config_path="${CONFIG_DIR}/${band}.json"
-  [ -f "${config_path}" ] || fail "missing band config: ${config_path}"
-  BAND_CONFIGS["${band}"]="${config_path}"
-done
+# ---- Preprocess once (skip if the normalized dataset already exists) ----
+if [ -f "${PROCESSED_DIR}/normalization.json" ]; then
+  log "processed dataset present: ${PROCESSED_DIR} (skipping preprocessing)"
+else
+  log "preprocessing -> ${PROCESSED_DIR}"
+  python -u processing/preprocessing.py
+fi
 
-# ---- Validate preprocessing input, prepare per-band launch config, then parallel training ----
-declare -A LAUNCH_CONFIGS=()
-declare -a train_jobs=()
+# ---- Train stage 1 (auto-resume if a checkpoint already exists) ----
+LAST_CKPT="${WORK_DIR}/checkpoints/last.ckpt"
+if [ -f "${LAST_CKPT}" ]; then
+  log "resuming stage-1 from ${LAST_CKPT}"
+  RESUME_CFG="${RUNTIME_CFG_DIR}/stage1.resume.json"
+  # Write a resume copy with checkpoint_mode=resume and ABSOLUTE paths (so it works
+  # regardless of where the resume copy lives).
+  python - "${CONFIG}" "${LAST_CKPT}" "${RESUME_CFG}" <<'PY'
+import json, sys
+from pathlib import Path
+src, ckpt, out = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
+cfg = json.loads(src.read_text())
+base = src.parent
+for key in ("raw_dir", "processed_dir", "work_dir"):
+    p = Path(cfg["paths"][key])
+    cfg["paths"][key] = str(p if p.is_absolute() else (base / p).resolve())
+cfg["training"]["checkpoint_mode"] = "resume"
+cfg.setdefault("runtime", {})["checkpoint"] = str(Path(ckpt).resolve())
+out.write_text(json.dumps(cfg, indent=2))
+PY
+  AUTOCHEM_CONFIG_PATH="${RESUME_CFG}" python -u src/main.py
+else
+  log "fresh stage-1 training -> ${WORK_DIR}"
+  python -u src/main.py
+fi
 
-for band in "${BAND_NAMES[@]}"; do
-  config_path="${BAND_CONFIGS[$band]}"
-  validate_training_input "${config_path}"
-  # prepare_band_config emits the launch-config path on stdout (canonical for fresh,
-  # rewritten resume copy for restart). Diagnostic logs go to stderr.
-  launch_path="$(prepare_band_config "${band}" "${config_path}" "${RUNTIME_CFG_DIR}")"
-  LAUNCH_CONFIGS["${band}"]="${launch_path}"
-  log "prepared band ${band}: ${launch_path}"
-done
-
-log "launching parallel stage-1 training for ${#BAND_NAMES[@]} bands"
-for band in "${BAND_NAMES[@]}"; do
-  launch_path="${LAUNCH_CONFIGS[$band]}"
-  log_path="${LOG_DIR}/${RUN_ID}_train_${band}.log"
-  run_python_job "${launch_path}" "${log_path}"
-  pid="${RUN_PYTHON_JOB_PID}"
-  train_jobs+=( "${band}:${pid}" )
-done
-wait_for_jobs "train" "${train_jobs[@]}"
-
-for band in "${BAND_NAMES[@]}"; do
-  config_path="${BAND_CONFIGS[$band]}"
-  validate_training_output "${config_path}"
-done
-
-log "all ${#BAND_NAMES[@]} stage-1 dt-band training jobs completed successfully"
+# ---- Validate outputs ----
+[ -f "${WORK_DIR}/config.resolved.json" ] || fail "missing ${WORK_DIR}/config.resolved.json"
+[ -f "${WORK_DIR}/metrics.csv" ]          || fail "missing ${WORK_DIR}/metrics.csv"
+ls "${WORK_DIR}"/checkpoints/*.ckpt >/dev/null 2>&1 || fail "no checkpoints in ${WORK_DIR}/checkpoints"
+log "stage-1 complete (run ${RUN_ID}); checkpoints in ${WORK_DIR}/checkpoints"

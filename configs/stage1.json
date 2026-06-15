@@ -1,12 +1,11 @@
 {
   "_comment": [
-    "FALLBACK banded layout (stage2, dt band 1e1_1e3) \u2014 NOT the primary recommendation.",
-    "E2 found band specialists collapse 5-40x at deployment-style fixed-dt rollouts even",
-    "in-band, while the single full-range model holds (see DECISIONS.md, Gate G2).",
-    "Delivered per the conservative keep-both-options policy: the sandbox band emulation",
-    "conflates time-segment with dt-band more than Auto-Chem preprocessing does, so the",
-    "production pathology may be milder. Use only if the single model shows a measured",
-    "gap at the deployment dt that a deployment-dt-concentrated stage-2 cannot close."
+    "PRODUCTION stage 1 (one-jump pretrain) - single dt-conditioned model over dt in [0.1, 1e3] s.",
+    "Evidence and justification for every non-default key: docs/DECISIONS.md.",
+    "Preprocess first (writes ../data/processed):",
+    "  AUTOCHEM_CONFIG_PATH=configs/stage1.json python -u processing/preprocessing.py",
+    "Then train:",
+    "  AUTOCHEM_CONFIG_PATH=configs/stage1.json python -u src/main.py"
   ],
   "precision": {
     "compute_dtype": "float32",
@@ -18,9 +17,9 @@
     "loss_dtype": "float32"
   },
   "paths": {
-    "raw_dir": "../../../data/raw",
-    "processed_dir": "../../../data/processed_prod_dt_1e1_1e3",
-    "work_dir": "../../../models/prod_fallback_stage2_dt_1e1_1e3"
+    "raw_dir": "../data/raw",
+    "processed_dir": "../data/processed",
+    "work_dir": "../models/stage1"
   },
   "system": {
     "device": "cpu",
@@ -28,7 +27,7 @@
     "seed": 1234
   },
   "runtime": {
-    "checkpoint": "../../../models/prod_fallback_stage1_dt_1e1_1e3/checkpoints/last.ckpt",
+    "checkpoint": null,
     "load_weights_strict": true,
     "accelerator": "auto",
     "devices": "auto",
@@ -52,7 +51,7 @@
       "dynamic": false,
       "fullgraph": true,
       "compile_forward_step": true,
-      "compile_open_loop_unroll": false
+      "compile_open_loop_unroll": true
     }
   },
   "data": {
@@ -85,22 +84,25 @@
     }
   },
   "preprocessing": {
-    "_comment": [
-      "Identical to stage 1 \u2014 stage 2 reuses the same processed shards",
-      "(data/processed_prod_dt_1e-1_1e3). Do NOT rerun preprocessing for stage 2."
+    "_comment_full_dataset": [
+      "Full-dataset settings: pool_size and output_trajectories_per_file are set high",
+      "enough to consume every trajectory in every raw file (~160 files).",
+      "samples_per_source_trajectory=4 draws 4 independent (dt, t_start) chunks per",
+      "source trajectory - dt-diversity per state is the load-bearing robustness",
+      "ingredient found in E2 (see docs/DECISIONS.md)."
     ],
     "raw_file_patterns": [
       "*.h5",
       "*.hdf5"
     ],
-    "dt_min": 10.0,
+    "dt_min": 0.1,
     "dt_max": 1000.0,
     "dt_sampling": "loguniform",
     "n_steps": 100,
     "t_min": 0.0,
     "output_trajectories_per_file": 1000000,
     "shard_size": 4096,
-    "overwrite": false,
+    "overwrite": true,
     "time_key": "t_time",
     "val_fraction": 0.1,
     "test_fraction": 0.1,
@@ -111,7 +113,7 @@
     "drop_below": 1e-30
   },
   "dataset": {
-    "windows_per_trajectory": 92,
+    "windows_per_trajectory": 32,
     "preload_to_device": true,
     "shard_cache_size": 2
   },
@@ -128,7 +130,7 @@
       "sigma": 1.0,
       "seed": 0,
       "_comment": [
-        "Disabled 2026-06-11 per F1/F2 (see DECISIONS.md): on the residual trunk,",
+        "Disabled 2026-06-11 per F1/F2 (see docs/DECISIONS.md): on the residual trunk,",
         "Fourier-dt was harmful at 135k-param scale, replicated across 2 seeds.",
         "Re-enable only if the production-scale spot-check contradicts this."
       ]
@@ -159,20 +161,20 @@
   },
   "training": {
     "batch_size": 2048,
-    "max_epochs": 200,
-    "checkpoint_mode": "weights_only",
+    "max_epochs": 400,
+    "checkpoint_mode": "none",
     "num_workers": 0,
     "pin_memory": true,
     "persistent_workers": false,
     "prefetch_factor": null,
-    "rollout_steps": 10,
+    "rollout_steps": 1,
     "loss": {
       "lambda_log10_mae": 1.0,
-      "lambda_z_mse": 0.25
+      "lambda_z_mse": 0.1
     },
     "optimizer": {
       "name": "adamw",
-      "lr": 3e-05,
+      "lr": 0.0003,
       "weight_decay": 1e-05,
       "exclude_norm_and_bias_from_weight_decay": true,
       "betas": [
@@ -186,35 +188,34 @@
     "scheduler": {
       "enabled": true,
       "type": "reduce_on_plateau",
-      "warmup_epochs": 5,
+      "warmup_epochs": 30,
       "factor": 0.5,
-      "patience": 10,
-      "threshold": 0.0001,
-      "min_lr": 1e-08,
+      "patience": 15,
+      "threshold": 0.001,
+      "min_lr": 1e-07,
       "mode": "min",
       "monitor": "val_loss"
     },
     "autoregressive_training": {
-      "enabled": true,
-      "skip_steps": 1,
-      "detach_between_steps": false,
-      "backward_per_step": false,
-      "loss_discount_gamma": 1.0
+      "enabled": false,
+      "skip_steps": 0,
+      "detach_between_steps": true,
+      "backward_per_step": true
     },
     "curriculum": {
-      "enabled": true,
-      "start_steps": 2,
-      "end_steps": 10,
+      "enabled": false,
+      "start_steps": 1,
+      "end_steps": 1,
       "mode": "linear",
-      "ramp_epochs": 30
+      "ramp_epochs": 0
     },
     "ema": {
       "enabled": true,
-      "decay": 0.999
+      "decay": 0.9995
     },
     "early_stopping": {
       "enabled": true,
-      "patience": 20,
+      "patience": 30,
       "min_delta": 1e-05
     }
   }

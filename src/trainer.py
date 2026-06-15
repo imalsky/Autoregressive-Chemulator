@@ -61,13 +61,14 @@ from lightning_utilities.core.rank_zero import rank_zero_warn
 
 _LOSS_DENOM_EPS = 1e-3
 _LOG_GRAD_NORM_DEFAULT = False
+# Uniform per-step rollout weighting (no discount). Only consulted when the
+# optional training.autoregressive_training.loss_discount_gamma key is absent.
+_DEFAULT_LOSS_DISCOUNT_GAMMA = 1.0
 log = logging.getLogger(__name__)
 
 # ==============================================================================
 # Optimizer parameter groups
 # ==============================================================================
-
-EXCLUDE_NORM_AND_BIAS_FROM_WEIGHT_DECAY_BY_DEFAULT = True
 
 _NORM_MODULE_TYPES = (
     nn.LayerNorm,
@@ -124,6 +125,7 @@ class WarmupReduceLROnPlateau(torch.optim.lr_scheduler.ReduceLROnPlateau):
     """ReduceLROnPlateau with linear warmup over optimizer steps."""
 
     def __init__(self, optimizer: torch.optim.Optimizer, *, warmup_steps: int, **kwargs: Any) -> None:
+        """Capture base LRs and start at LR=0 if warming up; kwargs pass through to ReduceLROnPlateau."""
         self.warmup_steps = int(max(0, warmup_steps))
         self.warmup_step_count = 0
         self.base_lrs = [float(group["lr"]) for group in optimizer.param_groups]
@@ -133,21 +135,25 @@ class WarmupReduceLROnPlateau(torch.optim.lr_scheduler.ReduceLROnPlateau):
 
     @property
     def warmup_active(self) -> bool:
+        """True while still inside the linear warmup ramp."""
         return self.warmup_step_count < self.warmup_steps
 
     def _set_warmup_lrs(self, *, step: int) -> None:
+        """Set each param group's LR to base_lr * (step / warmup_steps)."""
         scale = float(step) / float(max(1, self.warmup_steps))
         for group, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
             group["lr"] = float(base_lr) * scale
         self._last_lr = [float(group["lr"]) for group in self.optimizer.param_groups]
 
     def step_warmup(self) -> None:
+        """Advance the warmup ramp by one optimizer step (no-op once warmup is complete)."""
         if not self.warmup_active:
             return
         self.warmup_step_count += 1
         self._set_warmup_lrs(step=self.warmup_step_count)
 
     def step(self, metrics: Any, epoch: Optional[int] = None) -> None:
+        """Plateau step on the monitored metric; suppressed while warmup is still active."""
         if self.warmup_active:
             return
         super().step(metrics, epoch=epoch)
@@ -188,6 +194,11 @@ class HybridLoss(nn.Module):
         *,
         step_weights: Optional[torch.Tensor] = None,  # [K]
     ) -> Dict[str, torch.Tensor]:
+        """Compute the hybrid loss over [B,K,S] predictions.
+
+        Returns loss_total = lambda_log10_mae * log10_MAE + lambda_z_mse * z_MSE, plus the two
+        components. Optional per-step weights mask/scale the K rollout steps (None = uniform).
+        """
         if pred_z.shape != true_z.shape:
             raise ValueError(f"Shape mismatch: pred_z={tuple(pred_z.shape)} true_z={tuple(true_z.shape)}")
         if pred_z.ndim != 3:
@@ -249,20 +260,20 @@ def build_loss_buffers(
 
 
 def _try_torch_compile(fn: Any, *, cfg: Mapping[str, Any], context: str) -> Any:
-    """Optionally wrap a callable with torch.compile (strict)."""
-    runtime = dict(cfg.get("runtime", {}) or {})
-    tc = dict(runtime.get("torch_compile", {}) or {})
-    if not bool(tc.get("enabled", True)):
+    """Optionally wrap a callable with torch.compile (strict; required keys only)."""
+    runtime = cfg["runtime"]
+    tc = runtime["torch_compile"]
+    if not bool(tc["enabled"]):
         return fn
 
     if not hasattr(torch, "compile"):
         raise RuntimeError(f"runtime.torch_compile.enabled=True but torch.compile is unavailable ({context}).")
 
-    backend = str(tc.get("backend", "inductor"))
-    mode = str(tc.get("mode", "default"))
-    dynamic = bool(tc.get("dynamic", False))
-    fullgraph = bool(tc.get("fullgraph", False))
-    accelerator = str(runtime.get("accelerator", "auto")).lower().strip()
+    backend = str(tc["backend"])
+    mode = str(tc["mode"])
+    dynamic = bool(tc["dynamic"])
+    fullgraph = bool(tc["fullgraph"])
+    accelerator = str(runtime["accelerator"]).lower().strip()
 
     mps_available = bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
     targeting_mps = accelerator == "mps" or (accelerator == "auto" and mps_available and not torch.cuda.is_available())
@@ -292,6 +303,7 @@ class RolloutCurriculum:
     ramp_epochs: int
 
     def steps(self, epoch: int) -> int:
+        """Return the rollout horizon for `epoch`, ramping start_steps -> end_steps over ramp_epochs."""
         end_k = int(self.end_steps)
         if not self.enabled:
             return end_k
@@ -332,6 +344,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         species_variables: Sequence[str],
         precision: Optional[PrecisionConfig] = None,
     ) -> None:
+        """Wire the model, loss, precision, curriculum, AR settings, and optional torch.compile from cfg."""
         super().__init__()
         self.model = model
         self.normalization_manifest = dict(normalization_manifest)
@@ -344,32 +357,27 @@ class FlowMapRolloutModule(pl.LightningModule):
         self.loss_dtype = self.precision_config.loss_dtype
 
         tcfg = dict(cfg["training"])
-        mcfg = dict(cfg.get("model", {}) or {})
+        mcfg = dict(cfg["model"])
 
         self.max_epochs = int(tcfg["max_epochs"])
         self.rollout_steps = int(tcfg["rollout_steps"])
         if self.rollout_steps < 1:
             raise ValueError(f"training.rollout_steps must be >= 1, got {self.rollout_steps}")
 
-        ar_cfg = dict(tcfg.get("autoregressive_training", {}) or {})
-        self.autoregressive_training = bool(ar_cfg.get("enabled", False))
-        if self.autoregressive_training:
-            if "skip_steps" not in ar_cfg:
-                raise KeyError("missing: training.autoregressive_training.skip_steps")
-            if "detach_between_steps" not in ar_cfg:
-                raise KeyError("missing: training.autoregressive_training.detach_between_steps")
-            self.ar_skip_steps = int(ar_cfg["skip_steps"])
-            if self.ar_skip_steps < 0:
-                raise ValueError(f"training.autoregressive_training.skip_steps must be >= 0, got {self.ar_skip_steps}")
-            self.ar_detach_between_steps = bool(ar_cfg["detach_between_steps"])
-        else:
-            self.ar_skip_steps = 0
-            self.ar_detach_between_steps = True
-        self.ar_backward_per_step = bool(ar_cfg.get("backward_per_step", True))
+        # The full autoregressive_training block is schema-required (enabled, skip_steps,
+        # detach_between_steps, backward_per_step); read them directly. When AR is disabled
+        # these values are inert (the one-jump training path ignores them).
+        ar_cfg = dict(tcfg["autoregressive_training"])
+        self.autoregressive_training = bool(ar_cfg["enabled"])
+        self.ar_skip_steps = int(ar_cfg["skip_steps"])
+        if self.ar_skip_steps < 0:
+            raise ValueError(f"training.autoregressive_training.skip_steps must be >= 0, got {self.ar_skip_steps}")
+        self.ar_detach_between_steps = bool(ar_cfg["detach_between_steps"])
+        self.ar_backward_per_step = bool(ar_cfg["backward_per_step"])
         # Per-step discount gamma^(k-skip) on the rollout loss. 1.0 = uniform (legacy).
-        # Validation/checkpoint selection (_eval_step) intentionally stays uniformly
-        # weighted so val_loss is comparable across gamma settings.
-        self.ar_loss_discount_gamma = float(ar_cfg.get("loss_discount_gamma", 1.0))
+        # Optional key; validation/checkpoint selection (_eval_step) intentionally stays
+        # uniformly weighted so val_loss is comparable across gamma settings.
+        self.ar_loss_discount_gamma = float(ar_cfg.get("loss_discount_gamma", _DEFAULT_LOSS_DISCOUNT_GAMMA))
         if not (0.0 < self.ar_loss_discount_gamma <= 1.0):
             raise ValueError(
                 "training.autoregressive_training.loss_discount_gamma must be in (0, 1], "
@@ -384,8 +392,8 @@ class FlowMapRolloutModule(pl.LightningModule):
         # Manual-optimization gradient clipping: Lightning forbids Trainer(gradient_clip_val=...)
         # with manual optimization, so in AR mode the module clips via this value instead
         # (build_lightning_trainer withholds it from the Trainer in that case).
-        runtime_cfg = dict(cfg.get("runtime", {}) or {})
-        clip_raw = runtime_cfg.get("gradient_clip_val", None)
+        runtime_cfg = dict(cfg["runtime"])
+        clip_raw = runtime_cfg["gradient_clip_val"]  # required; may be 0.0 (disabled)
         self._manual_grad_clip_val: Optional[float] = float(clip_raw) if clip_raw is not None else None
 
         if not self.autoregressive_training and self.rollout_steps != 1:
@@ -397,25 +405,14 @@ class FlowMapRolloutModule(pl.LightningModule):
         if self.autoregressive_training:
             self.automatic_optimization = False
 
-        # Curriculum (training only).
-        cur_cfg = dict(tcfg.get("curriculum", {}) or {})
-        cur_enabled = bool(cur_cfg.get("enabled", False))
-        if cur_enabled:
-            if "start_steps" not in cur_cfg:
-                raise KeyError("missing: training.curriculum.start_steps")
-            if "end_steps" not in cur_cfg:
-                raise KeyError("missing: training.curriculum.end_steps")
-            start_steps = int(cur_cfg["start_steps"])
-            end_steps = int(cur_cfg["end_steps"])
-        else:
-            start_steps = int(cur_cfg.get("start_steps", 1))
-            end_steps = int(cur_cfg.get("end_steps", self.rollout_steps))
+        # Curriculum (training only). The full block is schema-required; read directly.
+        cur_cfg = dict(tcfg["curriculum"])
         self.curriculum = RolloutCurriculum(
-            enabled=cur_enabled,
-            mode=str(cur_cfg.get("mode", "linear")),
-            start_steps=start_steps,
-            end_steps=end_steps,
-            ramp_epochs=int(cur_cfg.get("ramp_epochs", 0)),
+            enabled=bool(cur_cfg["enabled"]),
+            mode=str(cur_cfg["mode"]),
+            start_steps=int(cur_cfg["start_steps"]),
+            end_steps=int(cur_cfg["end_steps"]),
+            ramp_epochs=int(cur_cfg["ramp_epochs"]),
         )
 
         # Loss
@@ -434,24 +431,25 @@ class FlowMapRolloutModule(pl.LightningModule):
             loss_dtype=self.loss_dtype,
         )
 
-        self.sched_cfg = dict(tcfg.get("scheduler", {}) or {})
+        self.sched_cfg = dict(tcfg["scheduler"])
 
         # Validate model interface once at init (both FlowMapMLP and FlowMapAutoencoder provide this).
         if not hasattr(self.model, "forward_step"):
             raise RuntimeError("Model must implement forward_step(y_t, dt, g) -> y_{t+1}.")
 
-        # Optional compilation
-        runtime = dict(cfg.get("runtime", {}) or {})
-        tc = dict(runtime.get("torch_compile", {}) or {})
+        # Optional compilation (torch_compile block is schema-required).
+        runtime = dict(cfg["runtime"])
+        tc = dict(runtime["torch_compile"])
+        # log_grad_norm is an optional perf/debug knob (named-constant default).
         self.log_grad_norm = bool(runtime.get("log_grad_norm", _LOG_GRAD_NORM_DEFAULT))
         self._compiled_forward_step: Optional[Any] = None
         self._compiled_open_loop_unroll: Optional[Any] = None
-        if bool(tc.get("enabled", True)):
-            if bool(tc.get("compile_forward_step", True)):
+        if bool(tc["enabled"]):
+            if bool(tc["compile_forward_step"]):
                 self._compiled_forward_step = _try_torch_compile(
                     self.model.forward_step, cfg=cfg, context="FlowMapRolloutModule.model.forward_step"  # type: ignore[attr-defined]
                 )
-            if bool(tc.get("compile_open_loop_unroll", True)):
+            if bool(tc["compile_open_loop_unroll"]):
                 self._compiled_open_loop_unroll = _try_torch_compile(
                     self._open_loop_unroll_raw_step, cfg=cfg, context="FlowMapRolloutModule._open_loop_unroll_raw_step"
                 )
@@ -491,6 +489,7 @@ class FlowMapRolloutModule(pl.LightningModule):
     # ------------------------
 
     def on_fit_start(self) -> None:
+        """Log a one-time note that train_loss and val_loss use different rollout procedures."""
         if self._warned_metric_mismatch:
             return
         self._warned_metric_mismatch = True
@@ -524,10 +523,12 @@ class FlowMapRolloutModule(pl.LightningModule):
     # ------------------------
 
     def _forward_step(self, y_t: torch.Tensor, dt: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        """Single model step y_t -> y_{t+1}, using the compiled step when available."""
         fn = self._compiled_forward_step if self._compiled_forward_step is not None else self.model.forward_step  # type: ignore[attr-defined]
         return fn(y_t, dt, g)  # type: ignore[misc]
 
     def _coerce_g(self, g: torch.Tensor, batch_size: int, like: torch.Tensor) -> torch.Tensor:
+        """Broadcast globals g to [batch_size, G] and move to `like`'s device/dtype (strict shape checks)."""
         if g.ndim == 1:
             g = g.view(1, -1).expand(batch_size, -1)
         elif g.ndim == 2:
@@ -541,12 +542,14 @@ class FlowMapRolloutModule(pl.LightningModule):
         return g.to(device=like.device, dtype=like.dtype)
 
     def _train_rollout_steps(self, epoch: int, *, transitions: int) -> int:
+        """Training horizon for this epoch: min(rollout_steps, available transitions, curriculum step)."""
         if not self.curriculum.enabled:
             return int(min(self.rollout_steps, transitions))
         k = int(self.curriculum.steps(epoch))
         return int(min(self.rollout_steps, transitions, k))
 
     def _eval_rollout_steps(self, *, transitions: int) -> int:
+        """Fixed eval horizon: min(rollout_steps, available transitions) (no curriculum)."""
         return int(min(self.rollout_steps, transitions))
 
     def _cast_batch_tensors(
@@ -625,6 +628,7 @@ class FlowMapRolloutModule(pl.LightningModule):
     # ------------------------
 
     def _get_single_optimizer(self) -> torch.optim.Optimizer:
+        """Return the single optimizer (this project never configures more than one)."""
         opt = self.optimizers()
         if isinstance(opt, (list, tuple)):
             if len(opt) != 1:
@@ -633,12 +637,18 @@ class FlowMapRolloutModule(pl.LightningModule):
         return opt
 
     def _accumulate_grad_batches(self) -> int:
+        """Return the trainer's accumulate_grad_batches as an int >= 1 (handles the schedule-dict form)."""
         acc = getattr(self.trainer, "accumulate_grad_batches", 1)
         if isinstance(acc, Mapping):
             acc = int(acc.get(0, list(acc.values())[0]))
         return int(max(1, int(acc)))
 
     def _maybe_step_optimizer(self, opt: torch.optim.Optimizer, batch_idx: int) -> None:
+        """Step the optimizer on accumulation boundaries: unscale, optional grad-norm log, clip, step, zero.
+
+        Manual-optimization path only (autoregressive mode). Also advances non-plateau schedulers
+        and the warmup ramp; plateau schedulers are stepped on validation end instead.
+        """
         acc = self._accumulate_grad_batches()
         n_batches = getattr(self.trainer, "num_training_batches", batch_idx + 1)
         # num_training_batches can be float('inf') for unsized iterables; fall back to accumulation-only stepping.
@@ -702,6 +712,7 @@ class FlowMapRolloutModule(pl.LightningModule):
             sch.step()
 
     def optimizer_step(self, *args: Any, **kwargs: Any) -> None:
+        """Automatic-optimization hook: after the normal step, hand-advance the warmup ramp only."""
         # Automatic-optimization path: Lightning already drives step/epoch LR schedulers
         # (cosine LambdaLR with interval="step", plateau on validation_end). The only
         # scheduler we must hand-advance is the custom WarmupReduceLROnPlateau's
@@ -721,6 +732,7 @@ class FlowMapRolloutModule(pl.LightningModule):
                 sch.step_warmup()
 
     def _scheduler_steps_per_epoch(self) -> int:
+        """Estimate optimizer steps per epoch (batches / accumulation), for sizing the warmup ramp."""
         if self.trainer is None:
             raise RuntimeError("Trainer must be attached before configure_optimizers for scheduler warmup.")
 
@@ -742,6 +754,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         return int(max(1, math.ceil(float(max_steps) / float(max_epochs))))
 
     def _scheduler_warmup_steps(self, warmup_epochs: int) -> int:
+        """Convert a warmup duration in epochs into optimizer steps, clamped to [0, max_steps]."""
         if warmup_epochs <= 0:
             return 0
         if self.trainer is None:
@@ -761,6 +774,7 @@ class FlowMapRolloutModule(pl.LightningModule):
     # ------------------------
 
     def _training_step_one_jump(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        """One-jump training: single transition y0 -> y1, loss on that one step (automatic optimization)."""
         y = batch["y"]
         dt = batch["dt"]
         g = batch["g"]
@@ -794,6 +808,12 @@ class FlowMapRolloutModule(pl.LightningModule):
 
 
     def _training_step_autoregressive(self, batch: Mapping[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        """Autoregressive rollout training (manual optimization).
+
+        Runs skip_steps warmup under no_grad (pushforward), then trains steps [skip..k_train) either
+        with stop-grad-per-step (detached) or full BPTT, applying the gamma^(k-skip) per-step weights.
+        Curriculum sets k_train per epoch. Handles its own backward/step via _maybe_step_optimizer.
+        """
         y = batch["y"]
         dt = batch["dt"]
         g = batch["g"]
@@ -893,6 +913,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         return loss_total
 
     def _eval_step(self, batch: Mapping[str, torch.Tensor], stage: str) -> torch.Tensor:
+        """Open-loop rollout evaluation for val/test: unroll k_eval steps and log the (uniformly weighted) loss."""
         y = batch["y"]
         dt = batch["dt"]
         g = batch["g"]
@@ -933,25 +954,29 @@ class FlowMapRolloutModule(pl.LightningModule):
         return loss_total
 
     def training_step(self, batch: Mapping[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        """Dispatch to the autoregressive or one-jump training step based on config."""
         if self.autoregressive_training:
             return self._training_step_autoregressive(batch, batch_idx)
         return self._training_step_one_jump(batch)
 
     def validation_step(self, batch: Mapping[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        """Open-loop rollout validation step (logs val_loss)."""
         return self._eval_step(batch, stage="val")
 
     def test_step(self, batch: Mapping[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        """Open-loop rollout test step (logs test_loss)."""
         return self._eval_step(batch, stage="test")
 
     def on_validation_epoch_end(self) -> None:
         """Step ReduceLROnPlateau schedulers when using manual optimization."""
         if not self.autoregressive_training:
             return
-        if not self.sched_cfg or not bool(self.sched_cfg.get("enabled", False)):
+        if not bool(self.sched_cfg["enabled"]):
             return
 
         metrics = getattr(self.trainer, "callback_metrics", {}) or {}
-        monitor = str(self.sched_cfg.get("monitor", "val_loss"))
+        # configure_optimizers enforces scheduler.monitor == "val_loss" for the plateau path.
+        monitor = "val_loss"
         metric = metrics.get(monitor, None)
         if metric is None:
             return
@@ -974,30 +999,29 @@ class FlowMapRolloutModule(pl.LightningModule):
     # ------------------------
 
     def configure_optimizers(self) -> Any:
+        """Build the AdamW optimizer (with norm/bias WD exclusion) and the configured LR scheduler.
+
+        Supports reduce_on_plateau (wrapped with linear warmup) and cosine_with_warmup. Returns the
+        Lightning optimizer/scheduler dict; scheduler.monitor is required to be "val_loss".
+        """
         tcfg = dict(self.hparams["training"])
         opt_cfg = dict(tcfg["optimizer"])
 
         name = str(opt_cfg["name"]).lower()
         lr = float(opt_cfg["lr"])
-        weight_decay = float(opt_cfg.get("weight_decay", 0.0))
-
-        exclude_nd = bool(
-            opt_cfg.get(
-                "exclude_norm_and_bias_from_weight_decay",
-                EXCLUDE_NORM_AND_BIAS_FROM_WEIGHT_DECAY_BY_DEFAULT,
-            )
-        )
+        weight_decay = float(opt_cfg["weight_decay"])
+        exclude_nd = bool(opt_cfg["exclude_norm_and_bias_from_weight_decay"])
         param_groups = _build_optimizer_param_groups(self, weight_decay=weight_decay, exclude_norm_and_bias=exclude_nd)
 
         if name != "adamw":
             raise ValueError("Unsupported optimizer; only 'adamw' is allowed")
 
-        betas = opt_cfg.get("betas", (0.9, 0.999))
+        betas = opt_cfg["betas"]
         b0, b1 = float(betas[0]), float(betas[1])
-        eps = float(opt_cfg.get("eps", 1e-8))
+        eps = float(opt_cfg["eps"])
 
-        use_fused = bool(opt_cfg.get("fused", True))
-        use_foreach = bool(opt_cfg.get("foreach", True))
+        use_fused = bool(opt_cfg["fused"])
+        use_foreach = bool(opt_cfg["foreach"])
         if use_fused and use_foreach:
             raise ValueError("optimizer config invalid: fused and foreach cannot both be true")
 
@@ -1017,8 +1041,8 @@ class FlowMapRolloutModule(pl.LightningModule):
             opt_kwargs["foreach"] = use_foreach
         opt = torch.optim.AdamW(**opt_kwargs)
 
-        sched_cfg = dict(tcfg.get("scheduler", {}) or {})
-        if not bool(sched_cfg.get("enabled", False)):
+        sched_cfg = dict(tcfg["scheduler"])
+        if not bool(sched_cfg["enabled"]):
             return opt
 
         sched_type_raw = str(sched_cfg["type"]).strip()
@@ -1111,15 +1135,23 @@ def build_lightning_trainer(
     precision_config: Optional[PrecisionConfig] = None,
     train_batches_per_epoch: Optional[int] = None,
 ) -> pl.Trainer:
+    """Construct the Lightning Trainer from the (validated) config.
+
+    Wires the CSV logger, LR monitor, and the optional EMA / early-stopping /
+    checkpoint callbacks, plus precision and gradient clipping. All runtime and
+    checkpointing keys are schema-required and read directly (no silent defaults);
+    the EMA and early-stopping blocks are required too, each gated by its own
+    explicit ``enabled`` flag.
+    """
     tcfg = cfg["training"]
-    runtime = dict(cfg.get("runtime", {}) or {})
+    runtime = cfg["runtime"]
 
     max_epochs = int(tcfg["max_epochs"])
-    devices = runtime.get("devices", "auto")
-    accelerator = runtime.get("accelerator", "auto")
+    devices = runtime["devices"]
+    accelerator = runtime["accelerator"]
     prec = precision_config if precision_config is not None else parse_precision_config(cfg)
     lightning_precision = prec.lightning_precision
-    log_every_n_steps = int(runtime.get("log_every_n_steps", 50))
+    log_every_n_steps = int(runtime["log_every_n_steps"])
     if log_every_n_steps <= 0:
         raise ValueError("runtime.log_every_n_steps must be > 0")
     if train_batches_per_epoch is not None:
@@ -1127,12 +1159,12 @@ def build_lightning_trainer(
             raise ValueError("train_batches_per_epoch must be > 0 when provided")
         log_every_n_steps = min(log_every_n_steps, int(train_batches_per_epoch))
 
-    ckpt_cfg = dict(runtime.get("checkpointing", {}) or {})
-    enable_ckpt = bool(ckpt_cfg.get("enabled", True))
-    ckpt_every_n_epochs = int(ckpt_cfg.get("every_n_epochs", 1))
-    save_top_k = int(ckpt_cfg.get("save_top_k", 1))
-    save_last = bool(ckpt_cfg.get("save_last", True))
-    monitor = str(ckpt_cfg.get("monitor", "val_loss"))
+    ckpt_cfg = dict(runtime["checkpointing"])
+    enable_ckpt = bool(ckpt_cfg["enabled"])
+    ckpt_every_n_epochs = int(ckpt_cfg["every_n_epochs"])
+    save_top_k = int(ckpt_cfg["save_top_k"])
+    save_last = bool(ckpt_cfg["save_last"])
+    monitor = str(ckpt_cfg["monitor"])
     if monitor != "val_loss":
         raise ValueError("runtime.checkpointing.monitor must be 'val_loss'")
 
@@ -1152,9 +1184,9 @@ def build_lightning_trainer(
 
     callbacks: List[pl.Callback] = [LearningRateMonitor(logging_interval="epoch")]
 
-    ema_cfg = tcfg.get("ema", {}) or {}
-    if bool(ema_cfg.get("enabled", False)):
-        callbacks.append(EMACallback(decay=float(ema_cfg.get("decay", 0.9995))))
+    ema_cfg = tcfg["ema"]
+    if bool(ema_cfg["enabled"]):
+        callbacks.append(EMACallback(decay=float(ema_cfg["decay"])))
 
     if enable_ckpt:
         ckpt_dir = work_dir / "checkpoints"
@@ -1171,27 +1203,27 @@ def build_lightning_trainer(
             )
         )
 
-    es_cfg = tcfg.get("early_stopping", {}) or {}
-    if bool(es_cfg.get("enabled", False)):
+    es_cfg = tcfg["early_stopping"]
+    if bool(es_cfg["enabled"]):
         callbacks.append(
             EarlyStopping(
                 monitor="val_loss",
                 mode="min",
-                patience=int(es_cfg.get("patience", 30)),
-                min_delta=float(es_cfg.get("min_delta", 1e-5)),
+                patience=int(es_cfg["patience"]),
+                min_delta=float(es_cfg["min_delta"]),
                 check_finite=True,
                 verbose=True,
             )
         )
 
-    grad_clip = runtime.get("gradient_clip_val", None)
+    grad_clip = runtime["gradient_clip_val"]
     gradient_clip_val = float(grad_clip) if grad_clip is not None else None
 
     # Lightning raises if gradient_clip_val is set while the module uses manual
     # optimization (the autoregressive path). The module clips in-loop instead
     # (FlowMapRolloutModule._manual_grad_clip_val), so withhold it here.
-    ar_cfg = dict(dict(cfg.get("training", {}) or {}).get("autoregressive_training", {}) or {})
-    if bool(ar_cfg.get("enabled", False)) and gradient_clip_val is not None:
+    ar_cfg = dict(tcfg["autoregressive_training"])
+    if bool(ar_cfg["enabled"]) and gradient_clip_val is not None:
         log.info(
             "Autoregressive (manual optimization): gradient clipping (%.3g) is applied "
             "in-module; not passing gradient_clip_val to the Lightning Trainer.",
@@ -1199,8 +1231,8 @@ def build_lightning_trainer(
         )
         gradient_clip_val = None
 
-    strategy = runtime.get("strategy", "auto")
-    accumulate_grad_batches = int(runtime.get("accumulate_grad_batches", 1))
+    strategy = runtime["strategy"]
+    accumulate_grad_batches = int(runtime["accumulate_grad_batches"])
 
     trainer_kwargs = dict(
         default_root_dir=str(work_dir),
@@ -1212,13 +1244,13 @@ def build_lightning_trainer(
         log_every_n_steps=log_every_n_steps,
         callbacks=callbacks,
         logger=csv_logger,
-        enable_progress_bar=bool(runtime.get("enable_progress_bar", False)),
+        enable_progress_bar=bool(runtime["enable_progress_bar"]),
         enable_model_summary=False,
         num_sanity_val_steps=0,
         enable_checkpointing=bool(enable_ckpt),
         gradient_clip_val=gradient_clip_val,
         accumulate_grad_batches=accumulate_grad_batches,
-        deterministic=bool(runtime.get("deterministic", False)),
+        deterministic=bool(runtime["deterministic"]),
     )
 
     return pl.Trainer(**trainer_kwargs)

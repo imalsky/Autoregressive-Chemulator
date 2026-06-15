@@ -35,7 +35,7 @@ import matplotlib.pyplot as plt
 # =============================================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-CONFIG_PATH = PROJECT_ROOT / "config.json"
+CONFIG_PATH = PROJECT_ROOT / "configs" / "stage1.json"
 
 # If None, selects first matching file under config.paths.raw_dir using
 # config.preprocessing.raw_file_patterns.

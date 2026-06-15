@@ -297,6 +297,7 @@ def plot_losses(m, out_path: Path, *, run_name: str) -> None:
     ax.set_yscale("log")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
+    ax.set_title(run_name)
     ax.set_box_aspect(1)  # square plot area
 
     ax.legend(loc="best", fontsize=8)

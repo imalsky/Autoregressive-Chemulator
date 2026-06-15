@@ -5,9 +5,9 @@
 # Exercises the strict config validation, the new model/trainer code paths, and the
 # checkpoint handoff WITHOUT the real dataset. Scratch lives under smoke_scratch/.
 #
-# Usage:  conda activate nn && bash configs/production/run_local_smoke.sh
+# Usage:  conda activate nn && bash testing/run_local_smoke.sh
 set -euo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/../.."   # Auto-Chem repo root
+cd "$(dirname "${BASH_SOURCE[0]}")/.."   # Auto-Chem repo root (this script lives in testing/)
 export KMP_DUPLICATE_LIB_OK=TRUE
 
 SCRATCH="smoke_scratch"
@@ -23,7 +23,7 @@ import json, copy, sys
 from pathlib import Path
 
 scratch = sys.argv[1]
-root = Path("configs/production")
+root = Path("configs")
 
 def smoke_ify(cfg, stage):
     # The smoke config lives inside the scratch dir, so paths are plain names
@@ -53,9 +53,9 @@ def smoke_ify(cfg, stage):
         ar["loss_discount_gamma"] = 0.9
     return c
 
-for stage, src in [("stage1", "stage1_dt_1e-1_1e3.json"),
-                   ("stage2", "stage2_dt_1e-1_1e3.json"),
-                   ("stage2_detached", "stage2_dt_1e-1_1e3.json")]:
+for stage, src in [("stage1", "stage1.json"),
+                   ("stage2", "stage2.json"),
+                   ("stage2_detached", "stage2.json")]:
     cfg = json.load(open(root / src))
     out = Path(scratch) / f"smoke_{stage}.json"
     out.write_text(json.dumps(smoke_ify(cfg, stage), indent=2))
