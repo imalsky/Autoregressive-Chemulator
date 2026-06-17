@@ -100,7 +100,7 @@
     "dt_sampling": "loguniform",
     "n_steps": 100,
     "t_min": 0.0,
-    "output_trajectories_per_file": 1000000,
+    "output_trajectories_per_file": 100000,
     "shard_size": 4096,
     "overwrite": true,
     "time_key": "t_time",
@@ -110,7 +110,8 @@
     "pool_size": 1000000,
     "samples_per_source_trajectory": 4,
     "max_chunk_attempts_per_source": 200,
-    "drop_below": 1e-30
+    "drop_below": 1e-30,
+    "num_workers": 64
   },
   "dataset": {
     "windows_per_trajectory": 32,

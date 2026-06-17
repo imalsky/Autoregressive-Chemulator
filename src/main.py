@@ -196,6 +196,9 @@ _OPTIONAL_CONFIG_KEYS: Tuple[str, ...] = (
     "runtime.mode",
     # Optional perf knob for manual-optimization training path (default in code if absent).
     "runtime.log_grad_norm",
+    # Number of worker processes for the preprocessing per-file sampling fan-out.
+    # Consumed only by processing/preprocessing.py; harmless/optional to the trainer.
+    "preprocessing.num_workers",
     # Scheduler-specific keys are validated conditionally from training.scheduler.type.
     "training.scheduler.min_lr_ratio",
     "training.scheduler.factor",

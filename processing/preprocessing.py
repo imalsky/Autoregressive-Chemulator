@@ -43,9 +43,23 @@ import logging
 import os
 import shutil
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+# Cap native BLAS/OpenMP threads to 1 BEFORE numpy/h5py load their backends. The
+# preprocessing fan-out runs one process per raw file (preprocessing.num_workers);
+# without this, each of the ~64 workers would spawn its own BLAS thread-pool and
+# oversubscribe the node. Honors PBS-provided overrides (setdefault).
+for _thread_var in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+):
+    os.environ.setdefault(_thread_var, "1")
 
 import h5py
 import numpy as np
@@ -113,6 +127,7 @@ _REQUIRED_SECTION_KEYS: Dict[str, Tuple[str, ...]] = {
         "samples_per_source_trajectory",
         "max_chunk_attempts_per_source",
         "drop_below",
+        "num_workers",
     ),
     "system": ("device", "log_level", "seed"),
 }
@@ -286,6 +301,7 @@ class PreCfg:
     samples_per_source_trajectory: int
     max_chunk_attempts_per_source: int
     drop_below: float
+    num_workers: int  # number of parallel worker processes for the per-file sampling fan-out
 
 
 def load_json(path: Path) -> Dict:
@@ -388,7 +404,10 @@ def parse_precfg(cfg: Dict, *, cfg_path: Path) -> PreCfg:
     samples_per_source_trajectory = _require_int(pr, "samples_per_source_trajectory")
     max_chunk_attempts_per_source = _require_int(pr, "max_chunk_attempts_per_source")
     drop_below = _require_float(pr, "drop_below")
+    num_workers = _require_int(pr, "num_workers")
 
+    if num_workers <= 0:
+        raise ValueError("preprocessing.num_workers must be > 0")
     if output_trajectories_per_file <= 0:
         raise ValueError("preprocessing.output_trajectories_per_file must be > 0")
     if shard_size <= 0:
@@ -430,6 +449,7 @@ def parse_precfg(cfg: Dict, *, cfg_path: Path) -> PreCfg:
         samples_per_source_trajectory=samples_per_source_trajectory,
         max_chunk_attempts_per_source=max_chunk_attempts_per_source,
         drop_below=drop_below,
+        num_workers=num_workers,
     )
 
 
@@ -496,11 +516,17 @@ def flush_shard(
     g_buf: List[np.ndarray],
     dt_buf: List[np.ndarray],
     suffix: str,
+    name_prefix: str = "shard",
 ) -> Tuple[int, int]:
     """Stack the buffered samples and write one NPZ shard; return (next_idx, n_written).
 
     The `_physical` suffix selects the physical schema (y_mat/globals/dt_mat); otherwise
     the normalized schema (y_mat/globals/dt_norm_mat) is written. Empty buffers no-op.
+
+    `name_prefix` namespaces the shard filename so that the parallel per-file workers
+    write non-colliding paths (e.g. ``shard_f0007_000003_physical.npz``). Downstream
+    ``iter_shards`` globs ``shard_*{suffix}.npz``, so any prefix starting with ``shard``
+    is discovered.
     """
     if not y_buf:
         return shard_idx, 0
@@ -512,7 +538,7 @@ def flush_shard(
     g_mat = np.stack(g_buf, axis=0)
     dt_mat = np.stack(dt_buf, axis=0)
 
-    shard_path = split_dir / f"shard_{shard_idx:06d}{suffix}.npz"
+    shard_path = split_dir / f"{name_prefix}_{shard_idx:06d}{suffix}.npz"
 
     if suffix.endswith("_physical"):
         np.savez(shard_path, y_mat=y_mat, globals=g_mat, dt_mat=dt_mat)
@@ -809,14 +835,22 @@ def interp_loglog(
 
 def sample_file(
     file_path: Path,
+    file_idx: int,
     *,
     out_tmp: Path,
     cfg: PreCfg,
-    rng: np.random.Generator,
-    counts_total: Dict[str, int],
-    shard_idx: Dict[str, int],
-) -> Dict[str, int]:
-    """Sample and resample trajectories from a single HDF5 file into physical shards."""
+) -> Tuple[Dict[str, int], Dict[str, int]]:
+    """Sample and resample trajectories from a single HDF5 file into physical shards.
+
+    Self-contained so it can run in a worker process: it owns a per-file RNG (seeded
+    deterministically from ``cfg.seed`` and ``file_idx``, independent of how many files
+    run concurrently), its own per-split shard counters, and a per-file shard-name
+    prefix. Returns ``(written_by_split, rejects)`` for the parent to aggregate.
+    """
+
+    rng = np.random.default_rng([int(cfg.seed), int(file_idx)])
+    shard_idx: Dict[str, int] = {"train": 0, "validation": 0, "test": 0}
+    name_prefix = f"shard_f{int(file_idx):04d}"
 
     y_buf: Dict[str, List[np.ndarray]] = {"train": [], "validation": [], "test": []}
     g_buf: Dict[str, List[np.ndarray]] = {"train": [], "validation": [], "test": []}
@@ -973,7 +1007,6 @@ def sample_file(
                 g_buf[split].append(g_vec32)
                 dt_buf[split].append(np.full(cfg.n_steps - 1, dt_s, dtype=np.float32))
 
-                counts_total[split] += 1
                 written_by_split[split] += 1
                 written += 1
 
@@ -986,6 +1019,7 @@ def sample_file(
                         g_buf=g_buf[split],
                         dt_buf=dt_buf[split],
                         suffix="_physical",
+                        name_prefix=name_prefix,
                     )
                     y_buf[split].clear()
                     g_buf[split].clear()
@@ -1000,6 +1034,7 @@ def sample_file(
                 g_buf=g_buf[sp],
                 dt_buf=dt_buf[sp],
                 suffix="_physical",
+                name_prefix=name_prefix,
             )
 
     log.info(
@@ -1012,7 +1047,7 @@ def sample_file(
         rejects,
     )
 
-    return rejects
+    return written_by_split, rejects
 
 
 # -----------------------------------------------------------------------------
@@ -1356,32 +1391,34 @@ def main() -> None:
     clean_processed_outputs(out_final, overwrite=cfg.overwrite)
 
     counts_total = {"train": 0, "validation": 0, "test": 0}
-    shard_idx = {"train": 0, "validation": 0, "test": 0}
     rejects_total: Dict[str, int] = {}
 
-    rng = np.random.default_rng(cfg.seed)
+    n_workers = max(1, min(int(cfg.num_workers), len(raw_files)))
 
     log.info(
-        "Starting preprocessing raw_dir=%s processed_dir=%s files=%d",
+        "Starting preprocessing raw_dir=%s processed_dir=%s files=%d num_workers=%d",
         str(cfg.raw_dir),
         str(cfg.processed_dir),
         len(raw_files),
+        n_workers,
     )
 
     t0 = time.time()
 
-    for fp in raw_files:
-        log.info("Processing %s", fp.name)
-        rej = sample_file(
-            fp,
-            out_tmp=out_tmp,
-            cfg=cfg,
-            rng=rng,
-            counts_total=counts_total,
-            shard_idx=shard_idx,
-        )
-        for k, v in rej.items():
-            rejects_total[k] = rejects_total.get(k, 0) + int(v)
+    # Fan out one process per raw file. Files are independent (per-file RNG and
+    # per-file shard-name prefix), so there is no shared mutable state to guard.
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        futures = {
+            executor.submit(sample_file, fp, idx, out_tmp=out_tmp, cfg=cfg): fp
+            for idx, fp in enumerate(raw_files)
+        }
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="raw files"):
+            fp = futures[fut]
+            written_by_split, rej = fut.result()
+            for sp in ("train", "validation", "test"):
+                counts_total[sp] += int(written_by_split[sp])
+            for k, v in rej.items():
+                rejects_total[k] = rejects_total.get(k, 0) + int(v)
 
     total_written = counts_total["train"] + counts_total["validation"] + counts_total["test"]
     if total_written == 0:
