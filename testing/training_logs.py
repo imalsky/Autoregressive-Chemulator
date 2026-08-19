@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # -----------------------------------------------------------------------------
 
 # Run/artifact selection (main knobs).
-RUN_DIR: str = "models_old/v3"  # Absolute path or repo-relative path
+RUN_DIR: str = "models/stage2"  # Absolute path or repo-relative path
 METRICS_FILE: str = "metrics.csv"
 
 # Output.

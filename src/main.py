@@ -29,6 +29,7 @@ import warnings
 # Avoid MKL/OpenMP duplicate symbol aborts in some environments.
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
+import shutil
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -376,7 +377,8 @@ def _to_relative_path_str(p: str, *, start: Path) -> str:
         return str(pth)
     try:
         return os.path.relpath(str(pth.resolve()), str(start.resolve()))
-    except Exception:
+    except ValueError:
+        # os.path.relpath raises ValueError only for cross-drive paths on Windows.
         return str(pth)
 
 
@@ -409,7 +411,12 @@ def _portable_config_snapshot(cfg: Mapping[str, Any], *, save_dir: Path) -> Dict
 
 
 def resolve_paths(cfg: Dict[str, Any], cfg_path: Path) -> Dict[str, Any]:
-    """Resolve cfg.paths[*] relative to the config file directory."""
+    """Resolve cfg.paths[*] and runtime.checkpoint relative to the config file directory.
+
+    runtime.checkpoint may be null (no checkpoint); null is preserved as-is.
+    Absolutizing it here keeps the persisted config snapshot on a single base:
+    _portable_config_snapshot re-bases all absolute path fields to the run directory.
+    """
     root = _repo_root(cfg_path)
 
     out = dict(cfg)
@@ -421,6 +428,13 @@ def resolve_paths(cfg: Dict[str, Any], cfg_path: Path) -> Dict[str, Any]:
             resolved[k] = _resolve_path(root, v)
 
     out["paths"] = resolved
+
+    runtime = _require_dict(out, "runtime")
+    runtime_out: Dict[str, Any] = dict(runtime)
+    ckpt = runtime_out.get("checkpoint")
+    if ckpt is not None:
+        runtime_out["checkpoint"] = _resolve_path(root, _as_str(ckpt, "runtime.checkpoint"))
+    out["runtime"] = runtime_out
     return out
 
 
@@ -494,7 +508,8 @@ def load_manifest_and_validate_config(
     cfg: Mapping[str, Any],
     processed_dir: Path,
 ) -> Tuple[Dict[str, Any], List[str], List[str]]:
-    """Load normalization.json and require config.data matches it (if present in manifest)."""
+    """Load normalization.json and require that it declares species_variables and
+    global_variables exactly matching config.data (missing keys or any mismatch is a hard error)."""
     mpath = processed_dir / "normalization.json"
     if not mpath.exists():
         raise FileNotFoundError("missing normalization.json")
@@ -717,6 +732,27 @@ def main() -> None:
     if ckpt_mode not in ("none", "resume", "weights_only"):
         raise ValueError("bad checkpoint_mode")
 
+    # Validate the checkpoint config before any expensive work (dataset preload,
+    # model/trainer build) and before work_dir is created or written to, so a
+    # bad config fails in seconds and leaves no partial run directory behind.
+    ckpt_val = _require(runtime, "checkpoint")  # required key; may be null; absolute via resolve_paths
+    ckpt_path: Optional[Path] = None
+    if ckpt_val is not None:
+        ckpt_path = Path(_as_str(ckpt_val, "runtime.checkpoint"))
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
+        if not ckpt_path.is_file():
+            raise ValueError(f"checkpoint must be a file: {ckpt_path}")
+
+    strict_load = _as_bool(_require(runtime, "load_weights_strict"), "runtime.load_weights_strict")
+
+    if ckpt_mode == "none" and ckpt_path is not None:
+        raise ValueError("checkpoint_mode=none with checkpoint set")
+    if ckpt_mode == "resume" and ckpt_path is None:
+        raise ValueError("resume requires checkpoint")
+    if ckpt_mode == "weights_only" and ckpt_path is None:
+        raise ValueError("weights_only requires checkpoint")
+
     # No automatic backups. Fresh training requires an empty work_dir.
     # Resume mode allows non-empty work_dir (continuing in same directory).
     if ckpt_mode != "resume":
@@ -731,7 +767,7 @@ def main() -> None:
 
     processed_dir = Path(_as_str(_require(paths, "processed_dir"), "paths.processed_dir")).expanduser().resolve()
 
-    # Manifest must exist; config.data must match it if manifest provides variable lists.
+    # Manifest must exist and must declare variable lists that exactly match config.data.
     manifest, species_vars, global_vars = load_manifest_and_validate_config(cfg, processed_dir)
 
     preload_to_device = _as_bool(_require(ds_cfg, "preload_to_device"), "dataset.preload_to_device")
@@ -782,8 +818,9 @@ def main() -> None:
         precision=prec,
     )
 
-    # On resume/weights-only runs, preserve any existing metrics.csv before Lightning touches it.
-    if ckpt_mode in ("resume", "weights_only") and os.environ.get("LOCAL_RANK", "0") == "0":
+    # On resume runs, preserve any existing metrics.csv before Lightning touches it.
+    # (Non-resume modes require an empty work_dir, so nothing can exist yet.)
+    if ckpt_mode == "resume" and os.environ.get("LOCAL_RANK", "0") == "0":
         m = work_dir / "metrics.csv"
         if m.exists():
             dst = work_dir / "metrics.pre_restart.csv"
@@ -801,37 +838,43 @@ def main() -> None:
     )
     atomic_write_json(work_dir / "config.resolved.json", _portable_config_snapshot(cfg, save_dir=work_dir))
 
-    ckpt_val = _require(runtime, "checkpoint")  # required key; may be null
-    ckpt_path: Optional[Path] = None
-
-    if ckpt_val is not None:
-        ckpt_raw = _as_str(ckpt_val, "runtime.checkpoint")
-        ckpt_path = Path(_resolve_path(_repo_root(cfg_path), ckpt_raw))
-        if not ckpt_path.exists():
-            raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
-        if not ckpt_path.is_file():
-            raise ValueError(f"checkpoint must be a file: {ckpt_path}")
-
-    strict_load = _as_bool(_require(runtime, "load_weights_strict"), "runtime.load_weights_strict")
-
     if ckpt_mode == "none":
-        if ckpt_path is not None:
-            raise ValueError("checkpoint_mode=none with checkpoint set")
         trainer.fit(lit_module, train_dataloaders=train_dl, val_dataloaders=val_dl, ckpt_path=None)
 
     elif ckpt_mode == "resume":
-        if ckpt_path is None:
-            raise ValueError("resume requires checkpoint")
         trainer.fit(lit_module, train_dataloaders=train_dl, val_dataloaders=val_dl, ckpt_path=str(ckpt_path))
 
     elif ckpt_mode == "weights_only":
-        if ckpt_path is None:
-            raise ValueError("weights_only requires checkpoint")
         _load_weights_only(lit_module, ckpt_path, strict=strict_load)
         trainer.fit(lit_module, train_dataloaders=train_dl, val_dataloaders=val_dl, ckpt_path=None)
 
     else:
         raise ValueError("bad checkpoint_mode")
+
+    # Publish the best-val_loss checkpoint under a stable name for export tooling
+    # (testing/export.py, testing/aoti_export.py consume checkpoints/best.ckpt).
+    ckpt_enabled = _as_bool(
+        _require(_require_dict(runtime, "checkpointing"), "enabled"),
+        "runtime.checkpointing.enabled",
+    )
+    if ckpt_enabled and trainer.is_global_zero:
+        mc = trainer.checkpoint_callback
+        if mc is None:
+            raise RuntimeError("checkpointing enabled but no ModelCheckpoint callback found")
+        best_src = str(mc.best_model_path or "").strip()
+        if not best_src:
+            raise RuntimeError(
+                "checkpointing enabled but ModelCheckpoint.best_model_path is empty; "
+                "no best checkpoint was saved during fit"
+            )
+        best_path = Path(best_src)
+        if not best_path.is_file():
+            raise FileNotFoundError(f"best checkpoint not found: {best_path}")
+        dst = work_dir / "checkpoints" / "best.ckpt"
+        tmp = dst.parent / (dst.name + ".tmp")
+        shutil.copy2(best_path, tmp)
+        tmp.replace(dst)
+        log.info("best checkpoint (val_loss): %s -> %s", best_path, dst)
 
 
 if __name__ == "__main__":

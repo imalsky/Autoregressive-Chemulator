@@ -50,7 +50,7 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -66,7 +66,13 @@ REQUIRED_GLOBALS: Tuple[str, str] = ("P", "T")
 
 # Runtime settings (edit here; no argparse).
 RUN_DIR = (REPO_ROOT / "models" / "stage2").resolve()  # deployable model = stage-2 output
-CHECKPOINT = "checkpoints/last.ckpt"  # relative paths are resolved against run config directory
+# Best-val_loss checkpoint (written by src/main.py after training); relative paths are
+# resolved against the run config directory and the file must exist.
+CHECKPOINT = "checkpoints/best.ckpt"
+# Optional processed-dir override (absolute or repo-relative) for run dirs whose configured
+# processed_dir has been relocated. When set, it is the sole candidate and must contain
+# normalization.json. None => use cfg.paths.processed_dir strictly (no fallbacks).
+PROCESSED_DIR_OVERRIDE: Optional[str] = None
 EXPORT_DEVICES = "cpu,cuda"  # requested targets; unavailable devices are skipped with CPU fallback
 EXPORT_DTYPE = "float32"
 EXPORT_STRICT = True
@@ -78,7 +84,6 @@ B_MAX = 16384
 
 # Numerical constants for the baked normalizer (mirror processing/preprocessing.py semantics).
 _DENOM_EPS = 1e-12          # floor for normalization denominators (avoids divide-by-zero)
-_FALLBACK_EPSILON = 1e-30   # log10 floor used only if a manifest omits "epsilon"
 
 
 # =============================================================================
@@ -452,7 +457,7 @@ def build_baked_normalizer(
     if not isinstance(stats, Mapping):
         raise TypeError("normalization.json: expected 'per_key_stats' mapping.")
 
-    eps_global = float(manifest.get("epsilon", _FALLBACK_EPSILON))
+    eps_global = float(manifest["epsilon"])  # required; canonical preprocessing always writes it
 
     def _method_for(k: str, *, allowed: set[str]) -> str:
         raw = methods_map.get(k)
@@ -470,8 +475,8 @@ def build_baked_normalizer(
     # Species log stats (required)
     s_log_mean = torch.tensor([float(stats[k]["log_mean"]) for k in species_vars], dtype=torch.float32)
     s_log_std = torch.tensor([float(stats[k]["log_std"]) for k in species_vars], dtype=torch.float32)
-    s_log_min = torch.tensor([float(stats[k].get("log_min", 0.0)) for k in species_vars], dtype=torch.float32)
-    s_log_max = torch.tensor([float(stats[k].get("log_max", 1.0)) for k in species_vars], dtype=torch.float32)
+    s_log_min = torch.tensor([float(stats[k]["log_min"]) for k in species_vars], dtype=torch.float32)
+    s_log_max = torch.tensor([float(stats[k]["log_max"]) for k in species_vars], dtype=torch.float32)
     s_eps = torch.tensor([float(stats[k].get("epsilon", eps_global)) for k in species_vars], dtype=torch.float32)
 
     # Globals stats (required; produced by canonical preprocessing).
@@ -642,49 +647,36 @@ def _validate_manifest_vs_config(cfg: Mapping[str, Any], manifest: Mapping[str, 
 
 def _resolve_processed_dir(cfg: Mapping[str, Any], *, cfg_path: Path) -> Path:
     """
-    Locate processed_dir containing normalization.json using cfg.paths.processed_dir.
+    Locate processed_dir containing normalization.json.
+
+    Strict no-fallback contract (spec 4.4.2): the sole candidate is either
+    PROCESSED_DIR_OVERRIDE (when set; for relocated datasets) or
+    cfg.paths.processed_dir resolved against the config directory. The candidate
+    must contain normalization.json or this hard-fails.
     """
-    paths = cfg.get("paths", {}) or {}
-    if not isinstance(paths, Mapping):
-        raise TypeError("config missing paths section")
+    if PROCESSED_DIR_OVERRIDE is not None:
+        configured = PROCESSED_DIR_OVERRIDE
+        candidate = _resolve_path_like(PROCESSED_DIR_OVERRIDE, base=REPO_ROOT)
+        source = "PROCESSED_DIR_OVERRIDE"
+    else:
+        paths = cfg.get("paths", {}) or {}
+        if not isinstance(paths, Mapping):
+            raise TypeError("config missing paths section")
 
-    processed = paths.get("processed_dir")
-    if not isinstance(processed, str) or not processed.strip():
-        raise KeyError("config.paths.processed_dir is required")
+        processed = paths.get("processed_dir")
+        if not isinstance(processed, str) or not processed.strip():
+            raise KeyError("config.paths.processed_dir is required")
 
-    candidates: List[Path] = []
+        configured = processed
+        candidate = _resolve_path_like(processed, base=cfg_path.parent)
+        source = "config.paths.processed_dir"
 
-    def _add_candidate(raw_path: Path) -> None:
-        p = raw_path.resolve()
-        if p not in candidates:
-            candidates.append(p)
+    if (candidate / "normalization.json").exists():
+        return candidate
 
-    # Primary source: config.resolved.json
-    _add_candidate(_resolve_path_like(processed, base=cfg_path.parent))
-
-    # If this run dir came from another machine, the saved absolute path can be stale.
-    # Try remapping suffixes of the stale absolute path under this repo root.
-    primary_raw = Path(processed).expanduser()
-    if primary_raw.is_absolute():
-        parts = primary_raw.parts
-        for idx in range(1, len(parts)):
-            suffix = Path(*parts[idx:])
-            if len(suffix.parts) >= 2:
-                _add_candidate((REPO_ROOT / suffix))
-
-    # Last resort: the canonical default processed dir (still validated for normalization.json below).
-    _add_candidate((REPO_ROOT / "data" / "processed"))
-
-    for cand in candidates:
-        if (cand / "normalization.json").exists():
-            if cand != candidates[0]:
-                print(f"processed_dir fallback: using {cand} (configured: {candidates[0]})")
-            return cand
-
-    tried = "\n".join(f"  - {c}" for c in candidates)
     raise FileNotFoundError(
-        "normalization.json not found under any processed_dir candidate.\n"
-        f"Configured: {processed}\nTried:\n{tried}"
+        "normalization.json not found under processed_dir (no fallbacks).\n"
+        f"Source: {source}\nConfigured: {configured}\nTried:\n  - {candidate}"
     )
 
 
@@ -825,7 +817,7 @@ def _export_one(
         "species_variables": list(species_vars),
         "global_variables": list(global_vars),
         "normalization_methods": dict(manifest["normalization_methods"]),
-        "epsilon": float(manifest.get("epsilon", _FALLBACK_EPSILON)),
+        "epsilon": float(manifest["epsilon"]),
         "dt_log10_min": float(manifest["dt"]["log_min"]),
         "dt_log10_max": float(manifest["dt"]["log_max"]),
         "dt_min_seconds": float(10.0 ** float(manifest["dt"]["log_min"])),

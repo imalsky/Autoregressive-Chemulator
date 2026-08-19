@@ -162,6 +162,12 @@ def as_int(value: Any, key: str) -> int:
     return int(value)
 
 
+def as_float(value: Any, key: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"bad type: {key}")
+    return float(value)
+
+
 def as_bool(value: Any, key: str) -> bool:
     if not isinstance(value, bool):
         raise TypeError(f"bad type: {key}")

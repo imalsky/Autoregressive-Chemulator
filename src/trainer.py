@@ -19,7 +19,7 @@ Training styles (burn-in removed):
 
 Optional curriculum (training only):
 - training.curriculum ramps training rollout steps from start_steps -> rollout_steps.
-- Validation/test always use rollout_steps (fixed horizon for comparability).
+- Validation always uses rollout_steps (fixed horizon for comparability).
 
 Logging:
 - Uses Lightning CSVLogger. All self.log(...) metrics are written to metrics.csv.
@@ -454,11 +454,6 @@ class FlowMapRolloutModule(pl.LightningModule):
                     self._open_loop_unroll_raw_step, cfg=cfg, context="FlowMapRolloutModule._open_loop_unroll_raw_step"
                 )
 
-        # Dataloader wiring (kept for compatibility; main.py can also pass dataloaders directly)
-        self._train_dl = None
-        self._val_dl = None
-        self._test_dl = None
-
         # Epoch timing (logged; CSVLogger writes it)
         self._epoch_t0: Optional[float] = None
 
@@ -468,21 +463,6 @@ class FlowMapRolloutModule(pl.LightningModule):
         # Preserve for checkpoint reproducibility. Deep-copy so later config mutations
         # (or Lightning internals) can't alias the live training config.
         self.save_hyperparameters({"training": copy.deepcopy(dict(tcfg)), "model": copy.deepcopy(dict(mcfg))})
-
-    # ------------------------
-    # Dataloader wiring
-    # ------------------------
-
-    def train_dataloader(self) -> Any:
-        if self._train_dl is None:
-            raise RuntimeError("train_dataloader not set. Pass dataloaders to Trainer.fit(...).")
-        return self._train_dl
-
-    def val_dataloader(self) -> Any:
-        return self._val_dl
-
-    def test_dataloader(self) -> Any:
-        return self._test_dl
 
     # ------------------------
     # Fit-time warning about metric comparability
@@ -496,13 +476,13 @@ class FlowMapRolloutModule(pl.LightningModule):
 
         if self.autoregressive_training:
             msg = (
-                "train_loss (autoregressive training) may not be directly comparable to val_loss/test_loss "
+                "train_loss (autoregressive training) may not be directly comparable to val_loss "
                 "(open-loop rollout evaluation), especially when using detach_between_steps=True and/or a rollout curriculum. "
                 "Use the same split/stage for apples-to-apples comparisons, and log train_rollout_steps to track curriculum."
             )
         else:
             msg = (
-                "train_loss (one-jump training) is not directly comparable to val_loss/test_loss (open-loop rollout evaluation). "
+                "train_loss (one-jump training) is not directly comparable to val_loss (open-loop rollout evaluation). "
                 "Compare within the same rollout procedure."
             )
         log.info(msg)
@@ -637,14 +617,11 @@ class FlowMapRolloutModule(pl.LightningModule):
         return opt
 
     def _accumulate_grad_batches(self) -> int:
-        """Return the trainer's accumulate_grad_batches as an int >= 1 (handles the schedule-dict form)."""
-        acc = getattr(self.trainer, "accumulate_grad_batches", 1)
-        if isinstance(acc, Mapping):
-            acc = int(acc.get(0, list(acc.values())[0]))
-        return int(max(1, int(acc)))
+        """Return the trainer's accumulate_grad_batches (always 1; main.py rejects any other value)."""
+        return int(self.trainer.accumulate_grad_batches)
 
     def _maybe_step_optimizer(self, opt: torch.optim.Optimizer, batch_idx: int) -> None:
-        """Step the optimizer on accumulation boundaries: unscale, optional grad-norm log, clip, step, zero.
+        """Step the optimizer on accumulation boundaries: optional grad-norm log, clip, step, zero.
 
         Manual-optimization path only (autoregressive mode). Also advances non-plateau schedulers
         and the warmup ramp; plateau schedulers are stepped on validation end instead.
@@ -664,14 +641,8 @@ class FlowMapRolloutModule(pl.LightningModule):
         if not should_step:
             return
 
-        # Use the underlying torch optimizer for inspection/unscale when available.
+        # Use the underlying torch optimizer for grad-norm inspection when available.
         torch_opt = opt.optimizer if hasattr(opt, "optimizer") else opt
-
-        # Unscale gradients so logged grad_norm is in true scale.
-        # Only needed when a GradScaler is active (fp16 AMP); bf16/fp32 do not use one.
-        _plugin = getattr(self.trainer.strategy, "precision_plugin", None) or getattr(self.trainer, "precision_plugin", None)
-        if _plugin is not None and hasattr(_plugin, "unscale_gradients"):
-            _plugin.unscale_gradients(torch_opt)
 
         if self.log_grad_norm:
             grads = [p.grad.detach() for pg in torch_opt.param_groups for p in pg["params"] if p.grad is not None]
@@ -913,7 +884,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         return loss_total
 
     def _eval_step(self, batch: Mapping[str, torch.Tensor], stage: str) -> torch.Tensor:
-        """Open-loop rollout evaluation for val/test: unroll k_eval steps and log the (uniformly weighted) loss."""
+        """Open-loop rollout evaluation for val: unroll k_eval steps and log the (uniformly weighted) loss."""
         y = batch["y"]
         dt = batch["dt"]
         g = batch["g"]
@@ -932,7 +903,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         fn = self._compiled_open_loop_unroll if self._compiled_open_loop_unroll is not None else self._open_loop_unroll
         y_pred = fn(y0=y0, dt_bk=dt_eval, g=g)
 
-        # Keep loss definition consistent by masking skip_steps the same way in val/test.
+        # Keep loss definition consistent by masking skip_steps the same way in val.
         step_weights = None
         if self.autoregressive_training:
             step_weights = self._step_weights(k_eval, self.ar_skip_steps, device=y_pred.device)
@@ -940,16 +911,11 @@ class FlowMapRolloutModule(pl.LightningModule):
         losses = self.criterion(y_pred, y_true, step_weights=step_weights)
         loss_total = losses["loss_total"]
 
-        if stage == "val":
-            self.log("val_loss", loss_total, on_step=False, on_epoch=True, prog_bar=True)
-            self.log("val_loss_log10_mae", losses["loss_log10_mae"], on_step=False, on_epoch=True)
-            self.log("val_loss_z_mse", losses["loss_z_mse"], on_step=False, on_epoch=True)
-        elif stage == "test":
-            self.log("test_loss", loss_total, on_step=False, on_epoch=True, prog_bar=True)
-            self.log("test_loss_log10_mae", losses["loss_log10_mae"], on_step=False, on_epoch=True)
-            self.log("test_loss_z_mse", losses["loss_z_mse"], on_step=False, on_epoch=True)
-        else:
+        if stage != "val":
             raise ValueError(f"Unknown eval stage: {stage}")
+        self.log("val_loss", loss_total, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("val_loss_log10_mae", losses["loss_log10_mae"], on_step=False, on_epoch=True)
+        self.log("val_loss_z_mse", losses["loss_z_mse"], on_step=False, on_epoch=True)
 
         return loss_total
 
@@ -962,10 +928,6 @@ class FlowMapRolloutModule(pl.LightningModule):
     def validation_step(self, batch: Mapping[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         """Open-loop rollout validation step (logs val_loss)."""
         return self._eval_step(batch, stage="val")
-
-    def test_step(self, batch: Mapping[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        """Open-loop rollout test step (logs test_loss)."""
-        return self._eval_step(batch, stage="test")
 
     def on_validation_epoch_end(self) -> None:
         """Step ReduceLROnPlateau schedulers when using manual optimization."""
@@ -1195,6 +1157,7 @@ def build_lightning_trainer(
             ModelCheckpoint(
                 dirpath=str(ckpt_dir),
                 filename="epoch{epoch:03d}-val{val_loss:.6f}",
+                auto_insert_metric_name=False,
                 monitor=monitor,
                 save_top_k=save_top_k,
                 mode="min",

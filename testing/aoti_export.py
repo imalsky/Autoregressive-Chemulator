@@ -31,20 +31,29 @@ from torch._export.serde.serialize import SerializedArtifact, deserialize
 from torch.export import Dim
 
 
-ROOT = Path(__file__).resolve().parents[2]
-EXPORT_IMPL_PATH = (ROOT / "Auto-Chem" / "testing" / "export.py").resolve()
-RUN_DIR = (ROOT / "Auto-Chem" / "models" / "stage2").resolve()
-CHECKPOINT = "checkpoints/last.ckpt"
-REFERENCE_VULCAN_STATE_PATH = (ROOT / "output" / "HD189_short_thermo.vul").resolve()
-INSTALLED_RAW_MODEL_PATH = (ROOT / "Emulator" / "model" / "model.pt2").resolve()
+REPO_ROOT = Path(__file__).resolve().parents[1]
+EXPORT_IMPL_PATH = (Path(__file__).resolve().parent / "export.py").resolve()
+RUN_DIR = (REPO_ROOT / "models" / "stage2").resolve()
+# Best-val_loss checkpoint (written by src/main.py after training); resolved against
+# the run config directory and must exist.
+CHECKPOINT = "checkpoints/best.ckpt"
+# External, machine-specific inputs (edit here): this script needs a VULCAN working
+# tree providing a saved column state pickle and the installed raw Emulator model.
+# Neither lives in this repo; the script hard-fails with a clear message when absent.
+REFERENCE_VULCAN_STATE_PATH = (
+    REPO_ROOT.parent / "Misc" / "VULCAN-0D" / "output" / "HD189_short_thermo.vul"
+).resolve()
+INSTALLED_RAW_MODEL_PATH = (
+    REPO_ROOT.parent / "Misc" / "VULCAN-0D" / "Emulator" / "model" / "model.pt2"
+).resolve()
 OUTPUT_AOTI_PACKAGE_PATH = (
-    ROOT / "Auto-Chem" / "models" / "stage2" / "export_cpu_dynB_1step_phys_aoti.pt2"
+    REPO_ROOT / "models" / "stage2" / "export_cpu_dynB_1step_phys_aoti.pt2"
 ).resolve()
 OUTPUT_REPORT_PATH = (
-    ROOT / "Auto-Chem" / "models" / "stage2" / "export_cpu_dynB_1step_phys_aoti_validation.md"
+    REPO_ROOT / "models" / "stage2" / "export_cpu_dynB_1step_phys_aoti_validation.md"
 ).resolve()
 OUTPUT_JSON_PATH = (
-    ROOT / "Auto-Chem" / "models" / "stage2" / "export_cpu_dynB_1step_phys_aoti_validation.json"
+    REPO_ROOT / "models" / "stage2" / "export_cpu_dynB_1step_phys_aoti_validation.json"
 ).resolve()
 AOTI_EXAMPLE_BATCH: int | None = None
 BENCHMARK_BATCH_SIZES: tuple[int | str, ...] = (1, "nz", "2*nz")
@@ -188,7 +197,9 @@ def _load_reference_column(path: Path) -> ReferenceColumn:
     if not path.exists():
         raise FileNotFoundError(
             "Reference VULCAN state is required for this script and is missing: "
-            f"{path}"
+            f"{path}\n"
+            "This is an external, machine-specific input from a VULCAN working tree; "
+            "point REFERENCE_VULCAN_STATE_PATH at a local .vul state pickle."
         )
 
     with path.open("rb") as handle:
@@ -315,7 +326,7 @@ def _build_fresh_raw_export(
         "species_variables": list(species_vars),
         "global_variables": list(global_vars),
         "normalization_methods": dict(manifest["normalization_methods"]),
-        "epsilon": float(manifest.get("epsilon", 1e-30)),
+        "epsilon": float(manifest["epsilon"]),  # required; canonical preprocessing always writes it
         "dt_log10_min": float(manifest["dt"]["log_min"]),
         "dt_log10_max": float(manifest["dt"]["log_max"]),
         "dt_min_seconds": float(10.0 ** float(manifest["dt"]["log_min"])),
@@ -560,6 +571,14 @@ def main() -> None:
 
     export_impl = _load_export_impl()
     reference_column = _load_reference_column(REFERENCE_VULCAN_STATE_PATH)
+    # Validate both required external inputs before the expensive export/compile.
+    if not INSTALLED_RAW_MODEL_PATH.exists():
+        raise FileNotFoundError(
+            "Installed raw VULCAN model is required for this script and is missing: "
+            f"{INSTALLED_RAW_MODEL_PATH}\n"
+            "This is an external, machine-specific input from a VULCAN working tree; "
+            "point INSTALLED_RAW_MODEL_PATH at the installed Emulator/model/model.pt2."
+        )
     resolved_example_batch = _resolve_example_batch(reference_column)
     resolved_batch_sizes = _resolve_benchmark_batch_sizes(reference_column)
 

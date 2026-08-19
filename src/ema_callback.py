@@ -24,7 +24,7 @@ import torch
 class EMACallback(pl.Callback):
     """Maintain EMA-of-weights and swap them into the module for validation/checkpointing."""
 
-    def __init__(self, decay: float = 0.9995) -> None:
+    def __init__(self, *, decay: float) -> None:
         """Store the EMA decay (must be in (0, 1)); the shadow is initialized lazily."""
         super().__init__()
         if not (0.0 < decay < 1.0):

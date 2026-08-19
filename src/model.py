@@ -37,6 +37,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 import torch
 import torch.nn as nn
 
+from utils import as_bool, as_float
+
 ActivationFactory = Callable[[], nn.Module]
 
 # Small output init for delta heads. This reduces early rollout blow-ups.
@@ -325,8 +327,8 @@ class MLP(nn.Module):
             activation_factory: ActivationFactory,
             dropout_p: float = 0.0,
             *,
-            layer_norm: bool = True,
-            layer_norm_eps: float = 1e-5,
+            layer_norm: bool,
+            layer_norm_eps: float,
     ):
         super().__init__()
 
@@ -378,8 +380,8 @@ class ResidualMLP(nn.Module):
             activation_factory: ActivationFactory,
             dropout_p: float = 0.0,
             *,
-            layer_norm: bool = True,
-            layer_norm_eps: float = 1e-5,
+            layer_norm: bool,
+            layer_norm_eps: float,
     ):
         super().__init__()
 
@@ -441,9 +443,9 @@ class Encoder(nn.Module):
             activation_factory: ActivationFactory,
             dropout_p: float = 0.0,
             *,
-            residual: bool = True,
-            layer_norm: bool = True,
-            layer_norm_eps: float = 1e-5,
+            residual: bool,
+            layer_norm: bool,
+            layer_norm_eps: float,
     ):
         super().__init__()
         net_cls = ResidualMLP if bool(residual) else MLP
@@ -473,10 +475,10 @@ class LatentDynamics(nn.Module):
             activation_factory: ActivationFactory,
             dropout_p: float = 0.0,
             *,
-            residual: bool = True,
-            mlp_residual: bool = True,
-            layer_norm: bool = True,
-            layer_norm_eps: float = 1e-5,
+            residual: bool,
+            mlp_residual: bool,
+            layer_norm: bool,
+            layer_norm_eps: float,
             zero_init_residual_output: bool = False,
             fourier_dt: Optional[FourierDtFeatures] = None,
     ):
@@ -520,26 +522,6 @@ class LatentDynamics(nn.Module):
         dz = self.network(x)
         return z + dz if self.residual else dz
 
-    def forward(
-            self,
-            z: torch.Tensor,
-            dt_norm: torch.Tensor,
-            g: torch.Tensor,
-            *,
-            seq_len: Optional[int] = None,
-    ) -> torch.Tensor:
-        """Vectorized per-step prediction (not autoregressive)."""
-        torch._check(z.ndim == 2)
-        B = z.shape[0]  # Keep as symbolic
-        dt, K = prepare_dt_batch(dt_norm, B, context="LatentDynamics.forward", seq_len=seq_len)
-
-        z_exp = z.unsqueeze(1).expand(B, K, -1)
-        g_exp = g.unsqueeze(1).expand(B, K, -1)
-        x = torch.cat([z_exp, self._embed_dt(dt.unsqueeze(-1), z_exp.dtype), g_exp], dim=-1)
-
-        dz = self.network(x)
-        return z_exp + dz if self.residual else dz
-
 
 class Decoder(nn.Module):
     """Decoder: z -> y."""
@@ -552,9 +534,9 @@ class Decoder(nn.Module):
             activation_factory: ActivationFactory,
             dropout_p: float = 0.0,
             *,
-            residual: bool = True,
-            layer_norm: bool = True,
-            layer_norm_eps: float = 1e-5,
+            residual: bool,
+            layer_norm: bool,
+            layer_norm_eps: float,
     ):
         super().__init__()
         net_cls = ResidualMLP if bool(residual) else MLP
@@ -591,13 +573,13 @@ class FlowMapAutoencoder(nn.Module):
             encoder_hidden: Sequence[int] | int,
             dynamics_hidden: Sequence[int] | int,
             decoder_hidden: Sequence[int] | int,
-            activation_name: str = "gelu",
+            activation_name: str,
             dropout: float = 0.0,
-            residual: bool = True,
-            dynamics_residual: bool = True,
-            predict_delta: bool = True,
-            layer_norm: bool = True,
-            layer_norm_eps: float = 1e-5,
+            residual: bool,
+            dynamics_residual: bool,
+            predict_delta: bool,
+            layer_norm: bool,
+            layer_norm_eps: float,
             zero_init_dynamics_output: bool = False,
             fourier_dt: Optional[FourierDtFeatures] = None,
     ):
@@ -692,12 +674,12 @@ class FlowMapMLP(nn.Module):
             state_dim: int,
             global_dim: int,
             hidden_dims: Sequence[int],
-            activation_name: str = "gelu",
+            activation_name: str,
             dropout: float = 0.0,
-            residual: bool = True,
-            predict_delta: bool = True,
-            layer_norm: bool = True,
-            layer_norm_eps: float = 1e-5,
+            residual: bool,
+            predict_delta: bool,
+            layer_norm: bool,
+            layer_norm_eps: float,
             fourier_dt: Optional[FourierDtFeatures] = None,
     ):
         super().__init__()
@@ -817,12 +799,13 @@ def create_model(
         raise KeyError("model.type required.")
     model_type = str(model_type_raw).lower().strip()
 
-    # Architecture knobs are schema-required (validated in main.py); read directly.
+    # Architecture knobs are schema-required (main.py checks presence only);
+    # types are validated here, at the point of consumption.
     activation = str(mcfg["activation"]).lower().strip()
-    dropout = float(mcfg["dropout"])
-    predict_delta = bool(mcfg["predict_delta"])
-    layer_norm = bool(mcfg["layer_norm"])
-    layer_norm_eps = float(mcfg["layer_norm_eps"])
+    dropout = as_float(mcfg["dropout"], "model.dropout")
+    predict_delta = as_bool(mcfg["predict_delta"], "model.predict_delta")
+    layer_norm = as_bool(mcfg["layer_norm"], "model.layer_norm")
+    layer_norm_eps = as_float(mcfg["layer_norm_eps"], "model.layer_norm_eps")
     fourier_dt = build_fourier_dt(mcfg.get("fourier_dt"))  # optional feature block
     if fourier_dt is not None:
         log.info(
@@ -835,7 +818,7 @@ def create_model(
         if not isinstance(mlp_cfg, dict):
             raise KeyError("model.mlp required.")
         hidden_dims = _as_int_list(mlp_cfg["hidden_dims"], name="model.mlp.hidden_dims")
-        residual = bool(mlp_cfg["residual"])
+        residual = as_bool(mlp_cfg["residual"], "model.mlp.residual")
         return FlowMapMLP(
             state_dim=S,
             global_dim=G,
@@ -859,10 +842,19 @@ def create_model(
         encoder_hidden = _as_int_list(ae_cfg["encoder_hidden"], name="model.autoencoder.encoder_hidden")
         dynamics_hidden = _as_int_list(ae_cfg["dynamics_hidden"], name="model.autoencoder.dynamics_hidden")
         decoder_hidden = _as_int_list(ae_cfg["decoder_hidden"], name="model.autoencoder.decoder_hidden")
-        residual = bool(ae_cfg["residual"])
-        dynamics_residual = bool(ae_cfg["dynamics_residual"])
+        residual = as_bool(ae_cfg["residual"], "model.autoencoder.residual")
+        dynamics_residual = as_bool(ae_cfg["dynamics_residual"], "model.autoencoder.dynamics_residual")
         # zero_init_dynamics_output is an optional feature flag (default off).
-        zero_init_dynamics_output = bool(ae_cfg.get("zero_init_dynamics_output", False))
+        zero_init_dynamics_output = as_bool(
+            ae_cfg.get("zero_init_dynamics_output", False),
+            "model.autoencoder.zero_init_dynamics_output",
+        )
+        if zero_init_dynamics_output and not dynamics_residual:
+            raise ValueError(
+                "model.autoencoder.zero_init_dynamics_output has no effect when "
+                "model.autoencoder.dynamics_residual=false; remove it or set "
+                "dynamics_residual=true."
+            )
 
         return FlowMapAutoencoder(
             state_dim=S,
