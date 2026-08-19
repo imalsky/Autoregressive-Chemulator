@@ -100,7 +100,7 @@
     "dt_sampling": "loguniform",
     "n_steps": 100,
     "t_min": 0.0,
-    "output_trajectories_per_file": 100000,
+    "output_trajectories_per_file": 1000000,
     "shard_size": 4096,
     "overwrite": true,
     "time_key": "t_time",

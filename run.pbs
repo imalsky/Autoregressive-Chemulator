@@ -34,9 +34,14 @@ fail() { log "ERROR: $*"; exit 1; }
 
 [ -f "${CONFIG}" ] || fail "missing config: ${CONFIG}"
 
+# Path resolution runs before the conda setup so a doomed requeue dies in
+# seconds; it needs only a stdlib python already on PATH.
+PYBIN="$(command -v python3 || command -v python || true)"
+[ -n "${PYBIN}" ] || fail "no python3/python on PATH to resolve config paths"
+
 # resolve_cfg_path <config> <paths-key> -> absolute path (paths are relative to the config dir).
 resolve_cfg_path() {
-  python - "$1" "$2" <<'PY'
+  "${PYBIN}" - "$1" "$2" <<'PY'
 import json, sys
 from pathlib import Path
 cfg_path, key = Path(sys.argv[1]), sys.argv[2]
@@ -45,6 +50,17 @@ p = Path(cfg["paths"][key])
 print(p if p.is_absolute() else (cfg_path.parent / p).resolve())
 PY
 }
+
+PROCESSED_DIR="$(resolve_cfg_path "${CONFIG}" processed_dir)"
+WORK_DIR="$(resolve_cfg_path "${CONFIG}" work_dir)"
+LAST_CKPT="${WORK_DIR}/checkpoints/last.ckpt"
+
+# A run that dies before its first checkpoint leaves a non-empty work_dir with no
+# last.ckpt; the fresh branch below would then hard-fail inside main.py (fresh
+# runs require an empty work_dir), so fail here with the remediation instead.
+if [ ! -f "${LAST_CKPT}" ] && [ -d "${WORK_DIR}" ] && [ -n "$(ls -A "${WORK_DIR}" 2>/dev/null)" ]; then
+  fail "work_dir ${WORK_DIR} is non-empty but has no ${LAST_CKPT}: a previous run crashed before its first checkpoint. Inspect, then remove the directory and resubmit."
+fi
 
 # ---- Conda (HPC cluster environment) ----
 module purge
@@ -57,8 +73,12 @@ CONDA_ENV="${CONDA_ENV:-pyt2_8_gh}"
 conda activate "${CONDA_ENV}" || fail "failed to activate conda env: ${CONDA_ENV}"
 
 # GH200 needs the ARM-native h5py build (the x86 wheel may be cached).
-pip uninstall -y h5py || true
-pip install h5py --no-cache-dir
+# Reinstall is opt-in because the shared conda env is not writable on this cluster.
+if [ "${REINSTALL_H5PY:-0}" = "1" ]; then
+  pip install --user --no-cache-dir --force-reinstall h5py
+fi
+python -c "import h5py" >/dev/null 2>&1 \
+  || fail "h5py not importable in ${CONDA_ENV}: install the ARM-native build into the env once, or resubmit with REINSTALL_H5PY=1"
 
 mkdir -p "${LOG_DIR}" "${RUNTIME_CFG_DIR}" "${PROJECT_ROOT}/data" "${PROJECT_ROOT}/models"
 
@@ -71,9 +91,6 @@ export PYTHONUNBUFFERED=1
 export PYTHONPATH="${PROJECT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 export AUTOCHEM_CONFIG_PATH="${CONFIG}"
 
-PROCESSED_DIR="$(resolve_cfg_path "${CONFIG}" processed_dir)"
-WORK_DIR="$(resolve_cfg_path "${CONFIG}" work_dir)"
-
 # ---- Preprocess once (skip if the normalized dataset already exists) ----
 if [ -f "${PROCESSED_DIR}/normalization.json" ]; then
   log "processed dataset present: ${PROCESSED_DIR} (skipping preprocessing)"
@@ -83,7 +100,6 @@ else
 fi
 
 # ---- Train stage 1 (auto-resume if a checkpoint already exists) ----
-LAST_CKPT="${WORK_DIR}/checkpoints/last.ckpt"
 if [ -f "${LAST_CKPT}" ]; then
   log "resuming stage-1 from ${LAST_CKPT}"
   RESUME_CFG="${RUNTIME_CFG_DIR}/stage1.resume.json"

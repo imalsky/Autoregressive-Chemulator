@@ -18,6 +18,7 @@ every non-default config value.
       stage2.json         production stage 2 (autoregressive fine-tune) config
     docs/
       DECISIONS.md        per-key evidence + justification for the configs
+      AR_PAPER_PLAN.md    ApJ paper plan, outline, and evidence map
     data/                 raw HDF5 + processed NPZ shards live here (not source)
     models/               training outputs / checkpoints live here (not source)
     processing/
@@ -38,6 +39,11 @@ every non-default config value.
       predictions.py      autoregressive rollout plots (diagnostic)
       benchmark.py        throughput benchmarks (diagnostic)
       training_logs.py    training-curve plots (diagnostic)
+      eval_rollout_error.py   percentile rollout-error vs step (paper headline metric)
+      bench_speedup.py    exported-model latency sweep vs mini-chem per-cell cost
+      bench_eager_devices.py  eager CPU/MPS latency (GPU half of the speed benchmark)
+      science.mplstyle    shared matplotlib style for the paper figures
+      run.pbs             HPC: post-training export + plots job
       run_local_smoke.sh  end-to-end smoke on synthetic data
     run.pbs               HPC: stage 1 (preprocess + pretrain)
     run_stage2.pbs        HPC: stage 2 (autoregressive fine-tune)
@@ -66,6 +72,7 @@ Outputs land under `paths.work_dir` (`models/stage1`):
     metrics.csv                 per-epoch metrics (CSVLogger)
     config.resolved.json        portable snapshot of the config actually used
     checkpoints/epoch*.ckpt     Lightning checkpoints (EMA weights embedded)
+    checkpoints/best.ckpt       stable-name copy of the best-val_loss checkpoint
 
 ### 3. Train stage 2 (autoregressive fine-tune)
 
@@ -77,7 +84,9 @@ curriculum. Outputs land under `models/stage2`.
 
 Fresh training requires an empty `work_dir`. To continue a run in place, set
 `training.checkpoint_mode="resume"` and point `runtime.checkpoint` at a
-checkpoint file (the HPC scripts do this automatically on requeue).
+checkpoint file (the HPC scripts do this automatically on requeue once at least
+one checkpoint exists; a work dir from a run that died before its first
+checkpoint must be removed by hand).
 
 ### 4. Export and inspect
 
@@ -93,8 +102,9 @@ A fast end-to-end check on synthetic data (no real dataset needed):
 ## HPC
 
 `run.pbs` runs stage 1 (preprocess-if-needed + pretrain); `run_stage2.pbs` runs
-stage 2. Both target Grace-Hopper (GH200) nodes, auto-resume on requeue, and read
-`configs/stage{1,2}.json`. Typical submission:
+stage 2. Both target Grace-Hopper (GH200) nodes, auto-resume on requeue once at
+least one checkpoint exists, and read `configs/stage{1,2}.json`. Typical
+submission:
 
     qsub run.pbs
     qsub -W depend=afterok:<stage1_jobid> run_stage2.pbs

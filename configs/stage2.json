@@ -91,8 +91,9 @@
   },
   "preprocessing": {
     "_comment": [
-      "Identical to stage 1 - stage 2 reuses the same processed shards (../data/processed).",
-      "Do NOT rerun preprocessing for stage 2 (overwrite is false as a guard)."
+      "Identical to stage 1 EXCEPT overwrite=false, the sole intended difference:",
+      "stage 2 reuses the same processed shards (../data/processed); do NOT rerun",
+      "preprocessing for stage 2 (overwrite=false is the guard)."
     ],
     "raw_file_patterns": [
       "*.h5",
@@ -113,7 +114,8 @@
     "pool_size": 1000000,
     "samples_per_source_trajectory": 4,
     "max_chunk_attempts_per_source": 200,
-    "drop_below": 1e-30
+    "drop_below": 1e-30,
+    "num_workers": 64
   },
   "dataset": {
     "windows_per_trajectory": 92,

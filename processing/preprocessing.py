@@ -51,7 +51,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 # Cap native BLAS/OpenMP threads to 1 BEFORE numpy/h5py load their backends. The
 # preprocessing fan-out runs one process per raw file (preprocessing.num_workers);
 # without this, each of the ~64 workers would spawn its own BLAS thread-pool and
-# oversubscribe the node. Honors PBS-provided overrides (setdefault).
+# oversubscribe the node. Hard-assigned: launcher-exported training thread counts
+# (e.g. OMP_NUM_THREADS=16 from run.pbs) must not leak into the fan-out.
 for _thread_var in (
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
@@ -59,11 +60,13 @@ for _thread_var in (
     "NUMEXPR_NUM_THREADS",
     "VECLIB_MAXIMUM_THREADS",
 ):
-    os.environ.setdefault(_thread_var, "1")
+    os.environ[_thread_var] = "1"
 
-import h5py
-import numpy as np
-from tqdm import tqdm
+# These imports must stay below the thread-cap loop: the BLAS/OpenMP backends
+# read the env vars above at import time.
+import h5py  # noqa: E402
+import numpy as np  # noqa: E402
+from tqdm import tqdm  # noqa: E402
 
 
 # -----------------------------------------------------------------------------
@@ -839,13 +842,15 @@ def sample_file(
     *,
     out_tmp: Path,
     cfg: PreCfg,
-) -> Tuple[Dict[str, int], Dict[str, int]]:
+) -> Tuple[Dict[str, int], Dict[str, int], bool]:
     """Sample and resample trajectories from a single HDF5 file into physical shards.
 
     Self-contained so it can run in a worker process: it owns a per-file RNG (seeded
     deterministically from ``cfg.seed`` and ``file_idx``, independent of how many files
     run concurrently), its own per-split shard counters, and a per-file shard-name
-    prefix. Returns ``(written_by_split, rejects)`` for the parent to aggregate.
+    prefix. Returns ``(written_by_split, rejects, truncated)`` for the parent to
+    aggregate; ``truncated`` is True only when the per-file output cap stopped
+    sampling while candidate draws remained.
     """
 
     rng = np.random.default_rng([int(cfg.seed), int(file_idx)])
@@ -868,6 +873,7 @@ def sample_file(
 
     target = int(cfg.output_trajectories_per_file)
     written = 0
+    truncated = False
 
     step_offsets = np.arange(cfg.n_steps, dtype=np.float64)
 
@@ -877,6 +883,7 @@ def sample_file(
 
         for traj_name in pool:
             if written >= target:
+                truncated = True
                 break
 
             grp_obj = fin[traj_name]
@@ -976,6 +983,7 @@ def sample_file(
 
             for sidx in range(int(cfg.samples_per_source_trajectory)):
                 if written >= target:
+                    truncated = True
                     break
 
                 dt_s = sample_dt(cfg, rng)
@@ -1047,7 +1055,7 @@ def sample_file(
         rejects,
     )
 
-    return written_by_split, rejects
+    return written_by_split, rejects, truncated
 
 
 # -----------------------------------------------------------------------------
@@ -1376,7 +1384,8 @@ def main() -> None:
     validate_required_config_keys(cfg_dict)
 
     sys_cfg = _require_dict(cfg_dict, "system")
-    _configure_logging(_require_str(sys_cfg, "log_level"))
+    log_level = _require_str(sys_cfg, "log_level")
+    _configure_logging(log_level)
 
     cfg = parse_precfg(cfg_dict, cfg_path=cfg_path)
 
@@ -1405,20 +1414,48 @@ def main() -> None:
 
     t0 = time.time()
 
+    per_file_cap = int(cfg.output_trajectories_per_file)
+
     # Fan out one process per raw file. Files are independent (per-file RNG and
     # per-file shard-name prefix), so there is no shared mutable state to guard.
-    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+    # The initializer configures logging inside each worker so per-file log lines
+    # survive spawn/forkserver start methods (a no-op under fork, which inherits
+    # the parent's handlers).
+    with ProcessPoolExecutor(
+        max_workers=n_workers,
+        initializer=_configure_logging,
+        initargs=(log_level,),
+    ) as executor:
         futures = {
             executor.submit(sample_file, fp, idx, out_tmp=out_tmp, cfg=cfg): fp
             for idx, fp in enumerate(raw_files)
         }
-        for fut in tqdm(as_completed(futures), total=len(futures), desc="raw files"):
-            fp = futures[fut]
-            written_by_split, rej = fut.result()
-            for sp in ("train", "validation", "test"):
-                counts_total[sp] += int(written_by_split[sp])
-            for k, v in rej.items():
-                rejects_total[k] = rejects_total.get(k, 0) + int(v)
+        try:
+            for fut in tqdm(as_completed(futures), total=len(futures), desc="raw files"):
+                written_by_split, rej, truncated = fut.result()
+                for sp in ("train", "validation", "test"):
+                    counts_total[sp] += int(written_by_split[sp])
+                for k, v in rej.items():
+                    rejects_total[k] = rejects_total.get(k, 0) + int(v)
+                if truncated:
+                    log.warning(
+                        "File %s hit output_trajectories_per_file=%d; remaining "
+                        "trajectories in that file were not sampled",
+                        futures[fut].name,
+                        per_file_cap,
+                    )
+        except BaseException:
+            # Cancel queued files so a worker failure (or SIGTERM/Ctrl+C) fails
+            # fast instead of draining the whole queue. Pending futures must be
+            # cancelled directly: the context manager's exit calls
+            # shutdown(wait=True, cancel_futures=False), which resets the
+            # executor's cancel flag before the manager thread can act on it,
+            # so shutdown(cancel_futures=True) alone is racy. Exit then only
+            # joins the in-flight workers.
+            for pending_fut in futures:
+                pending_fut.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
 
     total_written = counts_total["train"] + counts_total["validation"] + counts_total["test"]
     if total_written == 0:

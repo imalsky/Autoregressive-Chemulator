@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +20,7 @@ MAX_EXAMPLES = 5
 MAX_TIME_SCAN_HITS = 50      # file-wide "time-like" dataset path hits to print
 
 
-# ---- config loader (config is one dir up) -----------------------------------
+# ---- config loader (AUTOCHEM_CONFIG_PATH, required) --------------------------
 @dataclass(frozen=True)
 class Cfg:
     raw_dir: Path
@@ -145,9 +146,15 @@ def scan_file_for_time_like_datasets(fp: h5py.File, *, max_hits: int) -> List[Tu
 
 # ---- main --------------------------------------------------------------------
 def main() -> None:
-    cfg_path = Path(__file__).resolve().parents[1] / "configs" / "stage1.json"
+    cfg_override = os.environ.get("AUTOCHEM_CONFIG_PATH", "").strip()
+    if not cfg_override:
+        raise RuntimeError(
+            "AUTOCHEM_CONFIG_PATH is not set. Point it at an explicit config file, e.g.:\n"
+            "  AUTOCHEM_CONFIG_PATH=configs/stage1.json python -u processing/testing_data.py"
+        )
+    cfg_path = Path(cfg_override).expanduser().resolve()
     if not cfg_path.exists():
-        raise SystemExit(f"Config not found at expected path: {cfg_path}")
+        raise FileNotFoundError(f"Config not found: {cfg_path}")
 
     cfg = load_cfg(cfg_path)
     print(f"[config] path={cfg_path}")

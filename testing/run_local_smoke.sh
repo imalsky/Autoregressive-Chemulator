@@ -14,10 +14,10 @@ SCRATCH="smoke_scratch"
 rm -rf "$SCRATCH"
 mkdir -p "$SCRATCH"
 
-echo "=== [1/4] synthetic raw ==="
-python processing/make_synthetic_raw.py --out-dir "$SCRATCH/raw" --n-files 2 --n-traj 30 --seed 0
+echo "=== [1/5] synthetic raw ==="
+AUTOCHEM_SYNTH_OUT_DIR="$SCRATCH/raw" python processing/make_synthetic_raw.py
 
-echo "=== [2/4] derive smoke configs from production configs ==="
+echo "=== [2/5] derive smoke configs from production configs ==="
 python - "$SCRATCH" <<'EOF'
 import json, copy, sys
 from pathlib import Path
@@ -62,7 +62,7 @@ for stage, src in [("stage1", "stage1.json"),
     print("wrote", out)
 EOF
 
-echo "=== [3/4] preprocessing + stage-1 (2 epochs) ==="
+echo "=== [3/5] preprocessing + stage-1 (2 epochs) ==="
 AUTOCHEM_CONFIG_PATH="$SCRATCH/smoke_stage1.json" python -u processing/preprocessing.py
 AUTOCHEM_CONFIG_PATH="$SCRATCH/smoke_stage1.json" python -u src/main.py
 

@@ -43,8 +43,8 @@
 | Claim / result | Status | Backing artifact |
 |---|---|---|
 | One-step model degrades under rollout (the motivating failure) | Published | sibling `main.tex` (14.5 %@10, 56.6 %@99) |
-| Latent-linear arch 3–5× better than MLP (stiff benchmark) | MEASURED | `Robertson_Tests/autoregressive/LL_CAMPAIGN.md`, `figures_l1/` |
-| Fourier-Δt scale-reversal; K-curriculum; input-noise fails; single>banded; two-stage | MEASURED | `EXPERIMENTS.md`, `notes.md`, `docs/DECISIONS.md` |
+| Latent-linear arch 3–5× better than MLP (stiff benchmark) | MEASURED | `Chemulator_Project/EXPERIMENTS.md`, `Robertson_Tests/autoregressive/figures_l1/` |
+| Fourier-Δt scale-reversal; K-curriculum; input-noise fails; single>banded; two-stage | MEASURED | `EXPERIMENTS.md`, `docs/DECISIONS.md` |
 | Architecture + two-stage recipe (definition) | KNOWN | `configs/stage1.json`, `stage2.json`, `docs/DECISIONS.md` |
 | Speed: mini-chem cold-start 92 µs (eq) / 178 µs (off-eq) per cell, in-process | MEASURED | `mini_chem/src_mini_chem_dlsode/bench_dlsode.f90` |
 | Speed: emulator CPU ~71 / MPS ~20 µs/cell (batched); comparable to mini-chem on commodity HW | MEASURED | `Auto-Chem/testing/bench_eager_devices.py`, `models/v3/bench_speedup.csv` |

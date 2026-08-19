@@ -2,7 +2,7 @@
 """make_synthetic_raw.py — tiny synthetic raw HDF5 files in the VULCAN schema.
 
 Purpose: local end-to-end smoke testing of preprocessing + training configs
-(see configs/production/run_local_smoke.sh) on machines that do not hold the
+(see testing/run_local_smoke.sh) on machines that do not hold the
 real raw dataset. NOT for science: species curves are smooth synthetic decays.
 
 Schema produced (matches processing/preprocessing.py expectations):
@@ -13,13 +13,12 @@ Schema produced (matches processing/preprocessing.py expectations):
       attrs: P, T              finite scalars (physical units)
 
 Usage:
-    python processing/make_synthetic_raw.py --out-dir /tmp/ac_smoke_raw \
-        --n-files 2 --n-traj 30 --seed 0
+    AUTOCHEM_SYNTH_OUT_DIR=/tmp/ac_smoke_raw python processing/make_synthetic_raw.py
 """
 
 from __future__ import annotations
 
-import argparse
+import os
 from pathlib import Path
 
 import h5py
@@ -33,6 +32,14 @@ SPECIES = [
 
 T_POINTS = 600
 T_START, T_END = 1e-6, 5e5   # spans the full production dt band x n_steps
+
+# Generation settings (no argparse; module-level constants per spec 9.3.4).
+# The output directory is the one run-varying input and comes from a required
+# environment variable (mirrors the AUTOCHEM_CONFIG_PATH fail-fast convention).
+OUT_DIR_ENV_VAR = "AUTOCHEM_SYNTH_OUT_DIR"
+N_FILES = 2
+N_TRAJ = 30  # trajectories per file
+SEED = 0
 
 
 def synth_trajectory(rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray, float, float]:
@@ -50,22 +57,25 @@ def synth_trajectory(rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray, 
     return t, y, P, T_K
 
 
+def _resolve_out_dir() -> Path:
+    raw = os.environ.get(OUT_DIR_ENV_VAR, "").strip()
+    if not raw:
+        raise RuntimeError(
+            f"{OUT_DIR_ENV_VAR} is not set. Point it at the output directory, e.g.:\n"
+            f"  {OUT_DIR_ENV_VAR}=/tmp/ac_smoke_raw python processing/make_synthetic_raw.py"
+        )
+    return Path(raw).expanduser()
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--n-files", type=int, default=2)
-    ap.add_argument("--n-traj", type=int, default=30, help="trajectories per file")
-    ap.add_argument("--seed", type=int, default=0)
-    args = ap.parse_args()
-
-    out = Path(args.out_dir)
+    out = _resolve_out_dir()
     out.mkdir(parents=True, exist_ok=True)
-    rng = np.random.default_rng(args.seed)
+    rng = np.random.default_rng(SEED)
 
-    for fi in range(args.n_files):
+    for fi in range(N_FILES):
         path = out / f"synthetic_run{fi:03d}.h5"
         with h5py.File(path, "w") as f:
-            for ti in range(args.n_traj):
+            for ti in range(N_TRAJ):
                 grp = f.create_group(f"run_{fi:03d}_{ti:04d}")
                 t, y, P, T_K = synth_trajectory(rng)
                 grp.create_dataset("t_time", data=t)
@@ -73,7 +83,7 @@ def main() -> None:
                     grp.create_dataset(name, data=y[:, j])
                 grp.attrs["P"] = P
                 grp.attrs["T"] = T_K
-        print(f"wrote {path} ({args.n_traj} trajectories)")
+        print(f"wrote {path} ({N_TRAJ} trajectories)")
 
 
 if __name__ == "__main__":

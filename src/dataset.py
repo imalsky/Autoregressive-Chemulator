@@ -182,7 +182,7 @@ class FlowMapRolloutDataset(Dataset):
         *,
         total_steps: int,
         windows_per_trajectory: int = 1,
-        seed: int = 1234,
+        seed: int,
         preload_to_device: bool = False,
         device: torch.device = torch.device("cpu"),
         storage_dtype: torch.dtype = torch.float32,
@@ -440,16 +440,6 @@ class FlowMapRolloutDataset(Dataset):
         y_all, g_all, dt_all = self._get_full_shard_arrays(shard_i)
         return y_all[local_i], g_all[local_i], dt_all[local_i]
 
-    def close(self) -> None:
-        """Drop cached shard arrays."""
-        self._npz_cache_full.clear()
-
-    def __enter__(self) -> "FlowMapRolloutDataset":
-        return self
-
-    def __exit__(self, _exc_type, _exc, _tb) -> None:
-        self.close()
-
     # -------------------------------------------------------------------------
     # RNG utilities
     # -------------------------------------------------------------------------
@@ -696,7 +686,7 @@ def create_dataloader(
             dataset,
             batch_size=batch_size,
             drop_last=bool(drop_last),
-            seed=getattr(dataset, "seed", 1234),
+            seed=dataset.seed,
         )
 
         stream_pin_memory = bool(pin_memory and dataset.device.type == "cpu")

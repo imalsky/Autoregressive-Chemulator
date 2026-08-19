@@ -14,7 +14,8 @@ Overlay style:
 - alpha=0.35
 - legend entries for Raw / Chunk
 
-No argparse. Configure via globals below.
+No argparse. The config file comes from AUTOCHEM_CONFIG_PATH (required);
+plot settings are the globals below.
 Outputs into: <repo_root>/figures/
 """
 
@@ -25,6 +26,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import json
+import os
 import h5py
 import numpy as np
 import matplotlib.pyplot as plt
@@ -35,7 +37,7 @@ import matplotlib.pyplot as plt
 # =============================================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-CONFIG_PATH = PROJECT_ROOT / "configs" / "stage1.json"
+# The config file comes from AUTOCHEM_CONFIG_PATH (required; no default config).
 
 # If None, selects first matching file under config.paths.raw_dir using
 # config.preprocessing.raw_file_patterns.
@@ -51,6 +53,9 @@ SEED = 1
 # Chunk generation semantics (mirrors preprocessing.py pick_t_start behavior)
 USE_ANCHOR_FIRST_CHUNK = True
 CHUNK_T_START_ATTEMPTS = 500  # random t_start attempts (after anchor)
+
+# Valid-time mask floor factor; must track preprocessing._VALID_TIME_FLOOR_FACTOR.
+VALID_TIME_FLOOR_FACTOR = 0.5
 
 # If set, overrides dt selection.
 DT_OVERRIDE: Optional[float] = None
@@ -417,7 +422,7 @@ def build_raw_and_chunk_from_preprocessing_logic(
     first_pos_time = float(t_raw[pos][0])
     t_lo = max(float(pcfg.t_min), first_pos_time)
 
-    valid = (t_raw > 0) & (t_raw >= t_lo * 0.5)
+    valid = (t_raw > 0) & (t_raw >= t_lo * VALID_TIME_FLOOR_FACTOR)
     if int(np.count_nonzero(valid)) < 2:
         raise RuntimeError(f"Rejected: too few valid samples after time filter (t_lo={t_lo:.3e})")
 
@@ -532,11 +537,18 @@ def plot_overlay_all_species(
 # =============================================================================
 
 def main() -> None:
-    if not CONFIG_PATH.exists():
-        raise FileNotFoundError(f"Config file not found: {CONFIG_PATH}")
+    cfg_override = os.environ.get("AUTOCHEM_CONFIG_PATH", "").strip()
+    if not cfg_override:
+        raise RuntimeError(
+            "AUTOCHEM_CONFIG_PATH is not set. Point it at an explicit config file, e.g.:\n"
+            "  AUTOCHEM_CONFIG_PATH=configs/stage1.json python -u processing/testing.py"
+        )
+    config_path = Path(cfg_override).expanduser().resolve()
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
 
-    cfg = load_json_config(CONFIG_PATH)
-    pcfg = load_plotcfg(cfg, cfg_path=CONFIG_PATH)
+    cfg = load_json_config(config_path)
+    pcfg = load_plotcfg(cfg, cfg_path=config_path)
     if not pcfg.species_variables:
         raise RuntimeError("data.species_variables is empty; cannot plot species curves.")
 

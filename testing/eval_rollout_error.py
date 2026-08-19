@@ -27,7 +27,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "testing"))
 
-import predictions as P  # reuse its loaders/denormalizers
+import predictions as P  # noqa: E402  (needs the sys.path insert above; reuses its loaders/denormalizers)
 
 N_SAMPLES_CAP = 4000          # cap trajectories pooled for the percentile estimate
 ROLLOUT_START_INDEX = 1       # match predictions.py default
@@ -76,7 +76,9 @@ def main() -> None:
     n = 0
     for sp in shards:
         y_mat, g_mat, dt_norm_mat = P._load_shard(sp)
-        ys.append(y_mat); gs.append(g_mat); dts.append(dt_norm_mat)
+        ys.append(y_mat)
+        gs.append(g_mat)
+        dts.append(dt_norm_mat)
         n += y_mat.shape[0]
         if n >= N_SAMPLES_CAP:
             break

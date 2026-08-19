@@ -1,11 +1,15 @@
 #!/bin/bash
-#PBS -N MYGPUPOST
+#PBS -N AUTOCHEM_POST
 #PBS -q gpu_long
 #PBS -W group_list=s2458
 #PBS -l select=1:ncpus=32:ngpus=1:mem=400gb:model=gh200
-#PBS -l walltime=72:00:00
+#PBS -l walltime=2:00:00
 #PBS -j oe
 #PBS -m abe
+
+# Post-training job for the production stage-2 run (models/stage2): export the
+# deployable .pt2, then plot loss curves and rollout predictions. Requires a
+# completed training run (submit after run.pbs / run_stage2.pbs).
 
 set -euo pipefail
 
@@ -51,6 +55,24 @@ fi
 export HDF5_USE_FILE_LOCKING=FALSE
 export PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}:${PYTHONPATH:-}"
 
+# All three steps read the production stage-2 run directory (the scripts'
+# module-level defaults). Guard each step so a missing prerequisite fails
+# with a clear message instead of deep inside Python.
+STAGE2_DIR="${REPO_ROOT}/models/stage2"
+
+require_dir() {
+  if [ ! -d "$1" ]; then
+    echo "ERROR: $2: missing directory: $1"
+    exit 2
+  fi
+}
+
+require_dir "${STAGE2_DIR}" "export step needs the stage-2 run directory"
+require_dir "${STAGE2_DIR}/checkpoints" "export step needs the stage-2 checkpoints directory"
 python -u "${REPO_ROOT}/testing/export.py"
+
+require_dir "${STAGE2_DIR}" "training_logs step needs the stage-2 run directory"
 python -u "${REPO_ROOT}/testing/training_logs.py"
+
+require_dir "${STAGE2_DIR}" "predictions step needs the stage-2 run directory"
 python -u "${REPO_ROOT}/testing/predictions.py"

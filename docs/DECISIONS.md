@@ -1,5 +1,24 @@
 # Production config decisions — evidence and justification
 
+## REVISION 2026-07-16: `output_trajectories_per_file` restored to **1e6**
+
+Commit df2c44f (2026-06-17, "fix to multi-thread processing") accidentally cut
+stage-1 `preprocessing.output_trajectories_per_file` from 1e6 to 1e5 while adding
+`num_workers: 64`, contradicting the "consume all" user decision in the table below,
+the config's own inline comment, and stage2.json. Restored to 1e6; both configs now
+carry identical preprocessing blocks except `overwrite` (stage-1 true, stage-2 false),
+with `num_workers: 64` added to stage2.json for parity. If a processed dataset was
+already built on the HPC after df2c44f, check the recorded value in the processed
+dir's `preprocessing_summary.json` and rebuild if it was made with the 1e5 cap
+(run.pbs skips preprocessing whenever the processed dir exists).
+
+Stage-1 -> stage-2 checkpoint handoff (status note): stage 2 initializes from
+`../models/stage1/checkpoints/last.ckpt`, i.e. the final-epoch EMA weights, not the
+best-val_loss checkpoint. Whether the handoff should use last or best val_loss is an
+OPEN decision to settle before launch; the config's checkpoint path stays unchanged
+until it is. `testing/export.py` exports `checkpoints/best.ckpt`, matching the
+val_loss selection contract (spec 1.3 / 6.2).
+
 ## REVISION 2026-06-11: `fourier_dt.enabled` flipped to **false**
 
 The F1/F2 production-mirror trunk shootout (~130k params — 17× the original screening
@@ -33,8 +52,11 @@ Date: 2026-06-09 (revised 2026-06-11; configs flattened/renamed and band/fallbac
 Scope: the autoregressive production configs (`configs/stage1.json` + `configs/stage2.json`),
 the two src changes that support them (`model.fourier_dt`, `loss_discount_gamma`),
 and the validation protocol. Campaign log with full numbers:
-`Chemulator_Project/notes.md`. Experiment artifacts:
-`Chemulator_Project/Robertson_Tests/autoregressive/runs_e*`.
+`Chemulator_Project/EXPERIMENTS.md` (the former `notes.md` was consolidated into it
+on 2026-06-15). Experiment artifacts: the E-series run directories
+(`Robertson_Tests/autoregressive/runs_e*`) were deleted in the 2026-06-15 cleanup
+after their numbers were verified and preserved in EXPERIMENTS.md; the surviving
+run dirs are `runs_f*` and `runs_l*`.
 
 ## Evidence base and its limits
 
@@ -101,6 +123,7 @@ no inversion of any adopted finding.
 | stage-2 `lr` | 3e-5 (= stage-1 peak / 10) | **E5**: staged pretrain→fine-tune at LR peak/10 gave the best fixed-dt result of the whole campaign (0.256 vs 0.379 from-scratch); LR peak/3 (1e-4) doubled geometric error with no fixed-dt gain. Literature: AR fine-tune LR is 5–3000× below pretrain peak (FourCastNet /5, Keisler /10 per stage, Stormer /100–/1000, GraphCast /3000); /10 is at the aggressive-but-precedented end, and the old template's 2e-5 is also fine. | medium-high |
 | stage-2 `wd` | 1e-5 (= stage 1; old template's 0.005 dropped) | No SOTA fine-tune cranks WD ×500 at the phase boundary; the 0.005 value was untested (stage 2 never ran). Keep optimizer geometry constant except LR. | medium (literature/consistency) |
 | stage-2 `lambda_z_mse` 0.25, EMA 0.999, early-stop 20, plateau warmup 5 | template values | Inherited from the stage-2 template; not locally discriminated. EMA re-warms automatically at stage start (fresh callback state); ACE evidence says EMA helps long-rollout metrics up to 15%. | inherited |
+| `runtime.torch_compile.compile_open_loop_unroll` | stage-1 true / stage-2 false | The flag affects only the validation open-loop rollout (`trainer.py` `_eval_step`), never the AR training loop, and eval K ignores the curriculum. Stage 2 disables whole-unroll compilation because a fullgraph K=10 unroll of the 10x2048 trunk is a 10x-deep inductor graph (long compile time; recompiles on a ragged final validation batch with dynamic=false); eval still runs the compiled forward step per step. Stage-1 true is redundant-but-harmless at eval K=1. | n/a (throughput only; no effect on math) |
 | **rejected: input-noise injection** | not shipped | **E6**: 4/4 noise runs worse, 3/4 catastrophic at fixed-dt (12.4–14.1 dex; σ ∈ {0.01, 0.03} z-space, with and without pushforward, 2 seeds) — *against* the GNS/Stachenfeld prior. No trainer option added. If ever revisited, sweep σ ≤ 1e-3 and re-test. | high (locally decisive) |
 | **rejected: K=20 detached training** | — | E3: consistently worse + one 1-dex blow-up; List 2024 agrees. (K>10 with BPTT untested locally — plausible future direction, not a default.) | medium |
 | **not adopted: inference-time renormalization** | off | Sturm 2024: naive projection degrades radicals/trace species (exactly what dominates a log-standardized loss); weighted projection neutral-to-positive. Track conservation drift as an EVAL metric; if the host solver needs hard conservation, the stoichiometric-output-layer route (Sturm & Wexler 2022) is the accuracy-neutral fix. | high (literature) |

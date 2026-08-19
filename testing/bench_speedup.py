@@ -19,7 +19,6 @@ import os
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
-import argparse
 import statistics
 import time
 from pathlib import Path
@@ -29,9 +28,15 @@ import torch
 # Measured mini-chem in-process per-cell cost (us), from bench_dlsode.f90 @ dt=6.4s.
 MINICHEM_US = {"equilibrium": 92.0, "off_equilibrium": 178.0}
 
-DEFAULT_PT2 = (
+# Runtime settings (edit here; no argparse).
+# PT2_PATH stays on the v3 export that backs the paper CSV (models/v3/bench_speedup.csv);
+# repoint to models/stage2/export_cpu_dynB_1step_phys.pt2 once the production stage-2
+# export lands.
+PT2_PATH = (
     Path(__file__).resolve().parents[1] / "models" / "v3" / "export_cpu_dynB_1step_phys.pt2"
 )
+WARMUP = 30
+ITERS = 200
 BATCHES = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
 S, G = 12, 2  # species, globals (P,T) — fixed for this model family
 
@@ -87,13 +92,7 @@ def bench_device(model, dev: str, warmup: int, iters: int) -> list[dict]:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--pt2", type=str, default=str(DEFAULT_PT2))
-    ap.add_argument("--warmup", type=int, default=30)
-    ap.add_argument("--iters", type=int, default=200)
-    args = ap.parse_args()
-
-    pt2 = Path(args.pt2)
+    pt2 = PT2_PATH
     print(f"model     : {pt2}")
     base = torch.export.load(str(pt2)).module()
     nparam = sum(p.numel() for p in base.parameters())
@@ -105,12 +104,12 @@ def main() -> None:
     all_rows: list[dict] = []
 
     cpu_model = base.to("cpu")
-    all_rows += bench_device(cpu_model, "cpu", args.warmup, args.iters)
+    all_rows += bench_device(cpu_model, "cpu", WARMUP, ITERS)
 
     if torch.backends.mps.is_available():
         try:
             mps_model = torch.export.load(str(pt2)).module().to("mps")
-            all_rows += bench_device(mps_model, "mps", args.warmup, args.iters)
+            all_rows += bench_device(mps_model, "mps", WARMUP, ITERS)
         except Exception as e:
             print(f"  mps: load/move failed ({type(e).__name__}: {e}); cpu only")
 
