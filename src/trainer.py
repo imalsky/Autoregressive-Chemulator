@@ -423,6 +423,14 @@ class FlowMapRolloutModule(pl.LightningModule):
 
         # Epoch timing (logged; CSVLogger writes it)
         self._epoch_t0: Optional[float] = None
+        # AR training horizon of the current epoch (set by the curriculum); logged once per epoch.
+        self._epoch_k_train: Optional[int] = None
+        # Per-epoch device sum of [loss_total, loss_log10_mae, loss_z_mse] and step count; the epoch
+        # means are logged once in on_train_epoch_end instead of three self.log calls per step.
+        # A per-step mean equals Lightning's per-sample mean only because every training batch is
+        # full-size (main.py builds the train loader with drop_last=True).
+        self._train_loss_sum: Optional[torch.Tensor] = None
+        self._train_loss_n = 0
 
         # Preserve for checkpoint reproducibility. Deep-copy so later config mutations
         # (or Lightning internals) can't alias the live training config.
@@ -453,10 +461,23 @@ class FlowMapRolloutModule(pl.LightningModule):
 
     def on_train_epoch_start(self) -> None:
         self._epoch_t0 = time.time()
+        self._train_loss_sum = None
+        self._train_loss_n = 0
 
     def on_train_epoch_end(self) -> None:
         if self._epoch_t0 is not None:
             self.log("epoch_time_sec", float(time.time() - self._epoch_t0), on_step=False, on_epoch=True)
+        if self._epoch_k_train is not None:
+            self.log("train_rollout_steps", float(self._epoch_k_train), on_step=False, on_epoch=True)
+            self._epoch_k_train = None
+        if self._train_loss_n > 0:
+            # Device-tensor divisor: tensor / Python number would take CUDA's multiply-by-reciprocal
+            # path and could differ from Lightning's epoch mean by 1 ulp.
+            m = self._train_loss_sum / self._train_loss_sum.new_full((), float(self._train_loss_n))
+            self.log("train_loss", m[0], on_step=False, on_epoch=True, prog_bar=True)
+            self.log("train_loss_log10_mae", m[1], on_step=False, on_epoch=True)
+            self.log("train_loss_z_mse", m[2], on_step=False, on_epoch=True)
+            self._train_loss_sum, self._train_loss_n = None, 0
 
     # ------------------------
     # Forward utilities
@@ -690,14 +711,10 @@ class FlowMapRolloutModule(pl.LightningModule):
         y_pred1 = self._forward_step(y0, dt0, g_t)
         losses = self.criterion(y_pred1.unsqueeze(1), y1.unsqueeze(1), step_weights=None)
 
-        self.log("train_loss", losses["loss_total"].detach(), on_step=False, on_epoch=True, prog_bar=True)
-        self.log("train_loss_log10_mae", losses["loss_log10_mae"], on_step=False, on_epoch=True)
-        self.log("train_loss_z_mse", losses["loss_z_mse"], on_step=False, on_epoch=True)
-
-        self.log("train_rollout_steps", float(1.0), on_step=False, on_epoch=True)
-
-        self.log("train_skip_steps", float(0.0), on_step=False, on_epoch=True)
-        self.log("train_detach_between_steps", float(1.0), on_step=False, on_epoch=True)
+        s = torch.stack([losses["loss_total"].detach(), losses["loss_log10_mae"].detach(), losses["loss_z_mse"].detach()])
+        s = s.to(torch.promote_types(s.dtype, torch.float32))  # sum in fp32 or wider, as Lightning does
+        self._train_loss_sum = s if self._train_loss_sum is None else self._train_loss_sum + s
+        self._train_loss_n += 1
 
         return losses["loss_total"]
 
@@ -794,12 +811,11 @@ class FlowMapRolloutModule(pl.LightningModule):
             self.manual_backward(loss_total)
             self._maybe_step_optimizer(opt)
 
-        self.log("train_loss", loss_total.detach(), on_step=False, on_epoch=True, prog_bar=True)
-        self.log("train_loss_log10_mae", loss_log10_mae, on_step=False, on_epoch=True)
-        self.log("train_loss_z_mse", loss_z_mse, on_step=False, on_epoch=True)
-        self.log("train_rollout_steps", float(k_train), on_step=False, on_epoch=True)
-        self.log("train_skip_steps", float(skip), on_step=False, on_epoch=True)
-        self.log("train_detach_between_steps", float(self.ar_detach_between_steps), on_step=False, on_epoch=True)
+        s = torch.stack([loss_total.detach(), loss_log10_mae.detach(), loss_z_mse.detach()])
+        s = s.to(torch.promote_types(s.dtype, torch.float32))  # sum in fp32 or wider, as Lightning does
+        self._train_loss_sum = s if self._train_loss_sum is None else self._train_loss_sum + s
+        self._train_loss_n += 1
+        self._epoch_k_train = int(k_train)
 
         return loss_total
 

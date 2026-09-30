@@ -1,5 +1,19 @@
 # Production config decisions — evidence and justification
 
+## REVISION 2026-09-30: per-step training overhead cut; stage-1 CUDA graphs (audit theme T3)
+
+Training numerics are unchanged: the 30-step fingerprint of both stages (live and EMA weights, every
+training loss, val_loss) is bitwise identical to the pre-audit baseline. What changed:
+- Three run constants are no longer logged on every training step; each call forced a GPU sync (3 per
+  step). `metrics.csv` loses the `train_skip_steps` and `train_detach_between_steps` columns (the settings
+  are in `hparams.yaml`), and one-jump (stage-1) runs also lose the constant `train_rollout_steps`.
+  Autoregressive runs log `train_rollout_steps` once per epoch; it follows the curriculum.
+- The epoch training losses are summed on the GPU and logged once per epoch. The logged values are
+  identical to the last bit at the shipped batch size.
+- The EMA update runs as grouped `torch._foreach` calls over cached tensor lists (same arithmetic).
+- Stage 1 compiles with `runtime.torch_compile.mode = "reduce-overhead"` (CUDA graphs); see the per-key
+  table.
+
 ## REVISION 2026-09-30: dead options and code paths removed (audit theme T6)
 
 Nothing the production configs do changed: a 30-step training fingerprint of both stages
@@ -162,6 +176,7 @@ no inversion of any adopted finding.
 | stage-2 `wd` | 1e-5 (= stage 1; old template's 0.005 dropped) | No SOTA fine-tune cranks WD ×500 at the phase boundary; the 0.005 value was untested (stage 2 never ran). Keep optimizer geometry constant except LR. | medium (literature/consistency) |
 | stage-2 `lambda_z_mse` 0.25, EMA 0.999, early-stop 20, plateau warmup 5 | template values | Inherited from the stage-2 template; not locally discriminated. EMA re-warms automatically at stage start (fresh callback state); ACE evidence says EMA helps long-rollout metrics up to 15%. | inherited |
 | `runtime.torch_compile.compile_open_loop_unroll` | stage-1 true / stage-2 false | The flag affects only the validation open-loop rollout (`trainer.py` `_eval_step`), never the AR training loop, and eval K ignores the curriculum. Stage 2 disables whole-unroll compilation because a fullgraph K=10 unroll of the 10x2048 trunk is a 10x-deep inductor graph (long compile time; recompiles on a ragged final validation batch with dynamic=false); eval still runs the compiled forward step per step. Stage-1 true is redundant-but-harmless at eval K=1. | n/a (throughput only; no effect on math) |
+| `runtime.torch_compile.mode` | stage-1 `reduce-overhead` (REVISED 2026-09-30, was `default`) / stage-2 `default` | Stage 1 replays its compiled training step and validation rollouts as CUDA graphs, which cuts host-side launch work: on a CPU-bound proxy (10x256 trunk, logging fixes applied) the stage-1 CPU time per step fell from 3.85 to 2.82 ms (audit efficiency study). On daw's RTX 6000 Ada stage 1 is GPU-bound and wall time did not change (-0.9%, inside noise); a gain is expected only where stage 1 is CPU-bound, e.g. on the GH200 (not measured). Numerics are identical: bitwise 30-step fingerprints (live/EMA weights, every loss, val_loss), and a 3-epoch run that replays every training and validation graph (ragged last batch included, after the EMA weight swap) matches `default` bit for bit. Compile variants with a ragged last validation batch: forward step 1, validation rollout 2 (the recompile limit is 8). Under CUDA graphs the next step's replay reuses the previous step's `.grad` memory, so nothing may read gradients across steps; nothing does (`runtime.log_grad_norm` is read only in the stage-2 manual-optimization path, within the step). Stage 2 keeps `default`: it is GPU-bound (no expected gain), and its no-grad pushforward output feeds the grad-mode step, which the study expects to conflict with CUDA-graph output reuse (inferred, not run). | n/a (throughput only; bitwise-identical) |
 | **rejected: input-noise injection** | not shipped | **E6**: 4/4 noise runs worse, 3/4 catastrophic at fixed-dt (12.4–14.1 dex; σ ∈ {0.01, 0.03} z-space, with and without pushforward, 2 seeds) — *against* the GNS/Stachenfeld prior. No trainer option added. If ever revisited, sweep σ ≤ 1e-3 and re-test. | high (locally decisive) |
 | **rejected: K=20 detached training** | — | E3: consistently worse + one 1-dex blow-up; List 2024 agrees. (K>10 with BPTT untested locally — plausible future direction, not a default.) | medium |
 | **not adopted: inference-time renormalization** | off | Sturm 2024: naive projection degrades radicals/trace species (exactly what dominates a log-standardized loss); weighted projection neutral-to-positive. Track conservation drift as an EVAL metric; if the host solver needs hard conservation, the stoichiometric-output-layer route (Sturm & Wexler 2022) is the accuracy-neutral fix. | high (literature) |

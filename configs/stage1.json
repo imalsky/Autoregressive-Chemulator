@@ -45,7 +45,7 @@
     "torch_compile": {
       "enabled": true,
       "backend": "inductor",
-      "mode": "default",
+      "mode": "reduce-overhead",
       "dynamic": false,
       "fullgraph": true,
       "compile_forward_step": true,

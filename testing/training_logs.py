@@ -70,8 +70,6 @@ PREFERRED_METRIC_ORDER: tuple[str, ...] = (
     "train_loss_z_mse",
     "val_loss_z_mse",
     "train_rollout_steps",
-    "train_skip_steps",
-    "train_detach_between_steps",
 )
 
 

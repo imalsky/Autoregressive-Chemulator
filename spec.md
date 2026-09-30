@@ -66,7 +66,7 @@ Audience: Professional collaborators and maintainers
 16. `ReduceLROnPlateau` with a linear warmup (`training.scheduler.*`), the only scheduler; there is no scheduler-type key.
 17. `cosine_with_warmup` is unsupported (removed 2026-09-30).
 18. `torch.compile` support is retained and optional.
-19. Compile default remains enabled with default compile settings.
+19. Compile default remains enabled: stage 1 uses `runtime.torch_compile.mode = "reduce-overhead"` (CUDA graphs), stage 2 `"default"` (evidence: `docs/DECISIONS.md`).
 20. Relative `runtime.checkpoint` paths are resolved against the config-file directory.
 21. `runtime.checkpoint` must exist and be a file; otherwise training must hard-fail.
 22. Training framework imports must use `lightning.pytorch`.

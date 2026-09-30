@@ -20,6 +20,10 @@ from typing import Any, Dict, Optional
 import lightning.pytorch as pl
 import torch
 
+# The EMA update runs mul_ then add_ per group of at most ~20 MB, so the add_ pass finds the group's
+# freshly written EMA tensors in L2 (96 MB on RTX 6000 Ada, 50 MB on H100) with 2 launches per group.
+_GROUP_BYTES = 20_000_000
+
 
 class EMACallback(pl.Callback):
     """Maintain EMA-of-weights and swap them into the module for validation/checkpointing."""
@@ -32,10 +36,12 @@ class EMACallback(pl.Callback):
         self.decay = float(decay)
         self.ema_sd: Optional[Dict[str, torch.Tensor]] = None
         self._stash: Optional[Dict[str, torch.Tensor]] = None
+        self._cache = None  # cached (ema, live) tensor groups; reset whenever ema_sd is replaced
 
     def _init_ema_from_module(self, pl_module: pl.LightningModule) -> None:
         """Initialize the EMA shadow as a detached clone of the module's current state_dict."""
         self.ema_sd = {k: v.detach().clone() for k, v in pl_module.state_dict().items()}
+        self._cache = None
 
     def setup(self, trainer: pl.Trainer, pl_module: pl.LightningModule, stage: str) -> None:
         """Create the EMA shadow at fit setup if it was not restored from a checkpoint."""
@@ -53,6 +59,7 @@ class EMACallback(pl.Callback):
         for k, v in list(self.ema_sd.items()):
             if v.device != target:
                 self.ema_sd[k] = v.to(target)
+        self._cache = None
 
     @torch.no_grad()
     def on_train_batch_end(
@@ -67,17 +74,30 @@ class EMACallback(pl.Callback):
         if self.ema_sd is None:
             self._init_ema_from_module(pl_module)
             return
-        d = self.decay
-        live = pl_module.state_dict()
-        for k, ema_t in self.ema_sd.items():
-            new_t = live[k]
-            if ema_t.device != new_t.device:
-                ema_t = ema_t.to(new_t.device)
-                self.ema_sd[k] = ema_t
-            if ema_t.dtype.is_floating_point:
-                ema_t.mul_(d).add_(new_t.detach(), alpha=1.0 - d)
-            else:
-                ema_t.copy_(new_t)
+        if self._cache is None:
+            live = pl_module.state_dict(keep_vars=True)  # live Parameter/buffer objects
+            for k, v in list(self.ema_sd.items()):
+                if v.device != live[k].device:
+                    self.ema_sd[k] = v.to(live[k].device)
+            groups, other, size = [], [], 0
+            for k, ema_t in self.ema_sd.items():
+                if not ema_t.dtype.is_floating_point:
+                    other.append((ema_t, live[k]))
+                    continue
+                nbytes = ema_t.numel() * ema_t.element_size()
+                if not groups or size + nbytes > _GROUP_BYTES:
+                    groups.append(([], []))
+                    size = 0
+                groups[-1][0].append(ema_t)
+                groups[-1][1].append(live[k])
+                size += nbytes
+            self._cache = (groups, other)
+        groups, other = self._cache
+        for ema_g, live_g in groups:
+            torch._foreach_mul_(ema_g, self.decay)
+            torch._foreach_add_(ema_g, live_g, alpha=1.0 - self.decay)
+        for ema_t, new_t in other:
+            ema_t.copy_(new_t)
 
     def on_validation_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         """Stash live weights and load the EMA weights so val_loss reflects EMA performance."""
@@ -115,3 +135,4 @@ class EMACallback(pl.Callback):
             self.ema_sd = {k: v.detach().clone() for k, v in ema.items()}
         else:
             self._init_ema_from_module(pl_module)
+        self._cache = None
