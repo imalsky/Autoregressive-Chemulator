@@ -14,10 +14,6 @@ Run:  conda run -n nn python Auto-Chem/testing/eval_rollout_error.py [models/v3]
 """
 from __future__ import annotations
 
-import os
-
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-
 import sys
 from pathlib import Path
 

@@ -36,18 +36,18 @@ Typical usage:
 
 Notes:
 - For correctness, export uses strict=True by default.
-- The resulting ep.module() can be moved to CUDA/MPS via .to(device) at inference time.
+- Exports are float32 only (a bf16 export was never numerically validated; docs/DECISIONS.md).
+- Each .pt2 is pinned to its export device: torch.export bakes device=<export device> into
+  the input asserts, so .to(device) on ep.module() is not enough. On GPU, load
+  export_cuda_dynB_1step_phys.pt2.
+- build_export() is shared with testing/aoti_export.py, so both artifacts carry the same
+  graph, weights and metadata.
 """
 
 from __future__ import annotations
 
 import json
 import os
-
-
-# Some MKL/OpenMP builds abort on duplicate symbols; this is a pragmatic default.
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -59,10 +59,7 @@ from torch.export import Dim
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from model import create_model  # noqa: E402
-
-
-REQUIRED_GLOBALS: Tuple[str, str] = ("P", "T")
+from model import _REQUIRED_GLOBALS, create_model  # noqa: E402
 
 # Runtime settings (edit here; no argparse).
 RUN_DIR = (REPO_ROOT / "models" / "stage2").resolve()  # deployable model = stage-2 output
@@ -74,10 +71,7 @@ CHECKPOINT = "checkpoints/best.ckpt"
 # normalization.json. None => use cfg.paths.processed_dir strictly (no fallbacks).
 PROCESSED_DIR_OVERRIDE: Optional[str] = None
 EXPORT_DEVICES = "cpu,cuda"  # requested targets; unavailable devices are skipped with CPU fallback
-EXPORT_DTYPE = "float32"
 EXPORT_STRICT = True
-VERIFY_CUDA = False
-VERIFY_MPS = False
 EXAMPLE_BATCH = 4
 B_MIN = 1
 B_MAX = 16384
@@ -99,18 +93,9 @@ def _cuda_available() -> bool:
         return False
 
 
-def _mps_available() -> bool:
-    """True if the Apple MPS backend is available (best-effort; never raises)."""
-    try:
-        return bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
-    except Exception:
-        return False
-
-
 def _print_device_diag() -> None:
-    """Print a one-line summary of torch version and CUDA/MPS availability."""
+    """Print a one-line summary of torch version and CUDA availability."""
     cuda_ok = _cuda_available()
-    mps_ok = _mps_available()
     print(
         "Device diag:"
         f" torch={torch.__version__}"
@@ -118,7 +103,6 @@ def _print_device_diag() -> None:
         f" CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')!r}"
         f" cuda.is_available={cuda_ok}"
         f" cuda.device_count={torch.cuda.device_count() if torch.cuda.is_available() else 0}"
-        f" mps.is_available={mps_ok}"
     )
     if cuda_ok:
         try:
@@ -558,7 +542,6 @@ def _make_example_inputs(
     *,
     B: int,
     device: torch.device,
-    dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Create a numerically sane example batch for export.
@@ -572,16 +555,16 @@ def _make_example_inputs(
     # y: sample log10(y) uniformly between observed log_min/log_max.
     u = torch.rand(B, S, device=device, dtype=torch.float32)
     logy = norm.s_log_min.to(device) + u * (norm.s_log_max.to(device) - norm.s_log_min.to(device))
-    y = torch.pow(10.0, logy).to(dtype)
+    y = torch.pow(10.0, logy)
 
     # dt_seconds: sample log10(dt) uniformly between cfg log_min/log_max.
     u_dt = torch.rand(B, device=device, dtype=torch.float32)
     logdt = norm.dt_log_min.to(device) + u_dt * (norm.dt_log_max.to(device) - norm.dt_log_min.to(device))
-    dt_seconds = torch.pow(10.0, logdt).to(dtype)
+    dt_seconds = torch.pow(10.0, logdt)
 
     # g: sample in a reasonable range (roughly within observed min/max).
     u_g = torch.rand(B, G, device=device, dtype=torch.float32)
-    g = (norm.g_min.to(device) + u_g * (norm.g_max.to(device) - norm.g_min.to(device))).to(dtype)
+    g = norm.g_min.to(device) + u_g * (norm.g_max.to(device) - norm.g_min.to(device))
 
     return y, dt_seconds, g
 
@@ -590,16 +573,15 @@ def _verify_dynamic_batch(
     ep: torch.export.ExportedProgram,
     *,
     device: torch.device,
-    dtype: torch.dtype,
     norm: BakedNormalizer,
 ) -> None:
     """
     Fail hard unless the exported program runs with multiple batch sizes (proves dynamic B).
     """
-    m = ep.module().to(device=device, dtype=dtype)
+    m = ep.module().to(device=device)
 
     for B in (1, 7):
-        y, dt, g = _make_example_inputs(norm, B=B, device=device, dtype=dtype)
+        y, dt, g = _make_example_inputs(norm, B=B, device=device)
         with torch.inference_mode():
             out = m(y, dt, g)
         if out.shape[0] != B:
@@ -634,10 +616,10 @@ def _validate_manifest_vs_config(cfg: Mapping[str, Any], manifest: Mapping[str, 
 
     if not isinstance(cfg_globals, list) or not all(isinstance(x, str) for x in cfg_globals):
         raise TypeError("config: bad data.global_variables")
-    if list(cfg_globals) != list(REQUIRED_GLOBALS):
-        raise ValueError(f"config.data.global_variables must be exactly {list(REQUIRED_GLOBALS)}")
-    if list(man_globals) != list(REQUIRED_GLOBALS):
-        raise ValueError(f"normalization.json global_variables must be exactly {list(REQUIRED_GLOBALS)}")
+    if list(cfg_globals) != list(_REQUIRED_GLOBALS):
+        raise ValueError(f"config.data.global_variables must be exactly {list(_REQUIRED_GLOBALS)}")
+    if list(man_globals) != list(_REQUIRED_GLOBALS):
+        raise ValueError(f"normalization.json global_variables must be exactly {list(_REQUIRED_GLOBALS)}")
     if list(cfg_globals) != man_globals:
         raise ValueError("global_variables mismatch between config and normalization.json (order matters).")
     globals_ = list(cfg_globals)
@@ -680,16 +662,6 @@ def _resolve_processed_dir(cfg: Mapping[str, Any], *, cfg_path: Path) -> Path:
     )
 
 
-def _parse_dtype(dtype_str: str) -> torch.dtype:
-    """Map an export dtype string to a torch.dtype (float32 | bfloat16)."""
-    s = dtype_str.strip().lower()
-    if s == "float32":
-        return torch.float32
-    if s == "bfloat16":
-        return torch.bfloat16
-    raise ValueError(f"Unsupported dtype '{dtype_str}'. Use float32|bfloat16.")
-
-
 def _parse_devices(raw_devices: str) -> List[str]:
     """Parse the comma-separated EXPORT_DEVICES string into a de-duplicated device list."""
     raw = str(raw_devices).strip().lower()
@@ -728,14 +700,7 @@ def _resolve_export_devices(devices: Sequence[str]) -> List[str]:
                 )
             continue
 
-        if dev == "mps":
-            if _mps_available():
-                resolved.append(dev)
-            else:
-                print("MPS requested in EXPORT_DEVICES but torch.backends.mps.is_available() is false; skipping.")
-            continue
-
-        raise ValueError(f"Unsupported device '{dev}'. Use cpu|cuda|mps (or cuda:0 style if needed).")
+        raise ValueError(f"Unsupported device '{dev}'. Use cpu|cuda (or cuda:0 style if needed).")
 
     if not resolved:
         print("No requested export devices are available. Falling back to CPU.")
@@ -750,57 +715,58 @@ def _default_out_for(run_dir: Path, device_tag: str) -> Path:
 
 
 # =============================================================================
-# Export per-device
+# Export build (shared with testing/aoti_export.py)
 # =============================================================================
 
 
-def _export_one(
-    *,
-    device_tag: str,
-    device: torch.device,
-    dtype: torch.dtype,
-    cfg_path: Path,
-    ckpt_path: Path,
-    manifest: Mapping[str, Any],
-    manifest_path: Path,
-    species_vars: Sequence[str],
-    global_vars: Sequence[str],
-    base_cpu: nn.Module,
-    norm_cpu: BakedNormalizer,
-    out_path: Path,
+def build_export(
     run_dir: Path,
-    strict: bool,
+    checkpoint: str,
+    device: torch.device,
     example_batch: int,
-    b_min: int,
-    b_max: int,
-    verify_cuda: bool,
-    verify_mps: bool,
-) -> None:
-    """Export one device target: wrap base+normalizer, torch.export with dynamic batch, verify, and save with metadata."""
-    # Move model and normalizer to device/dtype for this export.
-    base = base_cpu.to(device=device, dtype=dtype)
-    base = _freeze_for_inference(base)
+    *,
+    cuda_visible_devices: str,
+) -> Tuple[torch.export.ExportedProgram, Dict[str, Any]]:
+    """Build the verified one-step physical-space export for `device` and its metadata.
 
-    norm = norm_cpu.to(device=device, dtype=dtype)
+    Loads <run_dir>/config.resolved.json, the checkpoint (EMA weights preferred) and
+    normalization.json, wraps base+normalizer, exports with a dynamic batch dim and
+    verifies B in (1, 7) on `device`. `cuda_visible_devices` is recorded as given.
+    """
+    cfg, cfg_path = _load_resolved_config(run_dir)
+    ckpt_path = _resolve_checkpoint_path(checkpoint, cfg_path=cfg_path)
+
+    processed_dir = _resolve_processed_dir(cfg, cfg_path=cfg_path)
+    manifest_path = processed_dir / "normalization.json"
+    manifest = _load_json(manifest_path)
+
+    species_vars, global_vars = _validate_manifest_vs_config(cfg, manifest)
+
+    base = create_model(cfg)
+    _load_weights_strict(base, ckpt_path)
+    base = _freeze_for_inference(base.to(device=device))
+
+    norm = build_baked_normalizer(manifest, species_vars=species_vars, global_vars=global_vars)
+    norm = norm.to(device=device)
     norm.eval()
 
     step = OneStepPhysical(base, norm)
     step = _freeze_for_inference(step)
 
     B_ex = int(max(1, example_batch))
-    example_inputs = _make_example_inputs(norm, B=B_ex, device=device, dtype=dtype)
+    example_inputs = _make_example_inputs(norm, B=B_ex, device=device)
 
-    B = Dim("B", min=int(b_min), max=int(b_max))
+    B = Dim("B", min=int(B_MIN), max=int(B_MAX))
     dynamic_shapes = (
         {0: B},  # y_phys: (B, S)
         {0: B},  # dt_seconds: (B,)
         {0: B},  # g_phys: (B, G)
     )
 
-    ep = torch.export.export(step, example_inputs, dynamic_shapes=dynamic_shapes, strict=bool(strict))
+    ep = torch.export.export(step, example_inputs, dynamic_shapes=dynamic_shapes, strict=bool(EXPORT_STRICT))
 
     # Verify on export device.
-    _verify_dynamic_batch(ep, device=device, dtype=dtype, norm=norm)
+    _verify_dynamic_batch(ep, device=device, norm=norm)
 
     meta = {
         "format": "1step_physical_dynB",
@@ -810,10 +776,10 @@ def _export_one(
         "normalization_path": _to_repo_relative_str(manifest_path),
         "torch_version": torch.__version__,
         "torch_cuda_version": getattr(torch.version, "cuda", None),
-        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+        "cuda_visible_devices": cuda_visible_devices,
         "export_device": str(device),
-        "export_device_tag": str(device_tag),
-        "export_dtype": str(dtype).replace("torch.", ""),
+        "export_device_tag": device.type,
+        "export_dtype": "float32",
         "species_variables": list(species_vars),
         "global_variables": list(global_vars),
         "normalization_methods": dict(manifest["normalization_methods"]),
@@ -822,24 +788,13 @@ def _export_one(
         "dt_log10_max": float(manifest["dt"]["log_max"]),
         "dt_min_seconds": float(10.0 ** float(manifest["dt"]["log_min"])),
         "dt_max_seconds": float(10.0 ** float(manifest["dt"]["log_max"])),
-        "dynamic_batch": {"min": int(b_min), "max": int(b_max)},
+        "dynamic_batch": {"min": int(B_MIN), "max": int(B_MAX)},
         "signature": {
             "inputs": {"y_phys": ["B", "S"], "dt_seconds": ["B"], "g_phys": ["B", "G"]},
             "output": {"y_next_phys": ["B", "S"]},
         },
     }
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.export.save(ep, out_path, extra_files={"metadata.json": json.dumps(meta, indent=2, sort_keys=True)})
-    print(f"Saved export ({device_tag}): {out_path}")
-
-    # Optional cross-device verification.
-    if bool(verify_cuda) and _cuda_available():
-        _verify_dynamic_batch(ep, device=torch.device("cuda"), dtype=dtype, norm=norm.to("cuda"))
-        print(f"Verified on CUDA ({device_tag} export).")
-    if bool(verify_mps) and _mps_available():
-        _verify_dynamic_batch(ep, device=torch.device("mps"), dtype=dtype, norm=norm.to("mps"))
-        print(f"Verified on MPS ({device_tag} export).")
+    return ep, meta
 
 
 # =============================================================================
@@ -848,62 +803,27 @@ def _export_one(
 
 
 def main() -> None:
-    """Load the run's resolved config + checkpoint + normalization, then export per requested device."""
+    """Export RUN_DIR's checkpoint for each requested device and save it with embedded metadata."""
     _print_device_diag()
 
     run_dir = RUN_DIR.expanduser().resolve()
     if not run_dir.exists():
         raise FileNotFoundError(f"RUN_DIR not found: {run_dir}")
 
-    dtype = _parse_dtype(EXPORT_DTYPE)
-
-    cfg, cfg_path = _load_resolved_config(run_dir)
-    ckpt_path = _resolve_checkpoint_path(CHECKPOINT, cfg_path=cfg_path)
-
-    processed_dir = _resolve_processed_dir(cfg, cfg_path=cfg_path)
-    manifest_path = processed_dir / "normalization.json"
-    manifest = _load_json(manifest_path)
-
-    species_vars, global_vars = _validate_manifest_vs_config(cfg, manifest)
-
-    # Build base model on CPU once and load weights once.
-    base_cpu = create_model(cfg)
-    _load_weights_strict(base_cpu, ckpt_path)
-    base_cpu = _freeze_for_inference(base_cpu.to(device=torch.device("cpu"), dtype=dtype))
-
-    # Build baked normalizer once (buffers on CPU); we move it per-device for export.
-    norm_cpu = build_baked_normalizer(manifest, species_vars=species_vars, global_vars=global_vars)
-    norm_cpu = norm_cpu.to(device=torch.device("cpu"), dtype=dtype)
-    norm_cpu.eval()
-
-    device_tags = _resolve_export_devices(_parse_devices(EXPORT_DEVICES))
-
-    for dev in device_tags:
+    for dev in _resolve_export_devices(_parse_devices(EXPORT_DEVICES)):
         device = torch.device(dev)
-        device_tag = "cuda" if dev.startswith("cuda") else dev
-        out_path = _default_out_for(run_dir, device_tag)
-
-        _export_one(
-            device_tag=device_tag,
-            device=device,
-            dtype=dtype,
-            cfg_path=cfg_path,
-            ckpt_path=ckpt_path,
-            manifest=manifest,
-            manifest_path=manifest_path,
-            species_vars=species_vars,
-            global_vars=global_vars,
-            base_cpu=base_cpu,
-            norm_cpu=norm_cpu,
-            out_path=out_path,
-            run_dir=run_dir,
-            strict=bool(EXPORT_STRICT),
-            example_batch=int(EXAMPLE_BATCH),
-            b_min=int(B_MIN),
-            b_max=int(B_MAX),
-            verify_cuda=bool(VERIFY_CUDA),
-            verify_mps=bool(VERIFY_MPS),
+        ep, meta = build_export(
+            run_dir,
+            CHECKPOINT,
+            device,
+            int(EXAMPLE_BATCH),
+            cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES", ""),
         )
+
+        out_path = _default_out_for(run_dir, device.type)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.export.save(ep, out_path, extra_files={"metadata.json": json.dumps(meta, indent=2, sort_keys=True)})
+        print(f"Saved export ({device.type}): {out_path}")
 
 
 if __name__ == "__main__":

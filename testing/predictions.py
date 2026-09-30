@@ -56,6 +56,8 @@ PLOT_Y_LIM: Tuple[float, float] = (1e-30, 3.0)
 PLOT_MARKER_EVERY: int = 10
 PLOT_STYLE: str | None = str((ROOT / "testing" / "science.mplstyle").resolve())
 
+# Fixed global set, in this order (spec.md section 5, items 4-6). This standalone script
+# imports nothing from src/, so it keeps its own copy of src/model.py:_REQUIRED_GLOBALS.
 REQUIRED_GLOBALS: Tuple[str, str] = ("P", "T")
 
 
@@ -81,8 +83,6 @@ def _parse_export_dtype(raw: Any) -> torch.dtype:
     value = raw.strip().lower()
     if value == "float32":
         return torch.float32
-    if value == "float16":
-        return torch.float16
     if value == "bfloat16":
         return torch.bfloat16
     raise ValueError(f"unsupported export_dtype in metadata: {raw!r}")

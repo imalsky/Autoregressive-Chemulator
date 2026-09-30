@@ -1,5 +1,44 @@
 # Production config decisions — evidence and justification
 
+## REVISION 2026-09-30: dead options and code paths removed (audit theme T6)
+
+Nothing the production configs do changed: a 30-step training fingerprint of both stages
+(live and EMA weights, every training loss, val_loss; synthetic production-shaped data) is
+bitwise identical before and after, and preprocessing outputs (synthetic data and a small
+real-data subset) and exported artifacts (the smoke checkpoint) compare equal array by array.
+
+Removed config keys (a config that still sets one now fails as an unknown key):
+`precision.dataset_dtype`, `normalization.globals_default_method`, `runtime.load_weights_strict`
+(weights_only loading is always strict), `runtime.mode`, `dataset.preload_to_device` (every split
+is preloaded), `dataset.shard_cache_size`, the whole `model.autoencoder` block,
+`training.num_workers`, `training.persistent_workers`, `training.prefetch_factor`,
+`training.scheduler.type`, `training.scheduler.min_lr_ratio`, `training.curriculum.mode` (linear
+only), and the `preprocessing.dt` / `preprocessing.dt_mode` tombstones. The ReduceLROnPlateau keys
+(`factor`, `patience`, `threshold`, `min_lr`, `mode`, `monitor`) are now plain required keys. A
+`config.resolved.json` written before this change must have these keys deleted before
+`src/main.py` accepts it as a config; `testing/export.py` reads only the data/model/paths blocks
+and still exports older run directories.
+
+Removed code (recover from git history, tag `pre-audit-2026-09-29`):
+- The autoencoder model family and the unused multi-step `FlowMapMLP.forward` (see alternative 4).
+- The map-style (non-preloaded) dataset path. Its 2-shard LRU cache thrashes under random access
+  (audit measurement: about 17 s and 43.6 GB read per 2048-sample batch at 700 shards, against
+  0.46 ms for the preloaded stream), so it was never a scale fallback. There is now no loading
+  path for data larger than RAM; that is an open design item. The shards are uncompressed
+  `np.savez` ZIP archives, so their members could be opened with `np.memmap` at their data
+  offset (an input for any beyond-RAM loader); compressing them (`np.savez_compressed`) would
+  give that up and is undecided.
+- The `cosine_with_warmup` scheduler. The v3 reference run used it
+  (`git show 09748d7:models_old/v3/config.resolved.json`: `cosine_with_warmup`,
+  `min_lr_ratio` 0.01, `warmup_epochs` 30, `max_epochs` 300), so that schedule can no longer be
+  re-run from this repo.
+- Mac-era code: MPS device and export targets, and the `KMP_DUPLICATE_LIB_OK` shim (the venv's
+  only OpenMP runtime is GNU libgomp, which does not read it).
+- The bf16 export option (exports are float32 only; see "Verification performed" below).
+- Duplicate diagnostics: `testing/benchmark.py` and `testing/bench_eager_devices.py`
+  (`testing/bench_speedup.py` is the one latency benchmark and times the CPU and CUDA exports),
+  and `processing/testing_data.py` (preprocessing's `read_time` already hard-fails on its checks).
+
 ## REVISION 2026-07-16: `output_trajectories_per_file` restored to **1e6**
 
 Commit df2c44f (2026-06-17, "fix to multi-thread processing") accidentally cut
@@ -93,8 +132,7 @@ no inversion of any adopted finding.
 
 1. **`model.fourier_dt`** (`src/model.py: FourierDtFeatures`): fixed, seeded random-Fourier
    embedding of the normalized scalar dt, concatenated as `[dt, sin(2πB·dt), cos(2πB·dt)]`
-   — a strict superset of the legacy input. Wired into both FlowMapMLP and the
-   autoencoder's LatentDynamics. torch.export-verified.
+   — a strict superset of the legacy input. Wired into FlowMapMLP. torch.export-verified.
 2. **`training.autoregressive_training.loss_discount_gamma`** (`src/trainer.py`):
    per-step weight γ^(k−skip) on the rollout loss, both detached and BPTT paths.
    Default 1.0 reproduces legacy math exactly (verified: weights/normalization identical).
@@ -112,7 +150,7 @@ no inversion of any adopted finding.
 | `preprocessing.samples_per_source_trajectory` | 4 (was 1) | E2 mechanism: per-state dt diversity is the robustness lever; 4 independent (dt, t_start) draws per source trajectory maximize (state, dt) coverage from the same raws. | medium |
 | `preprocessing.output_trajectories_per_file`, `pool_size` | 1e6 (consume all) | "Use the full dataset" (user decision); ~62M samples across ~160 raw files. | decision |
 | `training.batch_size` | 2048 | Paper finding: >2048 degraded generalization; v2_bigger_batch (8192) plateaued at val ~9e-3. | high (production-scale evidence) |
-| stage-1 `lr` / `wd` / scheduler / EMA 0.9995 / early-stop | template values | v3-lineage; converged to val ~7e-4 historically. EMA window rule (1/(1−d) ≈ 1–10% of updates, ACE uses 0.9999) — with full-dataset epochs, consider 0.9999; not locally discriminable. | inherited |
+| stage-1 `lr` / `wd` / scheduler / EMA 0.9995 / early-stop | template values | v3-lineage except the scheduler (v3 used `cosine_with_warmup`, see REVISION 2026-09-30; the shipped plateau schedule is not v3-lineage); converged to val ~7e-4 historically. EMA window rule (1/(1−d) ≈ 1–10% of updates, ACE uses 0.9999) — with full-dataset epochs, consider 0.9999; not locally discriminable. | inherited |
 | **stage-2 model block = stage-1 model block** | 10×2048 (fourier_dt OFF) | Fixes the historical inconsistency: the now-removed `configs/stage2_dt_bands/` declared 8×1536 but strict-load 10×2048 checkpoints from wrong paths — would hard-fail at startup. | high (correctness fix) |
 | `training.rollout_steps` (stage 2) | 10 | **E3 K_MAX sweep**: inverted-U on geometric — K=1: 6.5e-3–1.9e-2, K=5: 4.4e-3, K=10: 2.4e-3 (±3%, 3 seeds), K=20: 1.2–3.3e-2 + one 1.0-dex fixed-dt blow-up. Matches List et al. 2024 (detached unrolling counterproductive beyond ~6; BPTT helps further but K=10 is inside every published envelope — GraphCast 12 max). Training horizon ≪ deployment horizon is universal practice. | medium-high |
 | `curriculum` 2→10, linear, 30 epochs | enabled | All multi-step SOTA use staged/ramped horizons (GraphCast +1/1k-updates 1→12; Stormer 1→4→8; NeuralGCM "critical"); sandbox used the equivalent ramp in every successful run. | high (literature + used throughout locally) |
@@ -142,9 +180,9 @@ no inversion of any adopted finding.
    rather than banding, run a second stage-2 pass with preprocessing dt_min/dt_max
    narrowed to ~[2, 20] s from the *same* stage-1 checkpoint (FuXi-style). Keeps one
    model family, no band-boundary discontinuity.
-4. **Autoencoder trunk** — `model.type=autoencoder` remains supported (incl. fourier_dt);
-   Fourier-Flow-map was worse + 5.5× seed spread at sandbox scale (E1) but small-scale
-   bottleneck behavior may not transfer; documented, not pursued.
+4. **Autoencoder trunk** — removed from src on 2026-09-30; recover from git history (tag
+   `pre-audit-2026-09-29`). Rationale kept: Fourier-Flow-map was worse + 5.5× seed spread at
+   sandbox scale (E1) but small-scale bottleneck behavior may not transfer; documented, not pursued.
 
 ## Cheap production-scale spot-checks (optional, per the transfer-risk policy)
 
@@ -171,12 +209,14 @@ Each ~20 stage-1 epochs (~5% of a full run) on one GH200, comparing val curves:
 - **Adversarial code review** (two independent reviewers over the diff): default-off
   behavior verified *bitwise* against HEAD (state dicts, forward outputs, gradients);
   γ math consistent across detached/accumulated/BPTT paths; torch.export verified with
-  dynamic batch at fp32 and bf16. Review findings addressed: fallback_banded path depth
-  fixed (+ resolution verified); `fourier_dt` block without `enabled` now raises;
-  `loss_discount_gamma` outside AR mode now raises; Fourier projection computed in fp32
-  internally (bf16-config fidelity). Known non-blocking notes: val_loss is intentionally
-  uniform-weighted even when training γ<1 (cross-config comparability — commented in
-  trainer.py); AR + bf16-mixed + fused-optimizer + clipping fails at first step
+  dynamic batch at fp32 and bf16 (a shape check only: the output batch size; bf16 numerical
+  fidelity was never verified. A 2026-09 audit measured the bf16 export at a median 6.2e-3 dex
+  error against 3.3e-7 for fp32, and the bf16 export option was removed on 2026-09-30).
+  Review findings addressed: fallback_banded path depth fixed (+ resolution verified);
+  `fourier_dt` block without `enabled` now raises; `loss_discount_gamma` outside AR mode now
+  raises; Fourier projection computed in fp32 internally (bf16-config fidelity). Known
+  non-blocking notes: val_loss is intentionally uniform-weighted even when training γ<1
+  (cross-config comparability — commented in trainer.py); AR + bf16-mixed + fused-optimizer + clipping fails at first step
   (pre-existing Lightning guard; production configs are fp32-true and unaffected).
 - ruff/vulture clean on all changed files; all 7 configs pass the strict schema;
   legacy configs unaffected.

@@ -8,7 +8,6 @@
 # Usage:  conda activate nn && bash testing/run_local_smoke.sh
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."   # Auto-Chem repo root (this script lives in testing/)
-export KMP_DUPLICATE_LIB_OK=TRUE
 
 SCRATCH="smoke_scratch"
 rm -rf "$SCRATCH"

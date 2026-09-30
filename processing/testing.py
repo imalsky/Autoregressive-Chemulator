@@ -21,15 +21,32 @@ Outputs into: <repo_root>/figures/
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import json
 import os
 import h5py
 import numpy as np
 import matplotlib.pyplot as plt
+
+# Shared preprocessing logic (processing/ is on sys.path when this script runs), so the
+# chunks drawn here are built exactly as processing/preprocessing.py builds them.
+from preprocessing import (
+    PreCfg,
+    _is_non_finite_raw_error,
+    interp_loglog,
+    leaf_dataset_index,
+    list_raw_files,
+    load_json,
+    parse_precfg,
+    pick_t_start,
+    prepare_log_interp,
+    read_globals_vector,
+    read_species_matrix,
+    read_time,
+    sample_dt,
+    validate_required_config_keys,
+)
 
 
 # =============================================================================
@@ -50,12 +67,8 @@ N_COLS = 2
 # Random selection seed for trajectories
 SEED = 1
 
-# Chunk generation semantics (mirrors preprocessing.py pick_t_start behavior)
+# Chunk start semantics (preprocessing anchors only the first chunk per trajectory)
 USE_ANCHOR_FIRST_CHUNK = True
-CHUNK_T_START_ATTEMPTS = 500  # random t_start attempts (after anchor)
-
-# Valid-time mask floor factor; must track preprocessing._VALID_TIME_FLOOR_FACTOR.
-VALID_TIME_FLOOR_FACTOR = 0.5
 
 # If set, overrides dt selection.
 DT_OVERRIDE: Optional[float] = None
@@ -74,316 +87,8 @@ MAX_GROUP_TRIES = 5000
 
 
 # =============================================================================
-# Config + raw reading helpers (match preprocessing.py semantics)
+# Chunk construction (preprocessing.sample_file logic for one trajectory)
 # =============================================================================
-
-def load_json_config(path: Path) -> Dict:
-    with open(path, "r", encoding="utf-8") as f:
-        obj = json.load(f)
-    if not isinstance(obj, dict):
-        raise TypeError(f"Config must be a JSON object: {path}")
-    return obj
-
-
-def leaf_dataset_index(grp: h5py.Group) -> Dict[str, List[str]]:
-    idx: Dict[str, List[str]] = {}
-
-    def visitor(name: str, obj: object) -> None:
-        if isinstance(obj, h5py.Dataset):
-            leaf = name.split("/")[-1]
-            idx.setdefault(leaf, []).append(name)
-
-    grp.visititems(visitor)
-    return idx
-
-
-def _unique_dataset_path(grp: h5py.Group, leaf_index: Dict[str, List[str]], key: str) -> str:
-    """
-    Mirror preprocessing._unique_dataset_path():
-      - If key contains '/', treat as full path.
-      - Else match by leaf name; require exactly one match.
-    """
-    if "/" in key:
-        if key not in grp:
-            raise KeyError(f"Dataset path not found in trajectory group: {key}")
-        obj = grp[key]
-        if not isinstance(obj, h5py.Dataset):
-            raise TypeError(f"Expected dataset at {key}")
-        return key
-
-    matches = leaf_index.get(key, [])
-    if not matches:
-        raise KeyError(f"Dataset not found in trajectory group: {key}")
-    if len(matches) != 1:
-        raise KeyError(f"Dataset name is ambiguous in trajectory group: {key} -> {matches}")
-    return matches[0]
-
-
-def read_time(grp: h5py.Group, *, time_key: str, leaf_index: Dict[str, List[str]]) -> np.ndarray:
-    p = _unique_dataset_path(grp, leaf_index, time_key)
-
-    t = np.asarray(grp[p][...], dtype=np.float64).reshape(-1)
-    if t.size < 2:
-        raise ValueError(f"time dataset '{time_key}' has < 2 samples")
-    if not np.all(np.isfinite(t)):
-        raise ValueError(f"time dataset '{time_key}' contains non-finite values")
-    if not np.all(np.diff(t) > 0):
-        raise ValueError(f"time dataset '{time_key}' is not strictly increasing")
-    return t
-
-
-def read_species_matrix(
-    grp: h5py.Group,
-    *,
-    t_len: int,
-    species_vars: List[str],
-    leaf_index: Dict[str, List[str]],
-) -> np.ndarray:
-    s = len(species_vars)
-    y = np.empty((t_len, s), dtype=np.float64)
-
-    for j, name in enumerate(species_vars):
-        p = _unique_dataset_path(grp, leaf_index, name)
-        arr = np.asarray(grp[p][...], dtype=np.float64)
-
-        if arr.ndim == 1:
-            if int(arr.shape[0]) != int(t_len):
-                raise ValueError(
-                    f"Species dataset '{name}' must have shape [{t_len}] or [{t_len}, 1], got {arr.shape}"
-                )
-            col = arr
-        elif arr.ndim == 2 and int(arr.shape[0]) == int(t_len) and int(arr.shape[1]) == 1:
-            col = arr[:, 0]
-        else:
-            raise ValueError(
-                f"Species dataset '{name}' must be scalar-per-time with shape [{t_len}] or [{t_len}, 1], got {arr.shape}"
-            )
-
-        if not np.all(np.isfinite(col)):
-            raise ValueError(f"Species dataset '{name}' contains non-finite values")
-        y[:, j] = col
-
-    return y
-
-
-# =============================================================================
-# Chunk placement + interpolation (match preprocessing.py semantics)
-# =============================================================================
-
-def prepare_log_interp(log_t_valid: np.ndarray, log_t_target: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Mirror preprocessing.prepare_log_interp(): strict denom > 0.
-    """
-    n = int(log_t_valid.shape[0])
-    idx = np.searchsorted(log_t_valid, log_t_target, side="left")
-    idx = np.clip(idx, 1, n - 1)
-
-    i0 = (idx - 1).astype(np.int64)
-    i1 = idx.astype(np.int64)
-
-    t0 = log_t_valid[i0]
-    t1 = log_t_valid[i1]
-    denom = t1 - t0
-    if np.any(denom <= 0):
-        raise ValueError("Invalid time grid: encountered non-positive interpolation denominator")
-
-    w = (log_t_target - t0) / denom
-    w = np.clip(w, 0.0, 1.0).astype(np.float64)
-    return i0, i1, w
-
-
-def interp_loglog(
-    y_valid: np.ndarray,
-    *,
-    i0: np.ndarray,
-    i1: np.ndarray,
-    w: np.ndarray,
-    epsilon: float,
-) -> np.ndarray:
-    """
-    Mirror preprocessing.interp_loglog(): floor at epsilon (NOT 1e-300).
-    """
-    y0 = np.log10(np.maximum(y_valid[i0, :], epsilon))
-    y1 = np.log10(np.maximum(y_valid[i1, :], epsilon))
-    w2 = w.reshape(-1, 1)
-    return 10.0 ** ((1.0 - w2) * y0 + w2 * y1)
-
-
-def sample_dt(cfg: "PlotCfg", rng: np.random.Generator) -> float:
-    if DT_OVERRIDE is not None:
-        if DT_OVERRIDE <= 0:
-            raise ValueError(f"DT_OVERRIDE must be > 0, got {DT_OVERRIDE}")
-        return float(DT_OVERRIDE)
-
-    lo = np.log10(cfg.dt_min)
-    hi = np.log10(cfg.dt_max)
-    return float(10.0 ** rng.uniform(lo, hi))
-
-
-def pick_t_start(
-    *,
-    t_raw: np.ndarray,
-    t_valid: np.ndarray,
-    dt_s: float,
-    n_steps: int,
-    t_min: float,
-    rng: np.random.Generator,
-    anchor_first: bool,
-    max_attempts: int,
-) -> Optional[float]:
-    """
-    Mirror preprocessing.pick_t_start().
-    """
-    pos = t_raw > 0
-    if not np.any(pos):
-        return None
-
-    first_pos_time = float(t_raw[pos][0])
-    t_lo = max(float(t_min), first_pos_time)
-
-    chunk_offsets = np.arange(n_steps, dtype=np.float64) * float(dt_s)
-    chunk_duration = float(chunk_offsets[-1])
-
-    t_end = float(t_raw[-1])
-    t_hi = t_end - chunk_duration
-    if t_hi <= t_lo:
-        return None
-
-    def fits(start: float) -> bool:
-        t_chunk = start + chunk_offsets
-        return (t_chunk[0] >= float(t_valid[0])) and (t_chunk[-1] <= float(t_valid[-1]))
-
-    if anchor_first and fits(t_lo):
-        return float(t_lo)
-
-    lo = np.log10(t_lo)
-    hi = np.log10(t_hi)
-
-    for _ in range(max_attempts):
-        cand = float(10.0 ** rng.uniform(lo, hi))
-        if fits(cand):
-            return cand
-
-    return None
-
-
-# =============================================================================
-# Plot config
-# =============================================================================
-
-@dataclass(frozen=True)
-class PlotCfg:
-    raw_dir: Path
-    raw_file_patterns: List[str]
-
-    dt_min: float
-    dt_max: float
-    dt_sampling: str
-
-    n_steps: int
-    t_min: float
-    drop_below: float
-
-    time_key: str
-    species_variables: List[str]
-
-    epsilon: float
-
-
-def _resolve_path(root: Path, p: str) -> Path:
-    path = Path(p).expanduser()
-    return path if path.is_absolute() else (root / path).resolve()
-
-
-def load_plotcfg(cfg: Dict, *, cfg_path: Path) -> PlotCfg:
-    root = cfg_path.parent.resolve()
-
-    paths = cfg.get("paths", {})
-    if not isinstance(paths, dict):
-        raise TypeError("config.paths must be an object")
-
-    if "raw_dir" not in paths:
-        raise KeyError("config.paths must contain 'raw_dir'")
-
-    raw_dir = _resolve_path(root, str(paths["raw_dir"]))
-
-    data = cfg.get("data", {})
-    if not isinstance(data, dict):
-        raise TypeError("config.data must be an object")
-    species_variables = data.get("species_variables", [])
-    if not isinstance(species_variables, list) or not all(isinstance(x, str) and x.strip() for x in species_variables):
-        raise TypeError("config.data.species_variables must be a non-empty list of strings")
-    species_variables = [str(x).strip() for x in species_variables]
-
-    pr = cfg.get("preprocessing", {})
-    if not isinstance(pr, dict):
-        raise TypeError("config.preprocessing must be an object")
-
-    raw_file_patterns = pr.get("raw_file_patterns", ["*.h5", "*.hdf5"])
-    if isinstance(raw_file_patterns, str):
-        raw_file_patterns = [raw_file_patterns]
-    if (
-        not isinstance(raw_file_patterns, list)
-        or not raw_file_patterns
-        or not all(isinstance(x, str) and x.strip() for x in raw_file_patterns)
-    ):
-        raise TypeError("config.preprocessing.raw_file_patterns must be a non-empty list of strings")
-    raw_file_patterns = [str(x).strip() for x in raw_file_patterns]
-
-    time_key = pr.get("time_key", None)
-    if not isinstance(time_key, str) or not time_key.strip():
-        raise KeyError("config.preprocessing.time_key is required")
-    time_key = str(time_key).strip()
-
-    dt_min_raw = pr.get("dt_min", None)
-    dt_max_raw = pr.get("dt_max", None)
-    if dt_min_raw is None or dt_max_raw is None:
-        raise KeyError("config.preprocessing must include dt_min and dt_max")
-    dt_min = float(dt_min_raw)
-    dt_max = float(dt_max_raw)
-    dt_sampling = str(pr.get("dt_sampling", "loguniform")).lower().strip()
-    n_steps = int(pr.get("n_steps", 300))
-    t_min = float(pr.get("t_min", 0.0))
-    drop_below = float(pr.get("drop_below", 1e-35))
-
-    norm = cfg.get("normalization", {})
-    if not isinstance(norm, dict):
-        raise TypeError("config.normalization must be an object")
-    epsilon = float(norm.get("epsilon", 1e-30))
-    if epsilon <= 0.0:
-        raise ValueError(f"normalization.epsilon must be > 0, got {epsilon}")
-
-    if n_steps < 2:
-        raise ValueError(f"preprocessing.n_steps must be >= 2, got {n_steps}")
-    if dt_min <= 0.0 or dt_max <= 0.0 or dt_max <= dt_min:
-        raise ValueError(f"Invalid dt_min/dt_max: require 0 < dt_min < dt_max (got {dt_min}, {dt_max})")
-    if dt_sampling != "loguniform":
-        raise ValueError("preprocessing.dt_sampling must be 'loguniform'")
-
-    return PlotCfg(
-        raw_dir=raw_dir,
-        raw_file_patterns=raw_file_patterns,
-        dt_min=dt_min,
-        dt_max=dt_max,
-        dt_sampling=dt_sampling,
-        n_steps=n_steps,
-        t_min=t_min,
-        drop_below=drop_below,
-        time_key=time_key,
-        species_variables=species_variables,
-        epsilon=epsilon,
-    )
-
-
-def pick_raw_file(raw_dir: Path, patterns: List[str]) -> Path:
-    files: List[Path] = []
-    for pat in patterns:
-        files.extend(sorted(raw_dir.glob(pat)))
-    uniq = sorted({p.resolve() for p in files})
-    if not uniq:
-        raise FileNotFoundError(f"No HDF5 files found under raw_dir={raw_dir} for patterns={patterns}")
-    return uniq[0]
-
 
 def list_group_names(f_raw: h5py.File) -> List[str]:
     return [k for k in f_raw.keys() if isinstance(f_raw[k], h5py.Group)]
@@ -391,7 +96,7 @@ def list_group_names(f_raw: h5py.File) -> List[str]:
 
 def build_raw_and_chunk_from_preprocessing_logic(
     raw: h5py.Group,
-    pcfg: PlotCfg,
+    cfg: PreCfg,
     rng: np.random.Generator,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     """
@@ -401,66 +106,59 @@ def build_raw_and_chunk_from_preprocessing_logic(
       t_chunk : [n_steps] absolute times
       y_chunk : [n_steps, S] interpolated (floored at epsilon in log space)
       dt_s    : scalar dt used for the chunk
+
+    Soft rejects raise RuntimeError("Rejected...: ..."); non-finite raw values raise
+    preprocessing's ValueError; raw-schema errors raise KeyError/TypeError/ValueError.
     """
     leaf_index = leaf_dataset_index(raw)
 
-    t_raw = read_time(raw, time_key=pcfg.time_key, leaf_index=leaf_index)
+    t_raw = read_time(raw, time_key=cfg.time_key, leaf_index=leaf_index)
     T = int(t_raw.shape[0])
 
-    y_raw = read_species_matrix(raw, t_len=T, species_vars=pcfg.species_variables, leaf_index=leaf_index)
+    y_raw = read_species_matrix(raw, t_len=T, species_vars=cfg.species_variables, leaf_index=leaf_index)
+    # Globals are not plotted; reading them rejects non-finite P/T exactly as preprocessing does.
+    read_globals_vector(raw, global_vars=cfg.global_variables, leaf_index=leaf_index)
 
     # Apply preprocessing.drop_below rejection (optional; default True to match preprocessing)
     if APPLY_DROP_BELOW:
-        if np.any(y_raw < float(pcfg.drop_below)):
-            raise RuntimeError(f"Rejected by drop_below: min(y_raw)={float(np.min(y_raw)):.3e} < {pcfg.drop_below:.3e}")
+        if np.any(y_raw < float(cfg.drop_below)):
+            raise RuntimeError(f"Rejected by drop_below: min(y_raw)={float(np.min(y_raw)):.3e} < {cfg.drop_below:.3e}")
 
-    # Valid mask (mirrors preprocessing.sample_file)
-    pos = t_raw > 0
-    if not np.any(pos):
-        raise RuntimeError("Rejected: all times <= 0")
-
-    first_pos_time = float(t_raw[pos][0])
-    t_lo = max(float(pcfg.t_min), first_pos_time)
-
-    valid = (t_raw > 0) & (t_raw >= t_lo * VALID_TIME_FLOOR_FACTOR)
+    # Valid mask (mirrors preprocessing.sample_file): positive times, at least 2 of them.
+    valid = t_raw > 0
     if int(np.count_nonzero(valid)) < 2:
-        raise RuntimeError(f"Rejected: too few valid samples after time filter (t_lo={t_lo:.3e})")
+        raise RuntimeError("Rejected: fewer than 2 positive times (too_few_valid)")
 
     t_valid = t_raw[valid]
     y_valid = y_raw[valid, :]
 
-    # Sample dt (mirrors preprocessing.sample_dt unless DT_OVERRIDE is set)
-    dt_s = sample_dt(pcfg, rng)
+    # Sample dt (preprocessing.sample_dt unless DT_OVERRIDE is set)
+    dt_s = float(DT_OVERRIDE) if DT_OVERRIDE is not None else sample_dt(cfg, rng)
 
     # Choose chunk start
     t_start = pick_t_start(
         t_raw=t_raw,
         t_valid=t_valid,
         dt_s=dt_s,
-        n_steps=pcfg.n_steps,
-        t_min=pcfg.t_min,
+        n_steps=cfg.n_steps,
+        t_min=cfg.t_min,
         rng=rng,
         anchor_first=USE_ANCHOR_FIRST_CHUNK,
-        max_attempts=CHUNK_T_START_ATTEMPTS,
+        max_attempts=cfg.max_chunk_attempts_per_source,
     )
     if t_start is None:
         raise RuntimeError("Rejected: could not fit a chunk (no_fit_chunk)")
 
-    t_chunk = float(t_start) + np.arange(pcfg.n_steps, dtype=np.float64) * float(dt_s)
+    t_chunk = float(t_start) + np.arange(cfg.n_steps, dtype=np.float64) * float(dt_s)
 
-    # Interpolate in log-time/log-y (mirrors preprocessing.interp_loglog)
+    # Interpolate in log-time/log-y (preprocessing.interp_loglog)
     log_t_valid = np.log10(t_valid)
     log_t_chunk = np.log10(t_chunk)
     i0, i1, w = prepare_log_interp(log_t_valid, log_t_chunk)
-    y_chunk = interp_loglog(y_valid, i0=i0, i1=i1, w=w, epsilon=pcfg.epsilon)
+    y_chunk = interp_loglog(y_valid, i0=i0, i1=i1, w=w, epsilon=cfg.epsilon)
 
     if not np.all(np.isfinite(y_chunk)):
         raise RuntimeError("Rejected: interp produced non-finite values")
-
-    # Defensive assertion: with epsilon flooring, chunk should never drop below epsilon
-    if np.any(y_chunk < float(pcfg.epsilon)):
-        mn = float(np.min(y_chunk))
-        raise RuntimeError(f"BUG: y_chunk dropped below epsilon (min={mn:.3e} < eps={pcfg.epsilon:.3e})")
 
     return t_raw, y_raw, t_chunk, y_chunk, float(dt_s)
 
@@ -493,7 +191,7 @@ def plot_overlay_all_species(
     chunk_pts = int(len(t_chunk))
 
     raw_label = f"Raw ({raw_pts_per_species} pts/species, N={species_count})"
-    chunk_label = f"Chunk ({chunk_pts} pts, dt={dt_s:.0f})"
+    chunk_label = f"Chunk ({chunk_pts} pts, dt={dt_s:.3g} s)"
 
     did_raw_label = False
     did_chunk_label = False
@@ -544,17 +242,20 @@ def main() -> None:
             "  AUTOCHEM_CONFIG_PATH=configs/stage1.json python -u processing/testing.py"
         )
     config_path = Path(cfg_override).expanduser().resolve()
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
+    # Same strict parsing as preprocessing (unknown or missing keys hard-fail; no defaults).
+    cfg_dict = load_json(config_path)
+    validate_required_config_keys(cfg_dict)
+    cfg = parse_precfg(cfg_dict, cfg_path=config_path)
+    if DT_OVERRIDE is not None and DT_OVERRIDE <= 0:
+        raise ValueError(f"DT_OVERRIDE must be > 0, got {DT_OVERRIDE}")
 
-    cfg = load_json_config(config_path)
-    pcfg = load_plotcfg(cfg, cfg_path=config_path)
-    if not pcfg.species_variables:
-        raise RuntimeError("data.species_variables is empty; cannot plot species curves.")
-
-    raw_file = RAW_FILE if RAW_FILE is not None else pick_raw_file(pcfg.raw_dir, pcfg.raw_file_patterns)
-    if not raw_file.is_absolute():
-        raw_file = (PROJECT_ROOT / raw_file).resolve()
+    if RAW_FILE is not None:
+        raw_file = RAW_FILE if RAW_FILE.is_absolute() else (PROJECT_ROOT / RAW_FILE).resolve()
+    else:
+        raw_files = list_raw_files(cfg.raw_dir, cfg.raw_file_patterns)
+        if not raw_files:
+            raise FileNotFoundError(f"No HDF5 files found under raw_dir={cfg.raw_dir} for patterns={cfg.raw_file_patterns}")
+        raw_file = raw_files[0]
     if not raw_file.exists():
         raise FileNotFoundError(f"RAW_FILE not found: {raw_file}")
 
@@ -581,9 +282,16 @@ def main() -> None:
 
             raw_grp = f_raw[gname]
             try:
-                t_raw, y_raw, t_chunk, y_chunk, dt_s = build_raw_and_chunk_from_preprocessing_logic(raw_grp, pcfg, rng)
-            except Exception as e:
-                key = str(e).split(":")[0].strip() if str(e).strip() else e.__class__.__name__
+                t_raw, y_raw, t_chunk, y_chunk, dt_s = build_raw_and_chunk_from_preprocessing_logic(raw_grp, cfg, rng)
+            except ValueError as e:
+                # preprocessing's split: non-finite raw values are a soft reject; any other
+                # ValueError (like KeyError/TypeError) is a raw-schema error and propagates.
+                if not _is_non_finite_raw_error(e):
+                    raise
+                reject_reasons["non_finite"] = reject_reasons.get("non_finite", 0) + 1
+                continue
+            except RuntimeError as e:  # this script's own soft rejects
+                key = str(e).split(":")[0].strip()
                 reject_reasons[key] = reject_reasons.get(key, 0) + 1
                 continue
 
@@ -615,7 +323,7 @@ def main() -> None:
                 t_chunk,
                 y_chunk,
                 legend=True,
-                species_count=len(pcfg.species_variables),
+                species_count=len(cfg.species_variables),
                 dt_s=dt_s,
             )
 
@@ -630,13 +338,13 @@ def main() -> None:
                 t_chunk,
                 y_chunk,
                 legend=True,
-                species_count=len(pcfg.species_variables),
+                species_count=len(cfg.species_variables),
                 dt_s=dt_s,
             )
             axR.set_xlim(float(t_chunk[0]), float(t_chunk[-1]))
 
         fig.suptitle(
-            f"Raw vs Generated Chunk Overlay (dt_sampling={pcfg.dt_sampling}, n_steps={pcfg.n_steps}, eps={pcfg.epsilon:.1e})\n"
+            f"Raw vs Generated Chunk Overlay (dt_sampling={cfg.dt_sampling}, n_steps={cfg.n_steps}, eps={cfg.epsilon:.1e})\n"
             f"Raw file: {raw_file.name}",
             fontsize=11,
             y=0.995,

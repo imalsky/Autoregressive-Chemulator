@@ -1,25 +1,19 @@
 #!/usr/bin/env python3
 """
-model.py - Model architectures for flow-map rollout prediction.
+model.py - Model architecture for flow-map rollout prediction.
 
-This module defines the neural networks used by the trainer. The core task is
+This module defines the neural network used by the trainer. The core task is
 one-step evolution under variable timestep:
 
     y_{t+1} = F(y_t, dt_t, g)
 
 where:
   - y_t: state vector at time t (shape [B, S])
-  - dt_t: normalized timestep for that step (shape [B] or [B, 1])
+  - dt_t: normalized timestep for that step (shape [B])
   - g: global conditioning parameters (shape [B, G])
 
-Two model families are provided:
-
-  1) FlowMapMLP
-     Direct MLP that predicts y(t+dt) from concatenated (y(t), dt, g).
-
-  2) FlowMapAutoencoder
-     Encoder -> LatentDynamics -> Decoder. The dynamics operate in latent space,
-     then decode back to the original state space.
+FlowMapMLP is the only model: a direct MLP (residual or plain trunk) that predicts
+y(t+dt) from concatenated (y(t), dt, g), with an optional fixed Fourier embedding of dt.
 
 Design goals:
   - Deterministic behavior: no silent fallbacks.
@@ -45,6 +39,8 @@ ActivationFactory = Callable[[], nn.Module]
 _DELTA_OUT_INIT_STD = 1e-3
 # Negative slope for the optional "leaky_relu" activation factory.
 _LEAKY_RELU_SLOPE = 0.1
+# Fixed global set, in this order (spec.md section 5, items 4-6). src/main.py and testing/export.py
+# import it from here; the standalone processing/preprocessing.py and testing/predictions.py keep a copy.
 _REQUIRED_GLOBALS = ("P", "T")
 
 
@@ -59,106 +55,29 @@ def normalize_dt_shape(
         *,
         context: str,
 ) -> torch.Tensor:
-    """Return dt as shape [B, K] using strict, unambiguous rules.
+    """Return dt as shape [B, K]; any other shape is an error.
 
-    Accepted shapes:
-      - [B, K]     canonical
-      - [B, K, 1]  squeezed to [B, K]
-      - [K]        allowed only when B == 1 (treated as [1, K])
-
-    Anything else is an error. This avoids silent broadcasting that can mask
-    dataset / collation bugs.
-
-    Note: batch_size and seq_len can be symbolic (torch.SymInt) for export compatibility.
+    Only [B, K] is accepted (no squeezing or broadcasting that could mask dataset /
+    collation bugs). The rank check is a plain Python raise (ndim is concrete under
+    torch.export); batch_size and seq_len can be symbolic (torch.SymInt).
     """
-    B = batch_size
-    K = seq_len
-
-    if dt.ndim == 2:
-        torch._check(dt.shape[0] == B)
-        torch._check(dt.shape[1] == K)
-        return dt
-
-    if dt.ndim == 3 and dt.shape[-1] == 1:
-        torch._check(dt.shape[0] == B)
-        torch._check(dt.shape[1] == K)
-        return dt[..., 0]
-
-    if dt.ndim == 1:
-        torch._check(B == 1)
-        torch._check(dt.shape[0] == K)
-        return dt.reshape(1, K)
-
-    # For unsupported shapes, we need a concrete check (this path shouldn't be hit during export)
-    raise ValueError(f"{context}: unsupported dt shape {dt.shape}.")
-
-
-def prepare_dt_batch(
-        dt_norm: torch.Tensor,
-        batch_size: torch.SymInt,
-        *,
-        context: str,
-        seq_len: Optional[int] = None,
-) -> tuple[torch.Tensor, torch.SymInt]:
-    """Return (dt_bk, K) using the same rules as normalize_dt_shape.
-
-    Replaces the common `infer_seq_len` + `normalize_dt_shape` call pair.
-    """
-    K = infer_seq_len(dt_norm, batch_size, context=context)
-    if seq_len is not None:
-        torch._check(K == seq_len)
-    dt_bk = normalize_dt_shape(dt_norm, batch_size, K, context=context)
-    return dt_bk, K
+    if dt.ndim != 2:
+        raise ValueError(f"{context}: dt must have shape [B, K], got {tuple(dt.shape)}.")
+    torch._check(dt.shape[0] == batch_size)
+    torch._check(dt.shape[1] == seq_len)
+    return dt
 
 
 def normalize_dt_step(dt_norm: torch.Tensor, batch_size: torch.SymInt, *, context: str) -> torch.Tensor:
-    """Return a single-step dt as shape [B, 1].
+    """Return a single-step dt [B] as shape [B, 1]; any other shape is an error.
 
-    Accepted shapes:
-      - [B]
-      - [B, 1]
-      - scalar [] only when B == 1
-
-    Note: batch_size can be symbolic (torch.SymInt) for export compatibility.
+    The rank check is a plain Python raise (ndim is concrete under torch.export);
+    batch_size can be symbolic (torch.SymInt) for export compatibility.
     """
-    B = batch_size
-
-    if dt_norm.ndim == 1:
-        torch._check(dt_norm.shape[0] == B)
-        return dt_norm.reshape(-1, 1)
-
-    if dt_norm.ndim == 2:
-        torch._check(dt_norm.shape[0] == B)
-        torch._check(dt_norm.shape[1] == 1)
-        return dt_norm
-
-    if dt_norm.ndim == 0:
-        torch._check(B == 1)
-        return dt_norm.reshape(1, 1)
-
-    raise ValueError(f"{context}: unsupported dt shape {dt_norm.shape}.")
-
-
-def infer_seq_len(dt_norm: torch.Tensor, batch_size: torch.SymInt, *, context: str) -> torch.SymInt:
-    """Infer K from dt_norm using the same strict shape rules as normalize_dt_shape.
-
-    Note: Returns torch.SymInt for export compatibility.
-    """
-    B = batch_size
-
-    if dt_norm.ndim == 2:
-        torch._check(dt_norm.shape[0] == B)
-        return dt_norm.shape[1]
-
-    if dt_norm.ndim == 3 and dt_norm.shape[-1] == 1:
-        torch._check(dt_norm.shape[0] == B)
-        return dt_norm.shape[1]
-
-    if dt_norm.ndim == 1:
-        torch._check(B == 1)
-        return dt_norm.shape[0]
-
-    raise ValueError(f"{context}: unsupported dt shape {dt_norm.shape}.")
+    if dt_norm.ndim != 1:
+        raise ValueError(f"{context}: dt must have shape [B], got {tuple(dt_norm.shape)}.")
+    torch._check(dt_norm.shape[0] == batch_size)
+    return dt_norm.reshape(-1, 1)
 
 
 def _validate_g_shape(g: torch.Tensor, batch_size: torch.SymInt, global_dim: int, context: str) -> None:
@@ -180,15 +99,15 @@ def autoregressive_rollout(
 ) -> torch.Tensor:
     """Roll a per-step forward_step K times, feeding predictions back in.
 
-    Shared by FlowMapMLP.forward, FlowMapAutoencoder.forward, and the trainer's
-    open-loop evaluation unroll.
+    Used by the trainer's open-loop evaluation unroll.
     """
     B = y0.shape[0]
     K = dt_bk.shape[1]
     S = y0.shape[-1]
     y_pred = torch.empty(B, K, S, device=y0.device, dtype=y0.dtype)
     state = y0
-    # Intentionally avoid int(K) to stay export-safe with symbolic K.
+    # range(K) specializes K at trace time (torch.export guards K to a constant); only the
+    # batch dim can stay dynamic. Deployment exports the one-step forward_step instead.
     for t in range(K):
         state = forward_step(state, dt_bk[:, t], g)
         y_pred[:, t, :] = state
@@ -431,239 +350,9 @@ class ResidualMLP(nn.Module):
         return self.out(h)
 
 
-class Encoder(nn.Module):
-    """Encoder: (y, g) -> z."""
-
-    def __init__(
-            self,
-            state_dim: int,
-            global_dim: int,
-            hidden_dims: Sequence[int],
-            latent_dim: int,
-            activation_factory: ActivationFactory,
-            dropout_p: float = 0.0,
-            *,
-            residual: bool,
-            layer_norm: bool,
-            layer_norm_eps: float,
-    ):
-        super().__init__()
-        net_cls = ResidualMLP if bool(residual) else MLP
-        self.network = net_cls(
-            int(state_dim) + int(global_dim),
-            hidden_dims,
-            int(latent_dim),
-            activation_factory,
-            dropout_p,
-            layer_norm=layer_norm,
-            layer_norm_eps=layer_norm_eps,
-        )
-
-    def forward(self, y: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([y, g], dim=-1)
-        return self.network(x)
-
-
-class LatentDynamics(nn.Module):
-    """Latent-space dynamics: (z, dt, g) -> z_next or dz."""
-
-    def __init__(
-            self,
-            latent_dim: int,
-            global_dim: int,
-            hidden_dims: Sequence[int],
-            activation_factory: ActivationFactory,
-            dropout_p: float = 0.0,
-            *,
-            residual: bool,
-            mlp_residual: bool,
-            layer_norm: bool,
-            layer_norm_eps: float,
-            zero_init_residual_output: bool = False,
-            fourier_dt: Optional[FourierDtFeatures] = None,
-    ):
-        super().__init__()
-        self.residual = bool(residual)
-        self.fourier_dt = fourier_dt
-        dt_dim = fourier_dt.out_dim if fourier_dt is not None else 1
-
-        net_cls = ResidualMLP if bool(mlp_residual) else MLP
-        self.network = net_cls(
-            int(latent_dim) + dt_dim + int(global_dim),
-            hidden_dims,
-            int(latent_dim),
-            activation_factory,
-            dropout_p,
-            layer_norm=layer_norm,
-            layer_norm_eps=layer_norm_eps,
-        )
-
-        # When the dynamics is residual (z_next = z + dz), zero-init the output
-        # Linear so dz == 0 at step 0 and the skip provides an exact identity prior.
-        if self.residual and bool(zero_init_residual_output):
-            with torch.no_grad():
-                out = self.network.last_linear()
-                nn.init.zeros_(out.weight)
-                if out.bias is not None:
-                    nn.init.zeros_(out.bias)
-
-    def _embed_dt(self, dt: torch.Tensor, target_dtype: torch.dtype) -> torch.Tensor:
-        """dt [..., 1] -> [..., dt_dim] (identity when fourier_dt is disabled)."""
-        dt = dt.to(target_dtype)
-        if self.fourier_dt is None:
-            return dt
-        return self.fourier_dt(dt)
-
-    def forward_step(self, z: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-        """Advance one latent step: z_next = z + dz (residual) or dz, from (z, embedded dt, g)."""
-        B = z.shape[0]  # Keep as symbolic
-        dt = normalize_dt_step(dt_norm, B, context="LatentDynamics.forward_step")
-        x = torch.cat([z, self._embed_dt(dt, z.dtype), g], dim=-1)
-        dz = self.network(x)
-        return z + dz if self.residual else dz
-
-
-class Decoder(nn.Module):
-    """Decoder: z -> y."""
-
-    def __init__(
-            self,
-            latent_dim: int,
-            hidden_dims: Sequence[int],
-            state_dim: int,
-            activation_factory: ActivationFactory,
-            dropout_p: float = 0.0,
-            *,
-            residual: bool,
-            layer_norm: bool,
-            layer_norm_eps: float,
-    ):
-        super().__init__()
-        net_cls = ResidualMLP if bool(residual) else MLP
-        self.network = net_cls(
-            int(latent_dim),
-            hidden_dims,
-            int(state_dim),
-            activation_factory,
-            dropout_p,
-            layer_norm=layer_norm,
-            layer_norm_eps=layer_norm_eps,
-        )
-
-    def last_linear(self) -> nn.Linear:
-        return self.network.last_linear()
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return self.network(z)
-
-
 # ==============================================================================
 # Full models
 # ==============================================================================
-
-class FlowMapAutoencoder(nn.Module):
-    """Flow-map autoencoder: Encoder -> LatentDynamics -> Decoder."""
-
-    def __init__(
-            self,
-            *,
-            state_dim: int,
-            global_dim: int,
-            latent_dim: int,
-            encoder_hidden: Sequence[int] | int,
-            dynamics_hidden: Sequence[int] | int,
-            decoder_hidden: Sequence[int] | int,
-            activation_name: str,
-            dropout: float = 0.0,
-            residual: bool,
-            dynamics_residual: bool,
-            predict_delta: bool,
-            layer_norm: bool,
-            layer_norm_eps: float,
-            zero_init_dynamics_output: bool = False,
-            fourier_dt: Optional[FourierDtFeatures] = None,
-    ):
-        super().__init__()
-
-        self.S, self.G, self.Z = int(state_dim), int(global_dim), int(latent_dim)
-        self.predict_delta = bool(predict_delta)
-
-        # Hidden dims accept either an int (one layer) or a list[int].
-        enc_h = _as_int_list(encoder_hidden, name="encoder_hidden")
-        dyn_h = _as_int_list(dynamics_hidden, name="dynamics_hidden")
-        dec_h = _as_int_list(decoder_hidden, name="decoder_hidden")
-
-        act_factory = get_activation(activation_name)
-
-        self.encoder = Encoder(
-            self.S,
-            self.G,
-            enc_h,
-            self.Z,
-            act_factory,
-            float(dropout),
-            residual=bool(residual),
-            layer_norm=layer_norm,
-            layer_norm_eps=layer_norm_eps,
-        )
-        self.dynamics = LatentDynamics(
-            self.Z,
-            self.G,
-            dyn_h,
-            act_factory,
-            float(dropout),
-            residual=bool(dynamics_residual),
-            mlp_residual=bool(residual),
-            layer_norm=layer_norm,
-            layer_norm_eps=layer_norm_eps,
-            zero_init_residual_output=bool(zero_init_dynamics_output),
-            fourier_dt=fourier_dt,
-        )
-        self.decoder = Decoder(
-            self.Z,
-            dec_h,
-            self.S,
-            act_factory,
-            float(dropout),
-            residual=bool(residual),
-            layer_norm=layer_norm,
-            layer_norm_eps=layer_norm_eps,
-        )
-
-        if self.predict_delta:
-            self._init_delta_head()
-
-    def _init_delta_head(self) -> None:
-        """Small-output init for stable delta rollouts."""
-        with torch.no_grad():
-            out_layer = self.decoder.last_linear()
-            nn.init.zeros_(out_layer.bias)
-            nn.init.normal_(out_layer.weight, mean=0.0, std=_DELTA_OUT_INIT_STD)
-
-    def forward_step(self, y_i: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-        """One step y_i -> y_next via encode -> latent dynamics -> decode (+ y_i if predict_delta)."""
-        B = y_i.shape[0]  # Keep as symbolic
-        _validate_g_shape(g, B, self.G, context="FlowMapAutoencoder.forward_step")
-        z_i = self.encoder(y_i, g)
-        z_j = self.dynamics.forward_step(z_i, dt_norm, g)
-        y_pred = self.decoder(z_j)
-        return y_pred + y_i if self.predict_delta else y_pred
-
-    def forward(
-            self,
-            y_i: torch.Tensor,
-            dt_norm: torch.Tensor,
-            g: torch.Tensor,
-            *,
-            seq_len: Optional[int] = None,
-    ) -> torch.Tensor:
-        """Autoregressive rollout for K steps."""
-        torch._check(y_i.ndim == 2)
-        B = y_i.shape[0]  # Keep as symbolic
-        _validate_g_shape(g, B, self.G, context="FlowMapAutoencoder.forward")
-        dt_seq, _ = prepare_dt_batch(dt_norm, B, context="FlowMapAutoencoder.forward", seq_len=seq_len)
-        return autoregressive_rollout(self.forward_step, y_i, dt_seq, g)
-
 
 class FlowMapMLP(nn.Module):
     """Direct MLP flow-map: (y, dt, g) -> y_next."""
@@ -725,74 +414,42 @@ class FlowMapMLP(nn.Module):
         y_pred = self.network(x)
         return y_pred + y_i if self.predict_delta else y_pred
 
-    def forward(
-            self,
-            y_i: torch.Tensor,
-            dt_norm: torch.Tensor,
-            g: torch.Tensor,
-            *,
-            seq_len: Optional[int] = None,
-    ) -> torch.Tensor:
-        """Autoregressive rollout for K steps."""
-        torch._check(y_i.ndim == 2)
-        B = y_i.shape[0]  # Keep as symbolic
-        _validate_g_shape(g, B, self.G, context="FlowMapMLP.forward")
-        dt_seq, _ = prepare_dt_batch(dt_norm, B, context="FlowMapMLP.forward", seq_len=seq_len)
-        return autoregressive_rollout(self.forward_step, y_i, dt_seq, g)
-
 
 # ==============================================================================
 # Factory
 # ==============================================================================
 
-def create_model(
-        config: Dict[str, Any],
-        *,
-        state_dim: Optional[int] = None,
-        global_dim: Optional[int] = None,
-        logger: Optional[logging.Logger] = None,
-) -> nn.Module:
-    """Construct a model from config.
+def create_model(config: Dict[str, Any]) -> nn.Module:
+    """Construct the model from config (dims from config.data).
 
     Notes:
-      - Model selection is driven ONLY by model.type.
-      - model.mlp_only is explicitly rejected (deprecated).
+      - Model selection is driven ONLY by model.type; "mlp" is the only supported type.
       - Unknown model.type is a hard error.
     """
-    log = logger or logging.getLogger(__name__)
+    log = logging.getLogger(__name__)
 
     if not isinstance(config, dict):
         raise TypeError("config must be dict.")
 
-    if state_dim is None or global_dim is None:
-        data_cfg = config.get("data")
-        if not isinstance(data_cfg, dict):
-            raise KeyError("data required.")
+    data_cfg = config.get("data")
+    if not isinstance(data_cfg, dict):
+        raise KeyError("data required.")
 
-        species_vars = data_cfg.get("species_variables")
-        if not isinstance(species_vars, list) or not species_vars:
-            raise KeyError("data.species_variables required.")
-        global_vars = data_cfg.get("global_variables")
-        if not isinstance(global_vars, list):
-            raise TypeError("data.global_variables must be list.")
-        if list(global_vars) != list(_REQUIRED_GLOBALS):
-            raise ValueError(f"data.global_variables must be exactly {list(_REQUIRED_GLOBALS)}")
+    species_vars = data_cfg.get("species_variables")
+    if not isinstance(species_vars, list) or not species_vars:
+        raise KeyError("data.species_variables required.")
+    global_vars = data_cfg.get("global_variables")
+    if not isinstance(global_vars, list):
+        raise TypeError("data.global_variables must be list.")
+    if list(global_vars) != list(_REQUIRED_GLOBALS):
+        raise ValueError(f"data.global_variables must be exactly {list(_REQUIRED_GLOBALS)}")
 
-        if state_dim is None:
-            state_dim = len(species_vars)
-        if global_dim is None:
-            global_dim = len(global_vars)
-
-    S, G = int(state_dim), int(global_dim)
-    if G != len(_REQUIRED_GLOBALS):
-        raise ValueError(f"global_dim must be {len(_REQUIRED_GLOBALS)} (P and T), got {G}")
+    S, G = len(species_vars), len(global_vars)
     log.info("Model dims: S=%d, G=%d", S, G)
 
     mcfg = config.get("model")
     if not isinstance(mcfg, dict):
         raise KeyError("model required.")
-    if "mlp_only" in mcfg:
-        raise ValueError("model.mlp_only unsupported.")
 
     model_type_raw = mcfg.get("type")
     if model_type_raw is None:
@@ -829,48 +486,6 @@ def create_model(
             predict_delta=predict_delta,
             layer_norm=layer_norm,
             layer_norm_eps=layer_norm_eps,
-            fourier_dt=fourier_dt,
-        )
-
-    if model_type == "autoencoder":
-        ae_cfg = mcfg.get("autoencoder")
-        if not isinstance(ae_cfg, dict):
-            raise KeyError("model.autoencoder required.")
-
-        latent_dim = int(ae_cfg["latent_dim"])
-
-        encoder_hidden = _as_int_list(ae_cfg["encoder_hidden"], name="model.autoencoder.encoder_hidden")
-        dynamics_hidden = _as_int_list(ae_cfg["dynamics_hidden"], name="model.autoencoder.dynamics_hidden")
-        decoder_hidden = _as_int_list(ae_cfg["decoder_hidden"], name="model.autoencoder.decoder_hidden")
-        residual = as_bool(ae_cfg["residual"], "model.autoencoder.residual")
-        dynamics_residual = as_bool(ae_cfg["dynamics_residual"], "model.autoencoder.dynamics_residual")
-        # zero_init_dynamics_output is an optional feature flag (default off).
-        zero_init_dynamics_output = as_bool(
-            ae_cfg.get("zero_init_dynamics_output", False),
-            "model.autoencoder.zero_init_dynamics_output",
-        )
-        if zero_init_dynamics_output and not dynamics_residual:
-            raise ValueError(
-                "model.autoencoder.zero_init_dynamics_output has no effect when "
-                "model.autoencoder.dynamics_residual=false; remove it or set "
-                "dynamics_residual=true."
-            )
-
-        return FlowMapAutoencoder(
-            state_dim=S,
-            global_dim=G,
-            latent_dim=latent_dim,
-            encoder_hidden=encoder_hidden,
-            dynamics_hidden=dynamics_hidden,
-            decoder_hidden=decoder_hidden,
-            activation_name=activation,
-            dropout=dropout,
-            residual=residual,
-            dynamics_residual=dynamics_residual,
-            predict_delta=predict_delta,
-            layer_norm=layer_norm,
-            layer_norm_eps=layer_norm_eps,
-            zero_init_dynamics_output=zero_init_dynamics_output,
             fourier_dt=fourier_dt,
         )
 

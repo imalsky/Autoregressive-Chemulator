@@ -63,8 +63,8 @@ Audience: Professional collaborators and maintainers
 13. Autoregressive controls (`skip_steps`, detach behavior, backward mode) are retained.
 14. Optimizer support is restricted to `AdamW` only.
 15. Scheduler support is restricted to:
-16. `reduce_on_plateau` (canonical config value; compatibility value `ReduceLROnPlateau` is accepted)
-17. `cosine_with_warmup`
+16. `ReduceLROnPlateau` with a linear warmup (`training.scheduler.*`), the only scheduler; there is no scheduler-type key.
+17. `cosine_with_warmup` is unsupported (removed 2026-09-30).
 18. `torch.compile` support is retained and optional.
 19. Compile default remains enabled with default compile settings.
 20. Relative `runtime.checkpoint` paths are resolved against the config-file directory.
@@ -93,7 +93,7 @@ Audience: Professional collaborators and maintainers
 13. `export_{device}_dynB_1step_phys.pt2`
 14. Canonical requested targets are CPU and CUDA.
 15. `testing/export.py` may skip unavailable accelerator targets and may still emit any locally available target instead of failing the whole diagnostic run.
-16. MPS support is retained as best-effort if low maintenance overhead.
+16. MPS is unsupported; export targets are `cpu` and `cuda` only.
 17. Export metadata source of truth is embedded `metadata.json` inside the `.pt2` artifact.
 18. No sidecar metadata JSON is required.
 19. For `torch.export` artifacts, inference loaders must not call `model.eval()` or `model.train()` on `ep.module()` because these mode-switch APIs are unsupported; run inference under `torch.inference_mode()` instead.
@@ -101,7 +101,7 @@ Audience: Professional collaborators and maintainers
 ## 4.4 Diagnostic and Testing Scripts
 1. `testing/` holds diagnostic and deployment utilities; they are not release gates.
 2. `testing/export.py` and `testing/aoti_export.py` produce/validate deployment artifacts and follow the strict no-fallback contract.
-3. The plotting/inspection diagnostics (`testing/predictions.py`, `testing/benchmark.py`, `testing/training_logs.py`) may use explicit best-effort behavior for portability and local usability.
+3. The plotting/inspection diagnostics (`testing/predictions.py`, `testing/bench_speedup.py`, `testing/training_logs.py`) may use explicit best-effort behavior for portability and local usability.
 4. `testing/run_local_smoke.sh` exercises the full preprocess -> stage-1 -> stage-2 pipeline on synthetic data.
 
 ## 5. Data and Schema Contracts

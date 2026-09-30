@@ -27,16 +27,11 @@ from typing import Any
 import numpy as np
 import torch
 from torch import _inductor
-from torch._export.serde.serialize import SerializedArtifact, deserialize
-from torch.export import Dim
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# testing/export.py supplies the run (RUN_DIR, CHECKPOINT) and the shared build_export().
 EXPORT_IMPL_PATH = (Path(__file__).resolve().parent / "export.py").resolve()
-RUN_DIR = (REPO_ROOT / "models" / "stage2").resolve()
-# Best-val_loss checkpoint (written by src/main.py after training); resolved against
-# the run config directory and must exist.
-CHECKPOINT = "checkpoints/best.ckpt"
 # External, machine-specific inputs (edit here): this script needs a VULCAN working
 # tree providing a saved column state pickle and the installed raw Emulator model.
 # Neither lives in this repo; the script hard-fails with a clear message when absent.
@@ -76,7 +71,6 @@ class ExportBuildContext:
     metadata: dict[str, Any]
     model_species: tuple[str, ...]
     global_variables: tuple[str, ...]
-    dtype: torch.dtype
 
 
 @dataclass(frozen=True)
@@ -142,53 +136,20 @@ def _strip_export_suffix(name: str) -> str:
     return name
 
 
-def _read_embedded_metadata_json(path: Path) -> dict[str, Any]:
-    """Read embedded metadata from either raw-export or AOTI package layouts."""
-
-    if not path.exists():
-        raise FileNotFoundError(f"Missing export artifact: {path}")
-
-    with zipfile.ZipFile(path, "r") as archive:
-        archive_names = archive.namelist()
-        if not archive_names:
-            raise RuntimeError(f"Export archive is empty: {path}")
-
-        candidate_names = ["extra/metadata.json"]
-        candidate_names.extend(
-            name for name in archive_names if name.endswith("/extra/metadata.json")
-        )
-        for candidate_name in candidate_names:
-            try:
-                raw_metadata = archive.read(candidate_name).decode("utf-8")
-            except KeyError:
-                continue
-            metadata = json.loads(raw_metadata)
-            if not isinstance(metadata, dict):
-                raise TypeError(f"Embedded metadata must be a JSON object in {path}.")
-            return metadata
-
-    raise FileNotFoundError(f"Embedded metadata.json is missing from {path}.")
-
-
-def _load_raw_model_from_pt2(path: Path, *, dtype: torch.dtype) -> torch.nn.Module:
-    """Load one raw ``torch.export.save(...)`` artifact as a callable module."""
+def _load_raw_export(path: Path) -> tuple[torch.nn.Module, dict[str, Any]]:
+    """Load one raw ``torch.export.save(...)`` artifact: (callable module, embedded metadata)."""
 
     if not path.exists():
         raise FileNotFoundError(f"Missing raw export artifact: {path}")
 
-    with zipfile.ZipFile(path, "r") as archive:
-        archive_names = archive.namelist()
-        if not archive_names:
-            raise RuntimeError(f"Export archive is empty: {path}")
-        archive_root = archive_names[0].split("/", 1)[0] + "/"
-        artifact = SerializedArtifact(
-            exported_program=archive.read(f"{archive_root}models/model.json"),
-            state_dict=archive.read(f"{archive_root}data/weights/model.pt"),
-            constants=archive.read(f"{archive_root}data/constants/model.pt"),
-            example_inputs=archive.read(f"{archive_root}data/sample_inputs/model.pt"),
-        )
-
-    return deserialize(artifact).module().to(dtype=dtype)
+    extra_files = {"metadata.json": ""}
+    exported_program = torch.export.load(str(path), extra_files=extra_files)
+    if not extra_files["metadata.json"]:
+        raise FileNotFoundError(f"Embedded metadata.json is missing from {path}.")
+    metadata = json.loads(extra_files["metadata.json"])
+    if not isinstance(metadata, dict):
+        raise TypeError(f"Embedded metadata must be a JSON object in {path}.")
+    return exported_program.module(), metadata
 
 
 def _load_reference_column(path: Path) -> ReferenceColumn:
@@ -263,89 +224,23 @@ def _build_fresh_raw_export(
     *,
     example_batch: int,
 ) -> ExportBuildContext:
-    """Build the fresh raw export in memory from the current export code path."""
+    """Build the fresh raw CPU export in memory with export.py's shared build_export()."""
 
-    dtype = export_impl._parse_dtype(export_impl.EXPORT_DTYPE)
-    cfg, cfg_path = export_impl._load_resolved_config(RUN_DIR)
-    ckpt_path = export_impl._resolve_checkpoint_path(CHECKPOINT, cfg_path=cfg_path)
-    processed_dir = export_impl._resolve_processed_dir(cfg, cfg_path=cfg_path)
-    manifest_path = processed_dir / "normalization.json"
-    manifest = export_impl._load_json(manifest_path)
-    species_vars, global_vars = export_impl._validate_manifest_vs_config(cfg, manifest)
-
-    base_cpu = export_impl.create_model(cfg)
-    export_impl._load_weights_strict(base_cpu, ckpt_path)
-    base_cpu = export_impl._freeze_for_inference(
-        base_cpu.to(device=torch.device("cpu"), dtype=dtype)
+    exported_program, metadata = export_impl.build_export(
+        export_impl.RUN_DIR,
+        export_impl.CHECKPOINT,
+        torch.device("cpu"),
+        example_batch,
+        cuda_visible_devices="",  # the AOTI package records an empty value
     )
-
-    norm_cpu = export_impl.build_baked_normalizer(
-        manifest,
-        species_vars=species_vars,
-        global_vars=global_vars,
-    )
-    norm_cpu = norm_cpu.to(device=torch.device("cpu"), dtype=dtype)
-    norm_cpu.eval()
-
-    step = export_impl.OneStepPhysical(base_cpu, norm_cpu)
-    step = export_impl._freeze_for_inference(step)
-
-    example_inputs = export_impl._make_example_inputs(
-        norm_cpu,
-        B=max(1, int(example_batch)),
-        device=torch.device("cpu"),
-        dtype=dtype,
-    )
-    batch_dim = Dim("B", min=int(export_impl.B_MIN), max=int(export_impl.B_MAX))
-    dynamic_shapes = ({0: batch_dim}, {0: batch_dim}, {0: batch_dim})
-    exported_program = torch.export.export(
-        step,
-        example_inputs,
-        dynamic_shapes=dynamic_shapes,
-        strict=bool(export_impl.EXPORT_STRICT),
-    )
-    export_impl._verify_dynamic_batch(
-        exported_program,
-        device=torch.device("cpu"),
-        dtype=dtype,
-        norm=norm_cpu,
-    )
-
-    metadata = {
-        "format": "1step_physical_dynB",
-        "run_dir": export_impl._to_repo_relative_str(RUN_DIR),
-        "config_path": export_impl._to_repo_relative_str(cfg_path),
-        "checkpoint_path": export_impl._to_repo_relative_str(ckpt_path),
-        "normalization_path": export_impl._to_repo_relative_str(manifest_path),
-        "torch_version": torch.__version__,
-        "torch_cuda_version": getattr(torch.version, "cuda", None),
-        "cuda_visible_devices": "",
-        "export_device": "cpu",
-        "export_device_tag": "cpu",
-        "export_dtype": str(dtype).replace("torch.", ""),
-        "species_variables": list(species_vars),
-        "global_variables": list(global_vars),
-        "normalization_methods": dict(manifest["normalization_methods"]),
-        "epsilon": float(manifest["epsilon"]),  # required; canonical preprocessing always writes it
-        "dt_log10_min": float(manifest["dt"]["log_min"]),
-        "dt_log10_max": float(manifest["dt"]["log_max"]),
-        "dt_min_seconds": float(10.0 ** float(manifest["dt"]["log_min"])),
-        "dt_max_seconds": float(10.0 ** float(manifest["dt"]["log_max"])),
-        "dynamic_batch": {"min": int(export_impl.B_MIN), "max": int(export_impl.B_MAX)},
-        "signature": {
-            "inputs": {"y_phys": ["B", "S"], "dt_seconds": ["B"], "g_phys": ["B", "G"]},
-            "output": {"y_next_phys": ["B", "S"]},
-        },
-        "aoti_example_batch": int(example_batch),
-    }
+    metadata["aoti_example_batch"] = int(example_batch)
 
     return ExportBuildContext(
         exported_program=exported_program,
         fresh_raw_model=exported_program.module(),
         metadata=metadata,
-        model_species=tuple(_strip_export_suffix(name) for name in species_vars),
-        global_variables=tuple(str(name) for name in global_vars),
-        dtype=dtype,
+        model_species=tuple(_strip_export_suffix(name) for name in metadata["species_variables"]),
+        global_variables=tuple(str(name) for name in metadata["global_variables"]),
     )
 
 
@@ -586,13 +481,9 @@ def main() -> None:
         export_impl,
         example_batch=resolved_example_batch,
     )
-    compiled_package_path = _write_aoti_package(
-        fresh_export.exported_program,
-        metadata=fresh_export.metadata,
-        out_path=OUTPUT_AOTI_PACKAGE_PATH,
-    )
 
-    installed_metadata = _read_embedded_metadata_json(INSTALLED_RAW_MODEL_PATH)
+    # Check the installed model against the fresh export before the (slow) AOTI compile.
+    installed_raw_model, installed_metadata = _load_raw_export(INSTALLED_RAW_MODEL_PATH)
     installed_model_species = tuple(
         _strip_export_suffix(str(name))
         for name in installed_metadata.get("species_variables", [])
@@ -611,9 +502,10 @@ def main() -> None:
             f"installed={installed_global_variables}, fresh={fresh_export.global_variables}"
         )
 
-    installed_raw_model = _load_raw_model_from_pt2(
-        INSTALLED_RAW_MODEL_PATH,
-        dtype=fresh_export.dtype,
+    compiled_package_path = _write_aoti_package(
+        fresh_export.exported_program,
+        metadata=fresh_export.metadata,
+        out_path=OUTPUT_AOTI_PACKAGE_PATH,
     )
     compiled_models = {
         run_single_threaded: _inductor.aoti_load_package(
@@ -734,8 +626,8 @@ def main() -> None:
 
     report_payload = {
         "setup": {
-            "run_dir": str(RUN_DIR),
-            "checkpoint": CHECKPOINT,
+            "run_dir": str(export_impl.RUN_DIR),
+            "checkpoint": export_impl.CHECKPOINT,
             "reference_vulcan_state_path": str(REFERENCE_VULCAN_STATE_PATH),
             "installed_raw_model_path": str(INSTALLED_RAW_MODEL_PATH),
             "output_aoti_package_path": str(compiled_package_path),
@@ -784,8 +676,8 @@ def main() -> None:
     }
 
     setup_lines = [
-        f"- run_dir: `{RUN_DIR}`",
-        f"- checkpoint: `{CHECKPOINT}`",
+        f"- run_dir: `{export_impl.RUN_DIR}`",
+        f"- checkpoint: `{export_impl.CHECKPOINT}`",
         f"- reference_vulcan_state_path: `{REFERENCE_VULCAN_STATE_PATH}`",
         f"- installed_raw_model_path: `{INSTALLED_RAW_MODEL_PATH}`",
         f"- output_aoti_package_path: `{compiled_package_path}`",
@@ -806,8 +698,8 @@ def main() -> None:
         f"- fresh_raw_dt_min_seconds: {float(fresh_export.metadata['dt_min_seconds']):.6e}",
         f"- fresh_raw_dt_max_seconds: {float(fresh_export.metadata['dt_max_seconds']):.6e}",
         f"- installed_raw_export_dtype: {installed_metadata.get('export_dtype')}",
-        f"- installed_raw_dt_min_seconds: {float(installed_metadata.get('dt_min_seconds')):.6e}",
-        f"- installed_raw_dt_max_seconds: {float(installed_metadata.get('dt_max_seconds')):.6e}",
+        f"- installed_raw_dt_min_seconds: {float(installed_metadata.get('dt_min_seconds', float('nan'))):.6e}",
+        f"- installed_raw_dt_max_seconds: {float(installed_metadata.get('dt_max_seconds', float('nan'))):.6e}",
         f"- installed_raw_species_match_fresh: {installed_model_species == fresh_export.model_species}",
         f"- installed_raw_globals_match_fresh: {installed_global_variables == fresh_export.global_variables}",
         f"- installed_raw_dtype_match_fresh: {installed_dtype_matches_fresh}",

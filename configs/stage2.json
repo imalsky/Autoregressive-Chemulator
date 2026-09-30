@@ -18,7 +18,6 @@
     "amp_mode": "true",
     "model_dtype": "float32",
     "input_dtype": "float32",
-    "dataset_dtype": "float32",
     "preload_dtype": "float32",
     "loss_dtype": "float32"
   },
@@ -34,7 +33,6 @@
   },
   "runtime": {
     "checkpoint": "../models/stage1/checkpoints/last.ckpt",
-    "load_weights_strict": true,
     "accelerator": "auto",
     "devices": "auto",
     "strategy": "auto",
@@ -83,7 +81,6 @@
   "normalization": {
     "epsilon": 1e-30,
     "min_std": 1e-12,
-    "globals_default_method": "standard",
     "methods": {
       "P": "log-min-max",
       "T": "min-max"
@@ -118,9 +115,7 @@
     "num_workers": 64
   },
   "dataset": {
-    "windows_per_trajectory": 92,
-    "preload_to_device": true,
-    "shard_cache_size": 2
+    "windows_per_trajectory": 92
   },
   "model": {
     "type": "mlp",
@@ -154,24 +149,13 @@
         2048
       ],
       "residual": true
-    },
-    "autoencoder": {
-      "latent_dim": 256,
-      "encoder_hidden": 512,
-      "decoder_hidden": 512,
-      "dynamics_hidden": 512,
-      "residual": true,
-      "dynamics_residual": true
     }
   },
   "training": {
     "batch_size": 2048,
     "max_epochs": 200,
     "checkpoint_mode": "weights_only",
-    "num_workers": 0,
     "pin_memory": true,
-    "persistent_workers": false,
-    "prefetch_factor": null,
     "rollout_steps": 10,
     "loss": {
       "lambda_log10_mae": 1.0,
@@ -192,7 +176,6 @@
     },
     "scheduler": {
       "enabled": true,
-      "type": "reduce_on_plateau",
       "warmup_epochs": 5,
       "factor": 0.5,
       "patience": 10,
@@ -212,7 +195,6 @@
       "enabled": true,
       "start_steps": 2,
       "end_steps": 10,
-      "mode": "linear",
       "ramp_epochs": 30
     },
     "ema": {

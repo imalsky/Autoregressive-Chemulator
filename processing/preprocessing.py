@@ -88,13 +88,11 @@ def _configure_logging(level: str) -> None:
 log = logging.getLogger(__name__)
 
 
+# Fixed global set, in this order (spec.md section 5, items 4-6). This standalone script
+# imports nothing from src/, so it keeps its own copy of src/model.py:_REQUIRED_GLOBALS.
 _REQUIRED_GLOBALS: Tuple[str, str] = ("P", "T")
 _REQUIRED_DT_SAMPLING = "loguniform"
 _ALLOWED_GLOBAL_METHODS = {"standard", "min-max", "log-min-max", "log-standard"}
-# A raw sample is kept in the "valid" mask only if its time is no more than this
-# factor below the chunk floor t_lo = max(t_min, first_positive_time). This drops
-# samples deep in the stiff pre-onset transient before chunk placement/interpolation.
-_VALID_TIME_FLOOR_FACTOR = 0.5
 _REQUIRED_TOP_LEVEL: Tuple[str, ...] = ("paths", "data", "normalization", "preprocessing", "system")
 _ALLOWED_TOP_LEVEL: Tuple[str, ...] = (
     "precision",
@@ -111,7 +109,7 @@ _ALLOWED_TOP_LEVEL: Tuple[str, ...] = (
 _REQUIRED_SECTION_KEYS: Dict[str, Tuple[str, ...]] = {
     "paths": ("raw_dir", "processed_dir", "work_dir"),
     "data": ("global_variables", "species_variables"),
-    "normalization": ("epsilon", "min_std", "globals_default_method", "methods"),
+    "normalization": ("epsilon", "min_std", "methods"),
     "preprocessing": (
         "raw_file_patterns",
         "dt_min",
@@ -132,14 +130,6 @@ _REQUIRED_SECTION_KEYS: Dict[str, Tuple[str, ...]] = {
         "drop_below",
         "num_workers",
     ),
-    "system": ("device", "log_level", "seed"),
-}
-_ALLOWED_SECTION_KEYS: Dict[str, Tuple[str, ...]] = {
-    "paths": ("raw_dir", "processed_dir", "work_dir"),
-    "data": ("global_variables", "species_variables"),
-    "normalization": ("epsilon", "min_std", "globals_default_method", "methods"),
-    # Keep dt/dt_mode here so parse_precfg can emit the targeted unsupported-message.
-    "preprocessing": tuple(list(_REQUIRED_SECTION_KEYS["preprocessing"]) + ["dt", "dt_mode"]),
     "system": ("device", "log_level", "seed"),
 }
 
@@ -163,8 +153,9 @@ def validate_required_config_keys(cfg: Mapping[str, Any]) -> None:
     """Strictly validate the preprocessing-relevant config sections and keys.
 
     Checks top-level sections, rejects unknown keys, and requires every key the
-    pipeline reads. Only the sections preprocessing depends on are validated here
-    (training/runtime/etc. are validated by src/main.py).
+    pipeline reads (every allowed section key is required). Only the sections
+    preprocessing depends on are validated here (training/runtime/etc. are
+    validated by src/main.py).
     """
     if not isinstance(cfg, Mapping):
         raise TypeError("bad config")
@@ -179,7 +170,7 @@ def validate_required_config_keys(cfg: Mapping[str, Any]) -> None:
         if not isinstance(block, Mapping):
             raise TypeError(f"bad type: {sec}")
 
-        _validate_no_unknown_keys(block, allowed=_ALLOWED_SECTION_KEYS[sec], prefix=sec)
+        _validate_no_unknown_keys(block, allowed=required_keys, prefix=sec)
         for key in required_keys:
             if key not in block:
                 raise KeyError(f"missing: {sec}.{key}")
@@ -297,7 +288,6 @@ class PreCfg:
     epsilon: float
     min_std: float
     methods: Dict[str, str]
-    globals_default_method: str
 
     seed: int
     pool_size: int
@@ -339,10 +329,6 @@ def parse_precfg(cfg: Dict, *, cfg_path: Path) -> PreCfg:
     norm = _require_dict(cfg, "normalization")
     epsilon = _require_float(norm, "epsilon")
     min_std = _require_float(norm, "min_std")
-    globals_default_method = _parse_global_method(
-        _require_str(norm, "globals_default_method"),
-        key="normalization.globals_default_method",
-    )
     methods_obj = _require(norm, "methods")
     if not isinstance(methods_obj, dict):
         raise TypeError("config.normalization.methods must be an object")
@@ -370,10 +356,6 @@ def parse_precfg(cfg: Dict, *, cfg_path: Path) -> PreCfg:
     pr = _require_dict(cfg, "preprocessing")
     raw_file_patterns = _require_str_list(pr, "raw_file_patterns")
 
-    if "dt" in pr:
-        raise ValueError("preprocessing.dt is unsupported; use dt_min/dt_max with loguniform sampling")
-    if "dt_mode" in pr:
-        raise ValueError("preprocessing.dt_mode is unsupported; variable dt is always enabled")
     dt_min = _require_float(pr, "dt_min")
     dt_max = _require_float(pr, "dt_max")
     if dt_min <= 0.0 or dt_max <= 0.0 or dt_max <= dt_min:
@@ -446,7 +428,6 @@ def parse_precfg(cfg: Dict, *, cfg_path: Path) -> PreCfg:
         epsilon=epsilon,
         min_std=min_std,
         methods=methods,
-        globals_default_method=globals_default_method,
         seed=seed,
         pool_size=pool_size,
         samples_per_source_trajectory=samples_per_source_trajectory,
@@ -609,6 +590,10 @@ def pick_t_start(
 
     The first attempt may anchor at the earliest feasible time (anchor_first); otherwise
     candidates are drawn log-uniformly in [t_lo, t_hi]. Returns None if no placement fits.
+
+    With t_min = 0 (both production configs) the valid window spans every positive raw time,
+    so the anchor and any draw in [t_lo, t_hi) fit on the first try: the retry budget
+    (preprocessing.max_chunk_attempts_per_source) only matters when t_min > 0.
     """
     pos = t_raw > 0
     if not np.any(pos):
@@ -739,9 +724,6 @@ def read_globals_vector(
     Each global must be a finite scalar and present as exactly one of attribute OR dataset
     (both present is ambiguous and rejected).
     """
-    if not global_vars:
-        return np.zeros((0,), dtype=np.float32)
-
     out = np.empty((len(global_vars),), dtype=np.float64)
 
     for j, name in enumerate(global_vars):
@@ -951,16 +933,9 @@ def sample_file(
             g_vec32 = g_vec.astype(np.float32, copy=False)
 
             # Validity mask (matches training assumptions):
-            # - Only consider positive times.
+            # - Only consider positive times (log-time interpolation).
             # - Require at least 2 valid samples.
-            pos = t_raw > 0
-            if not np.any(pos):
-                rejects["too_few_valid"] += 1
-                continue
-
-            first_pos_time = float(t_raw[pos][0])
-            t_lo = max(float(cfg.t_min), first_pos_time)
-            valid = (t_raw > 0) & (t_raw >= t_lo * _VALID_TIME_FLOOR_FACTOR)
+            valid = t_raw > 0
             if int(np.count_nonzero(valid)) < 2:
                 rejects["too_few_valid"] += 1
                 continue
@@ -1117,8 +1092,8 @@ def compute_train_stats(out_tmp: Path, cfg: PreCfg) -> Tuple[Dict, Dict[str, str
     logy_min = np.full(S, np.inf, dtype=np.float64)
     logy_max = np.full(S, -np.inf, dtype=np.float64)
 
-    rms_g = RunningMeanVar(G) if G > 0 else None
-    rms_glog = RunningMeanVar(G) if G > 0 else None
+    rms_g = RunningMeanVar(G)
+    rms_glog = RunningMeanVar(G)
     g_min = np.full(G, np.inf, dtype=np.float64)
     g_max = np.full(G, -np.inf, dtype=np.float64)
     glog_min = np.full(G, np.inf, dtype=np.float64)
@@ -1127,7 +1102,7 @@ def compute_train_stats(out_tmp: Path, cfg: PreCfg) -> Tuple[Dict, Dict[str, str
     for p in tqdm(shards, desc="Computing stats"):
         with np.load(p) as z:
             y = np.asarray(z["y_mat"], dtype=np.float64)
-            g = np.asarray(z["globals"], dtype=np.float64) if G > 0 else None
+            g = np.asarray(z["globals"], dtype=np.float64)
 
         ylog = np.log10(np.maximum(y, cfg.epsilon))
         y2 = ylog.reshape(-1, S)
@@ -1135,27 +1110,19 @@ def compute_train_stats(out_tmp: Path, cfg: PreCfg) -> Tuple[Dict, Dict[str, str
         logy_min = np.minimum(logy_min, np.min(y2, axis=0))
         logy_max = np.maximum(logy_max, np.max(y2, axis=0))
 
-        if G > 0 and g is not None:
-            g2 = g.reshape(-1, G)
-            rms_g.update(g2)  # type: ignore[union-attr]
-            g_min = np.minimum(g_min, np.min(g2, axis=0))
-            g_max = np.maximum(g_max, np.max(g2, axis=0))
+        g2 = g.reshape(-1, G)
+        rms_g.update(g2)
+        g_min = np.minimum(g_min, np.min(g2, axis=0))
+        g_max = np.maximum(g_max, np.max(g2, axis=0))
 
-            glog = np.log10(np.maximum(g2, cfg.epsilon))
-            rms_glog.update(glog)  # type: ignore[union-attr]
-            glog_min = np.minimum(glog_min, np.min(glog, axis=0))
-            glog_max = np.maximum(glog_max, np.max(glog, axis=0))
+        glog = np.log10(np.maximum(g2, cfg.epsilon))
+        rms_glog.update(glog)
+        glog_min = np.minimum(glog_min, np.min(glog, axis=0))
+        glog_max = np.maximum(glog_max, np.max(glog, axis=0))
 
     mu_s, sd_s = rms_logy.finalize(min_std=cfg.min_std)
-
-    mu_g: Optional[np.ndarray] = None
-    sd_g: Optional[np.ndarray] = None
-    mu_glog: Optional[np.ndarray] = None
-    sd_glog: Optional[np.ndarray] = None
-    if G > 0 and rms_g is not None:
-        mu_g, sd_g = rms_g.finalize(min_std=cfg.min_std)
-    if G > 0 and rms_glog is not None:
-        mu_glog, sd_glog = rms_glog.finalize(min_std=cfg.min_std)
+    mu_g, sd_g = rms_g.finalize(min_std=cfg.min_std)
+    mu_glog, sd_glog = rms_glog.finalize(min_std=cfg.min_std)
 
     per_key_stats: Dict[str, Dict] = {}
     for i, name in enumerate(cfg.species_variables):
@@ -1168,8 +1135,6 @@ def compute_train_stats(out_tmp: Path, cfg: PreCfg) -> Tuple[Dict, Dict[str, str
         }
 
     for i, name in enumerate(cfg.global_variables):
-        if mu_g is None or sd_g is None or mu_glog is None or sd_glog is None:
-            raise RuntimeError("Globals configured but global stats unavailable")
         per_key_stats[name] = {
             "mean": float(mu_g[i]),
             "std": float(sd_g[i]),
@@ -1214,8 +1179,8 @@ def normalize_and_write(
     mu_s = np.array([per_key_stats[s]["log_mean"] for s in cfg.species_variables], dtype=np.float64).reshape(1, 1, S)
     sd_s = np.array([per_key_stats[s]["log_std"] for s in cfg.species_variables], dtype=np.float64).reshape(1, 1, S)
 
-    # Globals normalization vectors.
-    method_ids = np.zeros(G, dtype=np.int64)  # 0=standard, 1=min-max, 2=log-min-max, 3=log-standard
+    # Globals normalization: per-global method names (selects the formula below) and vectors.
+    g_methods = np.array([methods[name] for name in cfg.global_variables])
     g_mean = np.zeros(G, dtype=np.float64)
     g_std = np.ones(G, dtype=np.float64)
     g_min = np.zeros(G, dtype=np.float64)
@@ -1230,7 +1195,6 @@ def normalize_and_write(
         st = per_key_stats[name]
 
         if m == "standard":
-            method_ids[j] = 0
             g_mean[j] = float(st["mean"])
             g_std[j] = float(st["std"])
             if g_std[j] <= 0.0:
@@ -1238,7 +1202,6 @@ def normalize_and_write(
             continue
 
         if m == "min-max":
-            method_ids[j] = 1
             g_min[j] = float(st["min"])
             g_rng[j] = float(st["max"]) - g_min[j]
             if g_rng[j] <= 0.0:
@@ -1246,7 +1209,6 @@ def normalize_and_write(
             continue
 
         if m == "log-min-max":
-            method_ids[j] = 2
             glog_min[j] = float(st["log_min"])
             glog_rng[j] = float(st["log_max"]) - glog_min[j]
             if glog_rng[j] <= 0.0:
@@ -1254,7 +1216,6 @@ def normalize_and_write(
             continue
 
         if m == "log-standard":
-            method_ids[j] = 3
             glog_mean[j] = float(st["log_mean"])
             glog_std[j] = float(st["log_std"])
             if glog_std[j] <= 0.0:
@@ -1275,47 +1236,42 @@ def normalize_and_write(
         for i, p in enumerate(tqdm(physical_shards, desc=f"Normalizing {split}")):
             with np.load(p) as z:
                 y = np.asarray(z["y_mat"], dtype=np.float64)
-                g = np.asarray(z["globals"], dtype=np.float64) if G > 0 else None
+                g2 = np.asarray(z["globals"], dtype=np.float64)
                 dt = np.asarray(z["dt_mat"], dtype=np.float64)
 
             y_z = ((np.log10(np.maximum(y, eps)) - mu_s) / sd_s).astype(np.float32)
 
-            if G > 0 and g is not None:
-                g2 = g.astype(np.float64, copy=False)
+            g_out = g2
 
-                g_out = g2
+            # standard
+            std_mask = g_methods == "standard"
+            if np.any(std_mask):
+                g_out = np.where(std_mask.reshape(1, G), (g2 - g_mean.reshape(1, G)) / g_std.reshape(1, G), g_out)
 
-                # standard
-                std_mask = method_ids == 0
-                if np.any(std_mask):
-                    g_out = np.where(std_mask.reshape(1, G), (g2 - g_mean.reshape(1, G)) / g_std.reshape(1, G), g_out)
+            # min-max
+            mm_mask = g_methods == "min-max"
+            if np.any(mm_mask):
+                g_out = np.where(mm_mask.reshape(1, G), (g2 - g_min.reshape(1, G)) / g_rng.reshape(1, G), g_out)
 
-                # min-max
-                mm_mask = method_ids == 1
-                if np.any(mm_mask):
-                    g_out = np.where(mm_mask.reshape(1, G), (g2 - g_min.reshape(1, G)) / g_rng.reshape(1, G), g_out)
+            # log-min-max
+            lmm_mask = g_methods == "log-min-max"
+            if np.any(lmm_mask):
+                g_out = np.where(
+                    lmm_mask.reshape(1, G),
+                    (np.log10(np.maximum(g2, eps)) - glog_min.reshape(1, G)) / glog_rng.reshape(1, G),
+                    g_out,
+                )
 
-                # log-min-max
-                lmm_mask = method_ids == 2
-                if np.any(lmm_mask):
-                    g_out = np.where(
-                        lmm_mask.reshape(1, G),
-                        (np.log10(np.maximum(g2, eps)) - glog_min.reshape(1, G)) / glog_rng.reshape(1, G),
-                        g_out,
-                    )
+            # log-standard
+            ls_mask = g_methods == "log-standard"
+            if np.any(ls_mask):
+                g_out = np.where(
+                    ls_mask.reshape(1, G),
+                    (np.log10(np.maximum(g2, eps)) - glog_mean.reshape(1, G)) / glog_std.reshape(1, G),
+                    g_out,
+                )
 
-                # log-standard
-                ls_mask = method_ids == 3
-                if np.any(ls_mask):
-                    g_out = np.where(
-                        ls_mask.reshape(1, G),
-                        (np.log10(np.maximum(g2, eps)) - glog_mean.reshape(1, G)) / glog_std.reshape(1, G),
-                        g_out,
-                    )
-
-                g_z = g_out.astype(np.float32, copy=False)
-            else:
-                g_z = np.zeros((y.shape[0], 0), dtype=np.float32)
+            g_z = g_out.astype(np.float32, copy=False)
 
             dt_norm = (np.log10(np.maximum(dt, eps)) - dt_log_min) / dt_log_rng
             dt_norm = np.clip(dt_norm, 0.0, 1.0).astype(np.float32)

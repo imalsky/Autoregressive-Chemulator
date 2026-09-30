@@ -25,11 +25,10 @@ every non-default config value.
       preprocessing.py    HDF5 -> normalized NPZ shards (canonical)
       make_synthetic_raw.py   tiny synthetic raw generator (for the smoke test)
       testing.py          raw-vs-chunk overlay plots (diagnostic)
-      testing_data.py     raw HDF5 structure scan (diagnostic)
     src/
       main.py             training entrypoint
       dataset.py          shard loader + preloaded batch stream
-      model.py            FlowMapMLP / FlowMapAutoencoder
+      model.py            FlowMapMLP (the flow-map network)
       trainer.py          LightningModule + Trainer factory
       ema_callback.py     EMA-of-weights Lightning callback
       utils.py            shared config + precision helpers
@@ -37,11 +36,9 @@ every non-default config value.
       export.py           export to 1-step physical-space .pt2 (deployment artifact)
       aoti_export.py      AOT Inductor packaging + validation
       predictions.py      autoregressive rollout plots (diagnostic)
-      benchmark.py        throughput benchmarks (diagnostic)
       training_logs.py    training-curve plots (diagnostic)
       eval_rollout_error.py   percentile rollout-error vs step (paper headline metric)
-      bench_speedup.py    exported-model latency sweep vs mini-chem per-cell cost
-      bench_eager_devices.py  eager CPU/MPS latency (GPU half of the speed benchmark)
+      bench_speedup.py    exported-model (CPU and CUDA) latency sweep vs mini-chem per-cell cost
       science.mplstyle    shared matplotlib style for the paper figures
       run.pbs             HPC: post-training export + plots job
       run_local_smoke.sh  end-to-end smoke on synthetic data
@@ -93,7 +90,7 @@ checkpoint must be removed by hand).
     python -u testing/export.py           # 1-step physical-space .pt2 (edit RUN_DIR; defaults to models/stage2)
     python -u testing/aoti_export.py      # AOT Inductor package + validation
     python -u testing/predictions.py      # rollout plots against a shard
-    python -u testing/benchmark.py        # throughput microbenchmarks
+    python -u testing/bench_speedup.py    # exported-model latency sweep (edit RUN_DIR)
 
 A fast end-to-end check on synthetic data (no real dataset needed):
 

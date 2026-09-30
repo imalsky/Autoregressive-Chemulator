@@ -11,7 +11,7 @@ Training styles (burn-in removed):
 2) Autoregressive rollout
    - Total rollout steps K := training.rollout_steps
    - Skip/warmup steps M := training.autoregressive_training.skip_steps
-       * warmup is run under torch.no_grad(), then detached (pushforward trick input generation)
+       * warmup is run under torch.no_grad() (pushforward trick input generation)
        * warmup steps are excluded from the loss via masking (and/or by construction in detached-per-step mode)
    - Gradients:
        * detach_between_steps=True  : stop-grad between steps (no BPTT across time)
@@ -50,13 +50,12 @@ import torch.nn as nn
 
 from model import autoregressive_rollout, normalize_dt_shape
 
-from utils import PrecisionConfig, parse_precision_config
+from utils import PrecisionConfig
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 
 from ema_callback import EMACallback
 from lightning.pytorch.loggers import CSVLogger
-from lightning_utilities.core.rank_zero import rank_zero_warn
 
 
 _LOSS_DENOM_EPS = 1e-3
@@ -70,18 +69,8 @@ log = logging.getLogger(__name__)
 # Optimizer parameter groups
 # ==============================================================================
 
-_NORM_MODULE_TYPES = (
-    nn.LayerNorm,
-    nn.BatchNorm1d,
-    nn.BatchNorm2d,
-    nn.BatchNorm3d,
-    nn.GroupNorm,
-    nn.InstanceNorm1d,
-    nn.InstanceNorm2d,
-    nn.InstanceNorm3d,
-)
-if hasattr(nn, "SyncBatchNorm"):
-    _NORM_MODULE_TYPES = _NORM_MODULE_TYPES + (nn.SyncBatchNorm,)
+# The model's only normalization layer (model.py uses nn.LayerNorm and nothing else).
+_NORM_MODULE_TYPES = (nn.LayerNorm,)
 
 
 def _build_optimizer_param_groups(
@@ -261,25 +250,14 @@ def build_loss_buffers(
 
 def _try_torch_compile(fn: Any, *, cfg: Mapping[str, Any], context: str) -> Any:
     """Optionally wrap a callable with torch.compile (strict; required keys only)."""
-    runtime = cfg["runtime"]
-    tc = runtime["torch_compile"]
+    tc = cfg["runtime"]["torch_compile"]
     if not bool(tc["enabled"]):
         return fn
-
-    if not hasattr(torch, "compile"):
-        raise RuntimeError(f"runtime.torch_compile.enabled=True but torch.compile is unavailable ({context}).")
 
     backend = str(tc["backend"])
     mode = str(tc["mode"])
     dynamic = bool(tc["dynamic"])
     fullgraph = bool(tc["fullgraph"])
-    accelerator = str(runtime["accelerator"]).lower().strip()
-
-    mps_available = bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
-    targeting_mps = accelerator == "mps" or (accelerator == "auto" and mps_available and not torch.cuda.is_available())
-    if backend == "inductor" and targeting_mps:
-        log.info("Skipping torch.compile for %s (inductor backend on MPS).", context)
-        return fn
 
     try:
         return torch.compile(fn, backend=backend, mode=mode, dynamic=dynamic, fullgraph=fullgraph)  # type: ignore[misc]
@@ -294,10 +272,9 @@ def _try_torch_compile(fn: Any, *, cfg: Mapping[str, Any], context: str) -> Any:
 
 @dataclass(frozen=True)
 class RolloutCurriculum:
-    """Ramps training rollout steps from start_steps -> end_steps over ramp_epochs."""
+    """Ramps training rollout steps linearly from start_steps -> end_steps over ramp_epochs."""
 
     enabled: bool
-    mode: str
     start_steps: int
     end_steps: int
     ramp_epochs: int
@@ -314,16 +291,8 @@ class RolloutCurriculum:
 
         e = int(max(0, epoch))
         t = min(1.0, float(e) / float(max(1, int(self.ramp_epochs))))
-        mode = str(self.mode).lower()
 
-        if mode == "linear":
-            f = t
-        elif mode == "cosine":
-            f = 0.5 * (1.0 - math.cos(math.pi * t))
-        else:
-            raise ValueError(f"Unknown curriculum.mode '{self.mode}' (expected: linear|cosine)")
-
-        k = start_k + int((end_k - start_k) * f)
+        k = start_k + int((end_k - start_k) * t)
         return int(min(end_k, k))
 
 
@@ -342,7 +311,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         cfg: Mapping[str, Any],
         normalization_manifest: Mapping[str, Any],
         species_variables: Sequence[str],
-        precision: Optional[PrecisionConfig] = None,
+        precision: PrecisionConfig,
     ) -> None:
         """Wire the model, loss, precision, curriculum, AR settings, and optional torch.compile from cfg."""
         super().__init__()
@@ -351,8 +320,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         self.species_variables = list(species_variables)
 
         # Precision (centralized): controls dataset/model/loss dtypes and Lightning AMP settings.
-        self.precision_config = precision if precision is not None else parse_precision_config(cfg)
-        self.model_dtype = self.precision_config.model_dtype
+        self.precision_config = precision
         self.input_dtype = self.precision_config.input_dtype
         self.loss_dtype = self.precision_config.loss_dtype
 
@@ -409,7 +377,6 @@ class FlowMapRolloutModule(pl.LightningModule):
         cur_cfg = dict(tcfg["curriculum"])
         self.curriculum = RolloutCurriculum(
             enabled=bool(cur_cfg["enabled"]),
-            mode=str(cur_cfg["mode"]),
             start_steps=int(cur_cfg["start_steps"]),
             end_steps=int(cur_cfg["end_steps"]),
             ramp_epochs=int(cur_cfg["ramp_epochs"]),
@@ -433,7 +400,7 @@ class FlowMapRolloutModule(pl.LightningModule):
 
         self.sched_cfg = dict(tcfg["scheduler"])
 
-        # Validate model interface once at init (both FlowMapMLP and FlowMapAutoencoder provide this).
+        # Validate model interface once at init (FlowMapMLP provides forward_step).
         if not hasattr(self.model, "forward_step"):
             raise RuntimeError("Model must implement forward_step(y_t, dt, g) -> y_{t+1}.")
 
@@ -457,9 +424,6 @@ class FlowMapRolloutModule(pl.LightningModule):
         # Epoch timing (logged; CSVLogger writes it)
         self._epoch_t0: Optional[float] = None
 
-        # UX warnings
-        self._warned_metric_mismatch = False
-
         # Preserve for checkpoint reproducibility. Deep-copy so later config mutations
         # (or Lightning internals) can't alias the live training config.
         self.save_hyperparameters({"training": copy.deepcopy(dict(tcfg)), "model": copy.deepcopy(dict(mcfg))})
@@ -469,11 +433,7 @@ class FlowMapRolloutModule(pl.LightningModule):
     # ------------------------
 
     def on_fit_start(self) -> None:
-        """Log a one-time note that train_loss and val_loss use different rollout procedures."""
-        if self._warned_metric_mismatch:
-            return
-        self._warned_metric_mismatch = True
-
+        """Log a note (once per fit) that train_loss and val_loss use different rollout procedures."""
         if self.autoregressive_training:
             msg = (
                 "train_loss (autoregressive training) may not be directly comparable to val_loss "
@@ -507,18 +467,8 @@ class FlowMapRolloutModule(pl.LightningModule):
         fn = self._compiled_forward_step if self._compiled_forward_step is not None else self.model.forward_step  # type: ignore[attr-defined]
         return fn(y_t, dt, g)  # type: ignore[misc]
 
-    def _coerce_g(self, g: torch.Tensor, batch_size: int, like: torch.Tensor) -> torch.Tensor:
-        """Broadcast globals g to [batch_size, G] and move to `like`'s device/dtype (strict shape checks)."""
-        if g.ndim == 1:
-            g = g.view(1, -1).expand(batch_size, -1)
-        elif g.ndim == 2:
-            if int(g.shape[0]) == 1 and batch_size > 1:
-                g = g.expand(batch_size, -1)
-            elif int(g.shape[0]) != batch_size:
-                raise ValueError(f"g batch dim mismatch: got {int(g.shape[0])}, expected {batch_size}")
-        else:
-            raise ValueError(f"g must have shape [G] or [B,G], got {tuple(g.shape)}")
-
+    def _coerce_g(self, g: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+        """Move globals g [B, G] to `like`'s device/dtype (the model's forward_step checks the shape)."""
         return g.to(device=like.device, dtype=like.dtype)
 
     def _train_rollout_steps(self, epoch: int, *, transitions: int) -> int:
@@ -584,7 +534,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         g: torch.Tensor,      # [B,G]
     ) -> torch.Tensor:
         """Open-loop rollout: feed predictions back in (no teacher forcing)."""
-        g_t = self._coerce_g(g, int(dt_bk.shape[0]), y0)
+        g_t = self._coerce_g(g, y0)
         step_fn = self._compiled_forward_step if self._compiled_forward_step is not None else self.model.forward_step  # type: ignore[attr-defined]
         return autoregressive_rollout(step_fn, y0, dt_bk, g_t)
 
@@ -600,7 +550,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         This is used when compiling the unroll itself (compile_open_loop_unroll=True) so the
         compiler can see the full step-to-step dependency chain and fuse across steps.
         """
-        g_t = self._coerce_g(g, int(dt_bk.shape[0]), y0)
+        g_t = self._coerce_g(g, y0)
         return autoregressive_rollout(self.model.forward_step, y0, dt_bk, g_t)  # type: ignore[attr-defined]
 
     # ------------------------
@@ -616,31 +566,13 @@ class FlowMapRolloutModule(pl.LightningModule):
             return opt[0]
         return opt
 
-    def _accumulate_grad_batches(self) -> int:
-        """Return the trainer's accumulate_grad_batches (always 1; main.py rejects any other value)."""
-        return int(self.trainer.accumulate_grad_batches)
+    def _maybe_step_optimizer(self, opt: torch.optim.Optimizer) -> None:
+        """Optimizer step after every batch: optional grad-norm log, clip, step, zero_grad.
 
-    def _maybe_step_optimizer(self, opt: torch.optim.Optimizer, batch_idx: int) -> None:
-        """Step the optimizer on accumulation boundaries: optional grad-norm log, clip, step, zero.
-
-        Manual-optimization path only (autoregressive mode). Also advances non-plateau schedulers
-        and the warmup ramp; plateau schedulers are stepped on validation end instead.
+        Manual-optimization path only (autoregressive mode; gradient accumulation is unsupported,
+        main.py rejects accumulate_grad_batches != 1). Also advances the warmup ramp; the plateau
+        scheduler is stepped on validation end instead.
         """
-        acc = self._accumulate_grad_batches()
-        n_batches = getattr(self.trainer, "num_training_batches", batch_idx + 1)
-        # num_training_batches can be float('inf') for unsized iterables; fall back to accumulation-only stepping.
-        try:
-            n_batches_f = float(n_batches)
-        except (TypeError, ValueError):
-            n_batches_f = float("inf")
-        if math.isfinite(n_batches_f):
-            is_last = (batch_idx + 1) >= int(n_batches_f)
-        else:
-            is_last = False
-        should_step = (((batch_idx + 1) % acc) == 0) or is_last
-        if not should_step:
-            return
-
         # Use the underlying torch optimizer for grad-norm inspection when available.
         torch_opt = opt.optimizer if hasattr(opt, "optimizer") else opt
 
@@ -668,7 +600,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         opt.step()
         opt.zero_grad(set_to_none=True)
 
-        # Step non-plateau schedulers here; plateau is stepped on validation end.
+        # Advance the per-step warmup ramp; the plateau itself is stepped on validation end.
         sched = self.lr_schedulers()
         if sched is None:
             return
@@ -677,20 +609,13 @@ class FlowMapRolloutModule(pl.LightningModule):
             sch = s.scheduler if hasattr(s, "scheduler") else s
             if isinstance(sch, WarmupReduceLROnPlateau):
                 sch.step_warmup()
-                continue
-            if isinstance(sch, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                continue
-            sch.step()
 
     def optimizer_step(self, *args: Any, **kwargs: Any) -> None:
         """Automatic-optimization hook: after the normal step, hand-advance the warmup ramp only."""
-        # Automatic-optimization path: Lightning already drives step/epoch LR schedulers
-        # (cosine LambdaLR with interval="step", plateau on validation_end). The only
-        # scheduler we must hand-advance is the custom WarmupReduceLROnPlateau's
-        # per-step warmup ramp, which is not driven by either of those mechanisms.
+        # Lightning calls this hook only in automatic optimization (stage 1), where it steps the
+        # plateau scheduler on validation end. The custom WarmupReduceLROnPlateau's per-step
+        # warmup ramp is not driven by Lightning, so it is advanced here.
         super().optimizer_step(*args, **kwargs)
-        if not self.automatic_optimization:
-            return
 
         sched = self.lr_schedulers()
         if sched is None:
@@ -703,7 +628,7 @@ class FlowMapRolloutModule(pl.LightningModule):
                 sch.step_warmup()
 
     def _scheduler_steps_per_epoch(self) -> int:
-        """Estimate optimizer steps per epoch (batches / accumulation), for sizing the warmup ramp."""
+        """Estimate optimizer steps per epoch (training batches per epoch), for sizing the warmup ramp."""
         if self.trainer is None:
             raise RuntimeError("Trainer must be attached before configure_optimizers for scheduler warmup.")
 
@@ -714,8 +639,7 @@ class FlowMapRolloutModule(pl.LightningModule):
             num_batches = 0.0
 
         if math.isfinite(num_batches) and num_batches > 0.0:
-            acc = self._accumulate_grad_batches()
-            return int(max(1, math.ceil(num_batches / float(acc))))
+            return int(max(1, math.ceil(num_batches)))
 
         max_steps = int(self.trainer.estimated_stepping_batches)
         if max_steps <= 0:
@@ -761,7 +685,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         y0 = y[:, 0, :]
         y1 = y[:, 1, :]
         dt0 = dt_full[:, 0]
-        g_t = self._coerce_g(g, B, y0)
+        g_t = self._coerce_g(g, y0)
 
         y_pred1 = self._forward_step(y0, dt0, g_t)
         losses = self.criterion(y_pred1.unsqueeze(1), y1.unsqueeze(1), step_weights=None)
@@ -778,7 +702,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         return losses["loss_total"]
 
 
-    def _training_step_autoregressive(self, batch: Mapping[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+    def _training_step_autoregressive(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
         """Autoregressive rollout training (manual optimization).
 
         Runs skip_steps warmup under no_grad (pushforward), then trains steps [skip..k_train) either
@@ -799,24 +723,20 @@ class FlowMapRolloutModule(pl.LightningModule):
         dt_train = dt_full[:, :k_train]
         y_true = y[:, 1 : 1 + k_train, :]
         y0 = y[:, 0, :]
-        g_t = self._coerce_g(g, B, y0)
+        g_t = self._coerce_g(g, y0)
 
         skip = int(self.ar_skip_steps)
         if skip >= k_train:
             raise ValueError(f"skip_steps ({skip}) must be < rollout_steps ({k_train}).")
 
         opt = self._get_single_optimizer()
-        acc = self._accumulate_grad_batches()
-        if (batch_idx % acc) == 0:
-            opt.zero_grad(set_to_none=True)
 
-        # Warmup once: pushforward M steps without grad, then detach.
+        # Warmup once: pushforward M steps under torch.no_grad() (the outputs carry no graph).
         y_prev = y0
         if skip > 0:
             with torch.no_grad():
                 for k in range(skip):
                     y_prev = self._forward_step(y_prev, dt_train[:, k], g_t)
-            y_prev = y_prev.detach()
 
         gamma = float(self.ar_loss_discount_gamma)
 
@@ -831,14 +751,14 @@ class FlowMapRolloutModule(pl.LightningModule):
             z_mse_sum = y_prev.new_zeros(())
 
             for k in range(skip, k_train):
-                y_next = self._forward_step(y_prev.detach(), dt_train[:, k], g_t)
+                y_next = self._forward_step(y_prev, dt_train[:, k], g_t)
                 y_tgt = y_true[:, k, :]
 
                 step_losses = self.criterion(y_next.unsqueeze(1), y_tgt.unsqueeze(1), step_weights=None)
                 w_k = weights[k - skip]
 
                 if self.ar_backward_per_step:
-                    self.manual_backward(step_losses["loss_total"] * (w_k / (weight_sum * acc)))
+                    self.manual_backward(step_losses["loss_total"] * (w_k / weight_sum))
                 else:
                     loss_total_sum = loss_total_sum + step_losses["loss_total"] * w_k
 
@@ -848,9 +768,9 @@ class FlowMapRolloutModule(pl.LightningModule):
                 y_prev = y_next.detach()
 
             if not self.ar_backward_per_step:
-                self.manual_backward(loss_total_sum / (weight_sum * acc))
+                self.manual_backward(loss_total_sum / weight_sum)
 
-            self._maybe_step_optimizer(opt, batch_idx)
+            self._maybe_step_optimizer(opt)
 
             loss_log10_mae = log10_mae_sum / weight_sum
             loss_z_mse = z_mse_sum / weight_sum
@@ -871,8 +791,8 @@ class FlowMapRolloutModule(pl.LightningModule):
             loss_log10_mae = losses["loss_log10_mae"].detach()
             loss_z_mse = losses["loss_z_mse"].detach()
 
-            self.manual_backward(loss_total / float(acc))
-            self._maybe_step_optimizer(opt, batch_idx)
+            self.manual_backward(loss_total)
+            self._maybe_step_optimizer(opt)
 
         self.log("train_loss", loss_total.detach(), on_step=False, on_epoch=True, prog_bar=True)
         self.log("train_loss_log10_mae", loss_log10_mae, on_step=False, on_epoch=True)
@@ -883,7 +803,7 @@ class FlowMapRolloutModule(pl.LightningModule):
 
         return loss_total
 
-    def _eval_step(self, batch: Mapping[str, torch.Tensor], stage: str) -> torch.Tensor:
+    def _eval_step(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
         """Open-loop rollout evaluation for val: unroll k_eval steps and log the (uniformly weighted) loss."""
         y = batch["y"]
         dt = batch["dt"]
@@ -894,7 +814,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         transitions = int(K_full) - 1
         k_eval = self._eval_rollout_steps(transitions=transitions)
 
-        dt_full = normalize_dt_shape(dt, batch_size=B, seq_len=transitions, context=f"{stage}/eval")
+        dt_full = normalize_dt_shape(dt, batch_size=B, seq_len=transitions, context="val/eval")
         dt_eval = dt_full[:, :k_eval]
 
         y0 = y[:, 0, :]
@@ -911,23 +831,21 @@ class FlowMapRolloutModule(pl.LightningModule):
         losses = self.criterion(y_pred, y_true, step_weights=step_weights)
         loss_total = losses["loss_total"]
 
-        if stage != "val":
-            raise ValueError(f"Unknown eval stage: {stage}")
         self.log("val_loss", loss_total, on_step=False, on_epoch=True, prog_bar=True)
         self.log("val_loss_log10_mae", losses["loss_log10_mae"], on_step=False, on_epoch=True)
         self.log("val_loss_z_mse", losses["loss_z_mse"], on_step=False, on_epoch=True)
 
         return loss_total
 
-    def training_step(self, batch: Mapping[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+    def training_step(self, batch: Mapping[str, torch.Tensor], _batch_idx: int) -> torch.Tensor:
         """Dispatch to the autoregressive or one-jump training step based on config."""
         if self.autoregressive_training:
-            return self._training_step_autoregressive(batch, batch_idx)
+            return self._training_step_autoregressive(batch)
         return self._training_step_one_jump(batch)
 
-    def validation_step(self, batch: Mapping[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+    def validation_step(self, batch: Mapping[str, torch.Tensor], _batch_idx: int) -> torch.Tensor:
         """Open-loop rollout validation step (logs val_loss)."""
-        return self._eval_step(batch, stage="val")
+        return self._eval_step(batch)
 
     def on_validation_epoch_end(self) -> None:
         """Step ReduceLROnPlateau schedulers when using manual optimization."""
@@ -961,10 +879,10 @@ class FlowMapRolloutModule(pl.LightningModule):
     # ------------------------
 
     def configure_optimizers(self) -> Any:
-        """Build the AdamW optimizer (with norm/bias WD exclusion) and the configured LR scheduler.
+        """Build the AdamW optimizer (with norm/bias WD exclusion) and the LR scheduler.
 
-        Supports reduce_on_plateau (wrapped with linear warmup) and cosine_with_warmup. Returns the
-        Lightning optimizer/scheduler dict; scheduler.monitor is required to be "val_loss".
+        The scheduler is ReduceLROnPlateau wrapped with a linear warmup (the only scheduler).
+        Returns the Lightning optimizer/scheduler dict; scheduler.monitor is required to be "val_loss".
         """
         tcfg = dict(self.hparams["training"])
         opt_cfg = dict(tcfg["optimizer"])
@@ -1007,82 +925,38 @@ class FlowMapRolloutModule(pl.LightningModule):
         if not bool(sched_cfg["enabled"]):
             return opt
 
-        sched_type_raw = str(sched_cfg["type"]).strip()
-        sched_type = sched_type_raw.lower()
+        factor = float(sched_cfg["factor"])
+        patience = int(sched_cfg["patience"])
+        threshold = float(sched_cfg["threshold"])
+        min_lr = float(sched_cfg["min_lr"])
+        mode = str(sched_cfg["mode"])
+        monitor = str(sched_cfg["monitor"])
+        warmup_steps = self._scheduler_warmup_steps(int(sched_cfg["warmup_epochs"]))
+        if monitor != "val_loss":
+            raise ValueError("scheduler.monitor must be 'val_loss'")
 
-        if sched_type in {"reducelronplateau", "reduce_on_plateau"}:
-            factor = float(sched_cfg["factor"])
-            patience = int(sched_cfg["patience"])
-            threshold = float(sched_cfg["threshold"])
-            min_lr = float(sched_cfg["min_lr"])
-            mode = str(sched_cfg["mode"])
-            monitor = str(sched_cfg["monitor"])
-            warmup_steps = self._scheduler_warmup_steps(int(sched_cfg["warmup_epochs"]))
-            if monitor != "val_loss":
-                raise ValueError("scheduler.monitor must be 'val_loss'")
+        sched = WarmupReduceLROnPlateau(
+            opt,
+            warmup_steps=warmup_steps,
+            mode=mode,
+            factor=factor,
+            patience=patience,
+            threshold=threshold,
+            min_lr=min_lr,
+        )
 
-            sched = WarmupReduceLROnPlateau(
-                opt,
-                warmup_steps=warmup_steps,
-                mode=mode,
-                factor=factor,
-                patience=patience,
-                threshold=threshold,
-                min_lr=min_lr,
-            )
-
-            return {
-                "optimizer": opt,
-                "lr_scheduler": {
-                    "scheduler": sched,
-                    "interval": "epoch",
-                    "frequency": 1,
-                    "monitor": monitor,
-                    "name": "lr",
-                },
-            }
-
-        if sched_type != "cosine_with_warmup":
-            raise ValueError(
-                f"Unsupported scheduler type '{sched_type_raw}' "
-                "(supported: reduce_on_plateau, ReduceLROnPlateau, cosine_with_warmup)"
-            )
-
-        # Cosine schedule with optional warmup (step-based).
-        if self.trainer is None:
-            raise RuntimeError("Trainer must be attached before configure_optimizers for cosine scheduler.")
-        max_steps = int(self.trainer.estimated_stepping_batches)
-        if max_steps <= 0:
-            raise RuntimeError(f"estimated_stepping_batches={max_steps}; cannot build cosine schedule.")
-
-        warmup_epochs = int(sched_cfg["warmup_epochs"])
-        min_lr_ratio = float(sched_cfg["min_lr_ratio"])
-        warmup_steps = self._scheduler_warmup_steps(warmup_epochs)
-
-        def lr_lambda(step: int) -> float:
-            s = int(step)
-            if warmup_steps > 0 and s < warmup_steps:
-                return float(s) / float(max(1, warmup_steps))
-
-            if max_steps <= warmup_steps:
-                return float(min_lr_ratio)
-
-            progress = float(s - warmup_steps) / float(max(1, max_steps - warmup_steps))
-            progress = min(1.0, max(0.0, progress))
-            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-            return float(min_lr_ratio + (1.0 - min_lr_ratio) * cosine)
-
-        sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
-
-        return {
-            "optimizer": opt,
-            "lr_scheduler": {
-                "scheduler": sched,
-                "interval": "step",
-                "frequency": 1,
-                "name": "lr",
-            },
+        lr_scheduler: Dict[str, Any] = {
+            "scheduler": sched,
+            "interval": "epoch",
+            "frequency": 1,
+            "name": "lr",
         }
+        # Automatic optimization (stage 1): Lightning steps the plateau from "monitor". Manual
+        # optimization (stage 2) ignores the key with a warning; on_validation_epoch_end steps it.
+        if self.automatic_optimization:
+            lr_scheduler["monitor"] = monitor
+
+        return {"optimizer": opt, "lr_scheduler": lr_scheduler}
 
 
 # ==============================================================================
@@ -1094,7 +968,7 @@ def build_lightning_trainer(
     cfg: Mapping[str, Any],
     *,
     work_dir: Path,
-    precision_config: Optional[PrecisionConfig] = None,
+    precision_config: PrecisionConfig,
     train_batches_per_epoch: Optional[int] = None,
 ) -> pl.Trainer:
     """Construct the Lightning Trainer from the (validated) config.
@@ -1111,8 +985,7 @@ def build_lightning_trainer(
     max_epochs = int(tcfg["max_epochs"])
     devices = runtime["devices"]
     accelerator = runtime["accelerator"]
-    prec = precision_config if precision_config is not None else parse_precision_config(cfg)
-    lightning_precision = prec.lightning_precision
+    lightning_precision = precision_config.lightning_precision
     log_every_n_steps = int(runtime["log_every_n_steps"])
     if log_every_n_steps <= 0:
         raise ValueError("runtime.log_every_n_steps must be > 0")
@@ -1135,14 +1008,6 @@ def build_lightning_trainer(
 
     # CSVLogger: keep outputs rooted directly under work_dir.
     csv_logger = CSVLogger(save_dir=str(work_dir), name=".", version="")
-
-    # Warn if Lightning still chooses a subdirectory (best-effort; does not crash training).
-    try:
-        log_dir = Path(csv_logger.log_dir).resolve()
-        if log_dir != work_dir.resolve():
-            rank_zero_warn(f"CSVLogger log_dir is {log_dir}, not {work_dir}. metrics.csv will be written under log_dir.")
-    except Exception:
-        pass
 
     callbacks: List[pl.Callback] = [LearningRateMonitor(logging_interval="epoch")]
 

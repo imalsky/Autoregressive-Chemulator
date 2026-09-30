@@ -20,7 +20,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Union
+from typing import Any, Dict, Mapping, Union
 
 import torch
 
@@ -174,17 +174,6 @@ def as_bool(value: Any, key: str) -> bool:
     return bool(value)
 
 
-def as_opt_int(value: Any, key: str) -> "Optional[int]":
-    if value is None:
-        return None
-    return as_int(value, key)
-
-
-# Internal aliases preserved for this module's own use.
-_require = require
-_as_str = as_str
-
-
 @dataclass(frozen=True)
 class PrecisionConfig:
     """Resolved precision configuration (torch dtypes + Lightning precision string)."""
@@ -193,7 +182,6 @@ class PrecisionConfig:
     amp_mode: str  # "mixed" | "true"
     model_dtype: torch.dtype
     input_dtype: torch.dtype
-    dataset_dtype: torch.dtype
     preload_dtype: torch.dtype
     loss_dtype: torch.dtype
 
@@ -214,16 +202,15 @@ def parse_precision_config(cfg: Mapping[str, Any]) -> PrecisionConfig:
     if not isinstance(pcfg_raw, Mapping):
         raise KeyError("missing/invalid: precision (expected object)")
 
-    compute_dtype = parse_torch_dtype(_require(pcfg_raw, "compute_dtype"), key="precision.compute_dtype")
-    amp_mode = _as_str(_require(pcfg_raw, "amp_mode"), "precision.amp_mode").lower()
+    compute_dtype = parse_torch_dtype(require(pcfg_raw, "compute_dtype"), key="precision.compute_dtype")
+    amp_mode = as_str(require(pcfg_raw, "amp_mode"), "precision.amp_mode").lower()
     if amp_mode not in ("mixed", "true"):
         raise ValueError("precision.amp_mode must be 'mixed' or 'true'")
 
-    model_dtype = parse_torch_dtype(_require(pcfg_raw, "model_dtype"), key="precision.model_dtype")
-    input_dtype = parse_torch_dtype(_require(pcfg_raw, "input_dtype"), key="precision.input_dtype")
-    dataset_dtype = parse_torch_dtype(_require(pcfg_raw, "dataset_dtype"), key="precision.dataset_dtype")
-    preload_dtype = parse_torch_dtype(_require(pcfg_raw, "preload_dtype"), key="precision.preload_dtype")
-    loss_dtype = parse_torch_dtype(_require(pcfg_raw, "loss_dtype"), key="precision.loss_dtype")
+    model_dtype = parse_torch_dtype(require(pcfg_raw, "model_dtype"), key="precision.model_dtype")
+    input_dtype = parse_torch_dtype(require(pcfg_raw, "input_dtype"), key="precision.input_dtype")
+    preload_dtype = parse_torch_dtype(require(pcfg_raw, "preload_dtype"), key="precision.preload_dtype")
+    loss_dtype = parse_torch_dtype(require(pcfg_raw, "loss_dtype"), key="precision.loss_dtype")
 
     # Cross-validation: avoid silent dtype mismatches.
     if compute_dtype in (torch.float32, torch.float64):
@@ -247,7 +234,6 @@ def parse_precision_config(cfg: Mapping[str, Any]) -> PrecisionConfig:
         amp_mode=amp_mode,
         model_dtype=model_dtype,
         input_dtype=input_dtype,
-        dataset_dtype=dataset_dtype,
         preload_dtype=preload_dtype,
         loss_dtype=loss_dtype,
     )
