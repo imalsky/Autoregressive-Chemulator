@@ -1,7 +1,7 @@
 # Autoregressive Chemical Kinetics Emulator Specification
 
-Version: 1.8
-Date: 2026-09-30
+Version: 1.9
+Date: 2026-10-01
 Audience: Professional collaborators and maintainers
 
 ## 0. Execution Environment
@@ -29,7 +29,7 @@ Audience: Professional collaborators and maintainers
 5. Keep logic explicit and simple.
 6. Avoid magic numbers in logic bodies.
 7. Place stable defaults as named module-level constants in each executable script.
-8. There is no default config file; all entrypoints require `AUTOCHEM_CONFIG_PATH` and hard-fail if it is unset.
+8. There is no default config file; all entrypoints require `AUTOCHEM_CONFIG_PATH` and hard-fail if it is unset. The testing tools select their run directory (the config's `paths.work_dir`) through the same variable and one resolver (`testing/run_dir.py`).
 9. Required config keys are read directly (absence is an error); only optional feature blocks may carry named-constant defaults.
 
 ## 4. Canonical Workflow
@@ -55,9 +55,9 @@ Audience: Professional collaborators and maintainers
 6. Stage 1 run uses one-jump training with `rollout_steps = 1`.
 7. Stage 2 run uses autoregressive multi-step training with `rollout_steps = N`, where `N > 1`.
 8. Stage 2 `N` is user-configured per run and not fixed by the codebase.
-9. This two-run staging is a canonical workflow guideline and is not required to be hard-enforced by runtime guards in code.
+9. The order of the two runs is a canonical workflow guideline, but the stage-2 handoff is guarded: a `weights_only` load requires the source run's `COMPLETED` marker and a matching normalization fingerprint (`norm_sha256`).
 10. Resume/checkpoint options are retained.
-11. Fresh runs still require an empty work directory unless explicitly resuming.
+11. Fresh runs still require an empty work directory unless explicitly resuming; a work directory whose only entry is `train.log` (left by a failed start) counts as empty. The training process holds an exclusive flock on the work directory itself (no lock file is created), so a second training process on the same work directory fails at startup.
 12. Curriculum support is retained.
 13. Autoregressive controls (`skip_steps`, detach behavior, backward mode) are retained.
 14. Optimizer support is restricted to `AdamW` only.
@@ -75,6 +75,7 @@ Audience: Professional collaborators and maintainers
 26. The production layout is a single dt-conditioned model. The band-specialist (per-`dt`-range) layout was evaluated and rejected; see `docs/DECISIONS.md`.
 27. `training.ema` and `training.early_stopping` are required config blocks, each gated by its own `enabled` flag.
 28. `model.fourier_dt` and `training.autoregressive_training.loss_discount_gamma` are optional, validated feature blocks; absent keys use named-constant defaults that reproduce legacy behavior.
+29. `precision.amp_mode` is Lightning's precision suffix: `"true"` means `*-true` precision with no autocast (required for float32 and float64 compute; bfloat16 with `"true"` is pure bf16, a lossy mode that carries the rollout state in bf16); `"mixed"` enables autocast. TF32 is the separate `precision.allow_tf32` key, forced off by `runtime.deterministic=true`.
 
 ## 4.3 Export and Inference
 1. Export contract is physical-space one-step inference.
@@ -107,6 +108,7 @@ Audience: Professional collaborators and maintainers
 2. `testing/export.py` and `testing/aoti_export.py` produce/validate deployment artifacts and follow the strict no-fallback contract.
 3. The plotting/inspection diagnostics (`testing/predictions.py`, `testing/bench_speedup.py`, `testing/training_logs.py`, `testing/efficiency_summary.py`, `testing/profile_training.py`) may use explicit best-effort behavior for portability and local usability.
 4. `testing/run_local_smoke.sh` (run as `bash run_daw.sh smoke`) is the integration gate: the production configs, shrunk, on synthetic data through preprocessing (its two reject paths), both stages with the production compile settings, a deliberate extension and a refused re-run of a finished run, the `best.ckpt` handoff, both stage-2 recipes, the Fourier-dt fallback pair and the gated export with a reload check. It asserts the outcomes (finite losses, epoch counts, `COMPLETED`, `last.ckpt` at the final epoch, a ragged last validation batch, compiled-variant counts, weights that change, NaN rows out of range) and fails on the first wrong one. Run it before committing changes to `src/`, `processing/` or the export.
+5. `testing/eval_rollout_error.py` (rollout error vs step) and the planned fixed-dt evaluation-set generator are diagnostics under 6.3: the stage-2 rollout target in `docs/DECISIONS.md` is not a hard gate while 6.3 stands, and defining it is an open author decision. If the author makes it a gate, both move under the strict contract of 4.4.2: a non-zero exit on NaN percentiles, a K below the requested K, non-finite trajectories, truncated rows or a missed target.
 
 ## 5. Data and Schema Contracts
 1. Raw input data schema is stable and assumed unchanged.
@@ -164,6 +166,6 @@ Audience: Professional collaborators and maintainers
 
 ### 9.3 Editing Rules For Dead Code Fixes
 1. Remove truly unused locals/imports/functions rather than suppressing diagnostics.
-2. If protocol signatures require unused parameters (for example context manager or framework hook signatures), rename them with leading underscores.
+2. If protocol signatures require unused parameters (for example context manager or framework hook signatures), rename them with leading underscores only when the caller passes them positionally. Keep the names a framework passes by keyword (Lightning calls `setup` and `teardown` with `stage=`, so `EMACallback.setup`'s `stage` keeps its name), optionally with a targeted `# noqa` comment; a dead-code tool's report on such a parameter is a false positive.
 3. Treat framework callback methods and model `forward` methods as potential false positives in static dead-code tools; verify before deleting.
 4. Keep parser argument removal policy: no `argparse`; use config values or explicit module-level constants.

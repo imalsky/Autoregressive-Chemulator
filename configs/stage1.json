@@ -8,6 +8,7 @@
     "  AUTOCHEM_CONFIG_PATH=configs/stage1.json python -u src/main.py"
   ],
   "precision": {
+    "_comment": "amp_mode \"true\" = Lightning 32-true: no autocast (required for float32 compute); only \"mixed\" enables autocast. TF32 is allow_tf32 (forced off by runtime.deterministic=true).",
     "compute_dtype": "float32",
     "amp_mode": "true",
     "model_dtype": "float32",
@@ -130,7 +131,8 @@
       "seed": 0,
       "_comment": [
         "Disabled 2026-06-11 per F1/F2 (see docs/DECISIONS.md): on the residual trunk,",
-        "Fourier-dt was harmful at 135k-param scale, replicated across 2 seeds.",
+        "Fourier-dt was harmful at ~130k params, replicated across 2 seeds (a trunk interaction;",
+        "scale dependence untested).",
         "Re-enable only if the production-scale spot-check contradicts this."
       ]
     },

@@ -4,17 +4,22 @@
     "published by src/main.py only when stage 1 finished, i.e. wrote COMPLETED; EMA weights",
     "preferred automatically by the weights_only loader).",
     "Model block is IDENTICAL to stage 1.",
-    "Default rollout-gradient mode is full BPTT with uniform per-step weighting",
-    "(GraphCast/Stormer/Kelp-2020-aligned; locally tied with detach in E4).",
-    "FALLBACK (equally validated locally, lower memory): set",
-    "  autoregressive_training.detach_between_steps=true,",
-    "  autoregressive_training.backward_per_step=true,",
-    "  autoregressive_training.loss_discount_gamma=0.9   <- REQUIRED with detach (E3)",
+    "Default rollout-gradient mode is full BPTT with uniform per-step weighting, chosen on the",
+    "literature prior (GraphCast and NeuralGCM state BPTT). E4 local evidence mixed: detached better",
+    "on the geometric metric, BPTT better on fixed-dt; unresolved at 2-3 seeds.",
+    "FALLBACK (lower memory; the best local geometric point estimate, but the sandbox used skip 2",
+    "and this recipe keeps skip 1, smoke-tested only): under training.autoregressive_training set",
+    "  \"detach_between_steps\": true,",
+    "  \"backward_per_step\": true,",
+    "  \"loss_discount_gamma\": 0.9   <- REQUIRED with detach (E3; not enforced in code)",
+    "keeping skip_steps 1 and training.curriculum 2->10. Write the nested keys: a dotted key such as",
+    "\"autoregressive_training.loss_discount_gamma\" is rejected at startup.",
     "docs/DECISIONS.md: per-key evidence, and the Inherited / unjustified table for values without it.",
     "Stage 2 reuses the stage-1 processed shards; do NOT rerun preprocessing.",
     "Run: AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u src/main.py"
   ],
   "precision": {
+    "_comment": "amp_mode \"true\" = Lightning 32-true: no autocast (required for float32 compute); only \"mixed\" enables autocast. TF32 is allow_tf32 (forced off by runtime.deterministic=true).",
     "compute_dtype": "float32",
     "amp_mode": "true",
     "model_dtype": "float32",
@@ -132,7 +137,8 @@
       "seed": 0,
       "_comment": [
         "Disabled 2026-06-11 per F1/F2 (see docs/DECISIONS.md): on the residual trunk,",
-        "Fourier-dt was harmful at 135k-param scale, replicated across 2 seeds.",
+        "Fourier-dt was harmful at ~130k params, replicated across 2 seeds (a trunk interaction;",
+        "scale dependence untested).",
         "Must match the stage-1 model block exactly for the weights_only handoff."
       ]
     },

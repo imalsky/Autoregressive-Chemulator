@@ -68,7 +68,10 @@ Writes `data/processed/{train,validation,test}/shard_*.npz` and
 until the new one is complete (it is built in `_tmp_final/` and swapped in, with
 `normalization.json` last). The scratch dirs (`_tmp_physical/`, `_tmp_final/`,
 `_tmp_old/`) are removed on success; after a failure the next run wipes them
-(`preprocessing.overwrite=true`) or refuses (`false`). Stage 2 reuses these same shards.
+(`preprocessing.overwrite=true`) or refuses (`false`). One preprocessing run at a time per
+processed dir: it holds a lock on `data/processed.lock`, a persistent 0-byte file next to the
+processed dir, and a second run (or leftover workers of a killed one) exits with an error. Stage 2
+reuses these same shards.
 `normalization.json` also records the input units and the trained domain (window start
 times, (T, P) coverage, the tracked-species sum); `preprocessing_summary.json` is the
 build record (per raw file: size, groups, rejects, windows; the config blocks used; the
@@ -143,8 +146,10 @@ T lies outside the trained range, or whose inputs are not finite, comes back as 
 artifact is checked against the eager model before it replaces the previous one.
 `aoti_export.py` installs its package only when it matches the fresh export (otherwise it
 writes its reports and exits 1); the package does no input validation, so hosts must call
-it through `_check_step_inputs` or apply the same checks (spec 4.3). It is not run on daw:
-torch 2.8 extracts AOTI packages into the shared system temp dir.
+it through `_check_step_inputs` or apply the same checks (spec 4.3). It is not run on daw: on
+torch < 2.13, loading an AOTI `.pt2` writes about 152 MB per load (at production size) into a
+directory under the root temp dir whatever `TMPDIR` says, and a killed run leaves it there (the
+fix route is open; docs/DECISIONS.md, open items).
 
 The integration gate, about two minutes on one GPU with synthetic data (no real dataset needed):
 

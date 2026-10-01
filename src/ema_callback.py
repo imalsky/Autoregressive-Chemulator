@@ -8,10 +8,16 @@ state is also serialized into checkpoints under the key
 ``ema_state_dict`` so it can be loaded by stage-2 ``weights_only`` resumes
 or by post-training inference.
 
-Hook order matters. The callback must appear BEFORE ``ModelCheckpoint``
-in the callback list so that live weights are restored before
-``ModelCheckpoint.on_validation_end`` saves; EMA weights are then
-attached to the saved checkpoint via ``on_save_checkpoint``.
+Checkpoint timing. With validation once per epoch (the only cadence this
+project configures), ``ModelCheckpoint`` saves in ``on_train_epoch_end``,
+which runs after validation and therefore after ``on_validation_end`` below
+has restored the live weights. If validation ran mid-epoch or every N > 1
+epochs, ``ModelCheckpoint`` would save in ``on_validation_end`` instead;
+Lightning always moves Checkpoint callbacks to the end of
+``trainer.callbacks``, so the restore still runs first and this callback's
+position in the list does not matter. Saved checkpoints hold the live
+weights in ``state_dict`` and the EMA shadow in ``ema_state_dict`` (added by
+``on_save_checkpoint``; missing if ``ModelCheckpoint(save_weights_only=True)``).
 """
 
 from __future__ import annotations

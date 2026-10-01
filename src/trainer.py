@@ -81,7 +81,8 @@ from lightning.pytorch.loggers import CSVLogger
 # Uniform per-step rollout weighting (no discount). Only consulted when the
 # optional training.autoregressive_training.loss_discount_gamma key is absent.
 _DEFAULT_LOSS_DISCOUNT_GAMMA = 1.0
-# Validation is uniformly weighted so val_loss is comparable across gamma settings.
+# Validation weights every step >= skip_steps equally, so val_loss is comparable across gamma
+# settings, not across skip_steps.
 _VAL_STEP_GAMMA = 1.0
 # ReduceLROnPlateau threshold mode (torch's default, now explicit): val_loss counts as an improvement
 # only when it beats the best by the relative fraction training.scheduler.threshold (1e-3 stage 1,
@@ -436,8 +437,8 @@ class FlowMapRolloutModule(pl.LightningModule):
         self.ar_detach_between_steps = bool(ar_cfg["detach_between_steps"])
         self.ar_backward_per_step = bool(ar_cfg["backward_per_step"])
         # Per-step discount gamma^(k-skip) on the rollout loss. 1.0 = uniform (legacy).
-        # Optional key; validation/checkpoint selection (_eval_step) intentionally stays
-        # uniformly weighted so val_loss is comparable across gamma settings.
+        # Optional key; validation/checkpoint selection (_eval_step) intentionally stays uniform
+        # over steps >= skip_steps, so val_loss is comparable across gamma, not across skip_steps.
         self.ar_loss_discount_gamma = float(ar_cfg.get("loss_discount_gamma", _DEFAULT_LOSS_DISCOUNT_GAMMA))
         if not (0.0 < self.ar_loss_discount_gamma <= 1.0):
             raise ValueError(
@@ -1017,7 +1018,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         return loss_total
 
     def _eval_step(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
-        """Open-loop rollout evaluation for val: unroll k_eval steps and log the (uniformly weighted) loss."""
+        """Open-loop rollout evaluation for val: unroll k_eval steps and log the loss, uniform over steps >= skip_steps."""
         y = batch["y"]
         dt = batch["dt"]
         g = batch["g"]
