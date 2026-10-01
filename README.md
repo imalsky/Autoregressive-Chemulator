@@ -1,11 +1,13 @@
 # Auto-Chem
 
 Flow-map neural emulators for stiff chemistry trajectories. Given a state `y` at
-time `t`, the model predicts `y(t + dt)` under variable timesteps:
+time `t`, the model predicts `y(t + dt)` for a timestep `dt` in the trained range:
 
     y_{t+1} = F(y_t, dt_t, g)
 
-where `g = (P, T)` are per-trajectory global conditioning parameters. The
+The one-step export accepts any in-range dt per call and per row; multi-step rollouts are trained
+and validated only at constant dt within a rollout; rollouts whose dt changes between steps are
+unvalidated. Here `g = (P, T)` are per-trajectory global conditioning parameters. The
 production model is a single dt-conditioned MLP flow-map trained in two stages
 (one-jump pretrain -> autoregressive fine-tune). See [`spec.md`](spec.md) for the
 full design and [`docs/DECISIONS.md`](docs/DECISIONS.md) for the per-key evidence behind
@@ -38,12 +40,15 @@ the config values (values without evidence are listed there as inherited / unjus
       predictions.py      autoregressive rollout plots (diagnostic)
       training_logs.py    training-curve plots (diagnostic)
       eval_rollout_error.py   rollout-error curves vs step over a seeded validation sample (per-species dex),
-                              with persistence, loss vs persistence by window-start decade, gate-1 lines,
-                              steady-state windows reported apart from the evolving ones (the headline)
+                              with persistence, loss vs persistence by window-start decade and gate-1 lines
+                              on the evolving windows (the headline), steady-state windows reported apart
+                              by absolute log10 error
       bench_speedup.py    exported-model (CPU and CUDA) latency sweep vs mini-chem per-cell cost
       run_local_smoke.sh  end-to-end smoke on synthetic data (the integration gate)
     run_daw.sh            daw launcher: preprocess -> stage 1 -> stage 2, each with its post step
     requirements.lock     exact package pins (the daw venv); .python-version: 3.12.14
+    LICENSE               MIT license
+    CITATION.cff          software citation metadata
 
 ## Environment
 
@@ -150,7 +155,7 @@ Every tool acts on the run named by `AUTOCHEM_CONFIG_PATH` (its `paths.work_dir`
 same commands serve stage 1 and stage 2:
 
     AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u testing/export.py              # 1-step physical-space .pt2 (CPU + CUDA)
-    AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u testing/aoti_export.py         # AOT Inductor package + validation
+    AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u testing/aoti_export.py         # AOT Inductor package + validation (not on daw)
     AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u testing/eval_rollout_error.py  # rollout-error curves (validation split)
     AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u testing/predictions.py         # rollout plot against a shard
     AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u testing/bench_speedup.py       # exported-model latency sweep
@@ -161,15 +166,20 @@ same commands serve stage 1 and stage 2:
 
 Export requires a finished run (`COMPLETED`) whose checkpoint matches its processed data
 (`norm_sha256`); every requested device must be available. Inputs are in physical units
-(P in dyn/cm^2, T in K, dt in s, species mixing ratios; see spec 4.3); a row whose dt, P or
-T lies outside the trained range, or whose inputs are not finite, comes back as NaN. Each
-artifact is checked against the eager model before it replaces the previous one.
+(P in dyn/cm^2, T in K, dt in s, species mixing ratios relative to the whole gas; see spec 4.3);
+a row whose dt, P or T lies outside the trained range, or whose inputs are not finite, comes back
+as NaN. The training compositions contain no helium, so helium-bearing compositions are outside the
+validated domain; how a helium-bearing host should map its composition is an open decision
+(docs/DECISIONS.md, open item 25). Each artifact is checked against the eager model before it
+replaces the previous one.
 `aoti_export.py` installs its package only when it matches the fresh export (otherwise it
 writes its reports and exits 1); the package does no input validation, so hosts must call
-it through `_check_step_inputs` or apply the same checks (spec 4.3). It is not run on daw: on
-torch < 2.13, loading an AOTI `.pt2` writes about 152 MB per load (at production size) into a
-directory under the root temp dir whatever `TMPDIR` says, and a killed run leaves it there (the
-fix route is open; docs/DECISIONS.md, open items).
+it through `_check_step_inputs` or apply the same checks (spec 4.3). It is not run on daw
+(decided 2026-10-01): on torch < 2.13, loading an AOTI `.pt2` writes about 152 MB per load (at
+production size) into a directory under the root temp dir whatever `TMPDIR` says, and a killed run
+leaves it there. The torch.export `.pt2` is the deployment artifact; AOTI is revisited with a
+project-wide upgrade to torch >= 2.13 on its own branch, gated on parity (docs/DECISIONS.md, open
+item 26).
 
 The integration gate, about two minutes on one GPU with synthetic data (no real dataset needed):
 
@@ -193,8 +203,9 @@ retrained, an interrupted one resumes from `last.ckpt` (one that had finished tr
 published is published from it), and refusals from `src/main.py` are reported, not retried. It takes one GPU (the first idle one, or `AUTOCHEM_GPU`; it refuses a
 second GPU for the same user), pins itself to 16 CPUs on that GPU's NUMA node
 (`AUTOCHEM_THREADS`; all child processes inherit the pin), sets the thread counts, `TMPDIR`
-and the compile caches, and stops cleanly on Ctrl-C or `kill <pid>` (training exits 143 and
-resumes on the next run). Console logs, the GPU logger CSV and the last resume config go to
+and the compile caches (inductor compiles in-process, `TORCHINDUCTOR_COMPILE_THREADS=1`, so no
+compile-worker pool puts semaphores on the shared RAM disk), and stops cleanly on Ctrl-C or
+`kill <pid>` (training exits 143 and resumes on the next run). Console logs, the GPU logger CSV and the last resume config go to
 `logs/`.
 
 ## Design stance
@@ -206,3 +217,7 @@ hard errors rather than silent fallbacks. Required config keys are read directly
 `training.autoregressive_training.loss_discount_gamma`) carry documented,
 named-constant defaults. The rationale is deterministic behavior across
 environments and easy reproduction from `config.resolved.json`.
+
+## License
+
+MIT (see `LICENSE`). Citation metadata for the software is in `CITATION.cff`.

@@ -20,17 +20,21 @@ forward):
   so an inf percentile means more than that tail fraction diverged.
 Strata: a window is steady state when its truth stays within STEADY_STATE_MAX_DEX of its start
 state at every step and species (persistence is nearly exact there); the others are evolving. The
-headline rows, the pooled dex p90 at the report steps and the loss against persistence are also
-reported for each stratum, the evolving rows being the recommended headline, so steady states do
-not dominate it; the curve CSVs and gate 1 pool all windows.
+headline rows and the pooled dex p90 at the report steps are also reported for each stratum, the
+evolving rows being the recommended headline, so steady states do not dominate it; the curve CSVs
+pool all windows. The loss against persistence and gate 1 are judged on the evolving windows only
+(a ratio against a nearly exact persistence is meaningless); the steady-state windows are reported
+apart by the model's absolute log10 error.
 Loss against persistence: the run's val_loss definition (training.rollout_steps from the rollout
 start, steps >= skip_steps for an AR run, the run's loss weights), recomputed in float64 from the
 export's physical outputs (values clipped at epsilon), for the model and for persistence, as a ratio
-of means and skill = 1 - ratio, overall and by window-start decade. The window-start time is
-t_start + ROLLOUT_START_INDEX * dt; the shards hold no time, so t_start is replayed from the run's
-raw files with preprocessing's own per-trajectory draws and every replayed window is checked
-against its shard row. Gate 1 (the stage-1 accuracy gate, PROVISIONAL; GATE1_* below) is printed as
-pass/fail lines for a one-jump run; it is reported only, never enforced (the exit status ignores it).
+of means and skill = 1 - ratio, overall and by window-start decade, over the evolving windows (the
+all-window pooled ratio, training's val_skill population, is printed as a diagnostic). The
+window-start time is t_start + ROLLOUT_START_INDEX * dt; the shards hold no time, so t_start is
+replayed from the run's raw files with preprocessing's own per-trajectory draws and every replayed
+window is checked against its shard row. Gate 1 (the stage-1 accuracy gate, PROVISIONAL; GATE1_*
+below; evolving windows only) is printed as pass/fail lines for a one-jump run; it is reported only,
+never enforced (the exit status ignores it).
 Bootstrap CIs over sources are given at the report steps. Sources whose dt, P or T lies outside the
 export's trained box (NaN rows by the export contract) are dropped before the rollout and counted
 apart from divergence. If this run was started with weights_only from another run whose evaluation
@@ -96,9 +100,11 @@ DATA_LABEL = "random-dt, K <= 98 (processed shards; no fixed-dt evaluation set y
 # Gate 1, the stage-1 accuracy gate (PROVISIONAL, author 2026-10-01; revisit after the first trained
 # model): skill against persistence, because persistence already scores the stage-1 validation loss
 # at ~16x the old ~7e-4 threshold and its loss falls ~1000x from early to late window starts.
-# Pass: overall loss <= GATE1_MAX_LOSS_RATIO x persistence, and loss < persistence in every
-# window-start decade (ratio < GATE1_MAX_DECADE_RATIO); the decades from GATE1_LATE_START_S on (the
-# author's "especially") also get their own line.
+# Pass, on the evolving windows only (2026-10-01; steady-state windows, where persistence is nearly
+# exact, are reported apart by absolute log10 error): overall loss <= GATE1_MAX_LOSS_RATIO x
+# persistence, and loss < persistence in every window-start decade that has evolving windows (ratio <
+# GATE1_MAX_DECADE_RATIO); the decades from GATE1_LATE_START_S on (the author's "especially") also get
+# their own line.
 GATE1_MAX_LOSS_RATIO = 0.5
 GATE1_MAX_DECADE_RATIO = 1.0
 GATE1_LATE_START_S = 1e3
@@ -285,9 +291,10 @@ def _rollout_stats(model, y0_phys, g_phys, dt_seconds, y_true, *, eps: float, b_
     """Steps in the outer loop, row chunks of at most b_max in the inner loop; keep only the [N, S] state.
 
     Returns per-step pooled frac percentiles, pooled dex p90, per-species dex percentiles and bias,
-    n_finite, the truth-below-level shares, the per-source dex at the report steps, and the per-source
+    n_finite, the truth-below-level shares, the per-source dex at the report steps, the per-source
     loss under loss_def (lambda_log10_mae * mean |dlog10| + lambda_z_mse * mean (dlog10 / log_std)^2
-    over species, weighted over the first loss_def["k"] steps; +inf for a diverged source).
+    over species, weighted over the first loss_def["k"] steps; +inf for a diverged source) and the
+    per-source absolute log10 error (mean |dlog10| over species, same step weights; +inf if diverged).
     """
     N, K, S = y_true.shape
     state = torch.from_numpy(y0_phys.astype(np.float32))
@@ -296,6 +303,7 @@ def _rollout_stats(model, y0_phys, g_phys, dt_seconds, y_true, *, eps: float, b_
     out: Dict[str, Any] = {"frac": [], "dex_p90": [], "species_dex": [], "bias_median": [], "bias_mean": [],
                            "n_finite": [], "dex_at_report": []}
     window_loss = np.zeros(N)
+    window_abs_dex = np.zeros(N)
     below = {lvl: 0 for lvl in TRUTH_DISCLOSURE_LEVELS}
     for k in range(K):
         nxt = [model(state[i:i + b_max], dt[i:i + b_max, k], g[i:i + b_max]) for i in range(0, N, b_max)]
@@ -321,11 +329,14 @@ def _rollout_stats(model, y0_phys, g_phys, dt_seconds, y_true, *, eps: float, b_
             out["dex_at_report"].append(dex)
         if k < loss_def["k"] and loss_def["weights"][k] > 0.0:
             with np.errstate(invalid="ignore"):
-                term = (loss_def["lambda_log10_mae"] * dex.mean(axis=1)
+                mae = dex.mean(axis=1)
+                term = (loss_def["lambda_log10_mae"] * mae
                         + loss_def["lambda_z_mse"] * np.square(dex / loss_def["log_std"]).mean(axis=1))
             window_loss += loss_def["weights"][k] * np.where(np.isfinite(term), term, np.inf)
+            window_abs_dex += loss_def["weights"][k] * np.where(np.isfinite(mae), mae, np.inf)
     out["truth_share_below"] = {f"{lvl:g}": below[lvl] / float(N * K * S) for lvl in below}
     out["window_loss"] = window_loss / loss_def["weights"].sum()
+    out["window_abs_dex"] = window_abs_dex / loss_def["weights"].sum()
     return out
 
 
@@ -508,8 +519,13 @@ def main() -> None:
     print_headline("all windows", n_kept, {str(s): {"model": stats["species_dex"][s - 1][i90],
                                                      "persistence": pstats["species_dex"][s - 1][i90]} for s in headline})
 
-    # Loss against persistence, overall and by window-start decade (ratio of means; skill = 1 - ratio).
+    # Loss against persistence (ratio of means; skill = 1 - ratio), overall and by window-start decade,
+    # over the evolving windows: on a steady-state window persistence is nearly exact, so a ratio there
+    # is meaningless (gate 1's population since 2026-10-01). Steady-state windows are reported by the
+    # model's absolute log10 error instead.
     m_wl, p_wl = stats["window_loss"], pstats["window_loss"]
+    m_wd, p_wd = stats["window_abs_dex"], pstats["window_abs_dex"]
+    evolving = strata["evolving"]
 
     def vs_persistence(mask: np.ndarray) -> Dict[str, Any]:
         m, p = float(m_wl[mask].mean()), float(p_wl[mask].mean())
@@ -517,53 +533,86 @@ def main() -> None:
             r = float(np.float64(m) / np.float64(p))
         return {"n": int(mask.sum()), "model_loss": m, "persistence_loss": p, "ratio": r, "skill": 1.0 - r}
 
+    def abs_error(mask: np.ndarray) -> Dict[str, Any]:
+        return {"n": int(mask.sum()), "model_mean_dex": float(m_wd[mask].mean()),
+                "model_p90_dex": float(_pctl_fixed_pool(m_wd[mask], 90)),
+                "persistence_mean_dex": float(p_wd[mask].mean())}
+
     decade = np.floor(np.log10(t_window)).astype(int)
-    by_decade = [{"t_lo_s": 10.0 ** d, "t_hi_s": 10.0 ** (d + 1), **vs_persistence(decade == d),
-                  "n_steady_state": int((steady & (decade == d)).sum())} for d in sorted(set(decade.tolist()))]
-    overall = vs_persistence(np.ones_like(m_wl, dtype=bool))
-    for key, m in strata.items():
-        if by_stratum[key] is not None:
-            by_stratum[key]["loss_vs_persistence"] = vs_persistence(m)
+    decades = sorted(set(decade.tolist()))
+    # A decade without evolving windows has no ratio; it appears in the steady-state table only.
+    by_decade = [{"t_lo_s": 10.0 ** d, "t_hi_s": 10.0 ** (d + 1), **vs_persistence(evolving & (decade == d)),
+                  "n_steady_state": int((steady & (decade == d)).sum())}
+                 for d in decades if (evolving & (decade == d)).any()]
+    steady_by_decade = [{"t_lo_s": 10.0 ** d, "t_hi_s": 10.0 ** (d + 1), **abs_error(steady & (decade == d))}
+                        for d in decades if (steady & (decade == d)).any()]
+    overall = vs_persistence(evolving) if evolving.any() else None
+    pooled = vs_persistence(np.ones_like(m_wl, dtype=bool))
+    steady_overall = abs_error(steady) if steady.any() else None
+    if by_stratum["evolving"] is not None:
+        by_stratum["evolving"]["loss_vs_persistence"] = overall
+    if by_stratum["steady_state"] is not None:
+        by_stratum["steady_state"]["abs_log10_error"] = steady_overall
     loss_label = (f"the run's val_loss definition: {loss_def['k']} step(s) from start index {ROLLOUT_START_INDEX}, "
                   f"steps >= {loss_def['skip']} weighted equally, lambda_log10_mae={loss_def['lambda_log10_mae']:g}, "
                   f"lambda_z_mse={loss_def['lambda_z_mse']:g}; float64 from the export's outputs, clipped at "
                   f"epsilon (not training's val_loss); window start = t_start + {ROLLOUT_START_INDEX} x dt")
-    print(f"\n=== loss vs persistence ({loss_label}) ===")
+    abs_label = ("per window, mean |log10 yp - log10 yt| over species and the val_loss steps (same step weights; "
+                 "the loss's log10-MAE term), clipped at epsilon; +inf if diverged")
+    print(f"\n=== loss vs persistence, evolving windows ({loss_label}) ===")
+    print("(steady: the decade's steady-state windows, left out of the ratio; a decade with none evolving is not listed)")
     print(f"{'window start (s)':<20} {'n':>6} {'steady':>6} {'model_loss':>12} {'persistence':>12} {'ratio':>8} {'skill':>8}")
-    for row in by_decade + [dict(overall, t_lo_s=None, n_steady_state=n_steady)]:
-        span = "all" if row["t_lo_s"] is None else f"[{row['t_lo_s']:.0e}, {row['t_hi_s']:.0e})"
+    for row in by_decade:
+        span = f"[{row['t_lo_s']:.0e}, {row['t_hi_s']:.0e})"
         print(f"{span:<20} {row['n']:>6} {row['n_steady_state']:>6} {row['model_loss']:12.4e} "
               f"{row['persistence_loss']:12.4e} {row['ratio']:8.4f} {row['skill']:8.4f}")
-    for key, label in (("evolving", "evolving only"), ("steady_state", "steady state only")):
-        if by_stratum[key] is not None:
-            row = by_stratum[key]["loss_vs_persistence"]
-            print(f"{label:<20} {row['n']:>6} {'':>6} {row['model_loss']:12.4e} {row['persistence_loss']:12.4e} "
+    for label, row, n_st in (("evolving", overall, n_steady), ("all, pooled (diag.)", pooled, n_steady)):
+        if row is None:
+            print(f"{label:<20} {0:>6} {n_st:>6} (no evolving windows)")
+        else:
+            print(f"{label:<20} {row['n']:>6} {n_st:>6} {row['model_loss']:12.4e} {row['persistence_loss']:12.4e} "
                   f"{row['ratio']:8.4f} {row['skill']:8.4f}")
+    print("all, pooled: every window, steady state included (training's val_skill population); a diagnostic, "
+          "not gate 1")
+    print(f"\n=== steady-state windows: absolute log10 error in dex ({abs_label}) ===")
+    if steady_overall is None:
+        print("(no steady-state windows)")
+    else:
+        print(f"{'window start (s)':<20} {'n':>6} {'model_mean':>11} {'model_p90':>11} {'persistence_mean':>17}")
+        for row in steady_by_decade + [dict(steady_overall, t_lo_s=None)]:
+            span = "all steady state" if row["t_lo_s"] is None else f"[{row['t_lo_s']:.0e}, {row['t_hi_s']:.0e})"
+            print(f"{span:<20} {row['n']:>6} {row['model_mean_dex']:11.4e} {row['model_p90_dex']:11.4e} "
+                  f"{row['persistence_mean_dex']:17.4e}")
     late = [r for r in by_decade if r["t_lo_s"] >= GATE1_LATE_START_S]
     gate1 = {
         "provisional": True, "enforced": False,
+        "population": "evolving windows only (steady-state windows are reported apart by absolute log10 error)",
         "applies": not bool(cfg["training"]["autoregressive_training"]["enabled"]),
+        "judged": overall is not None,
         "max_overall_ratio": GATE1_MAX_LOSS_RATIO, "max_decade_ratio": GATE1_MAX_DECADE_RATIO,
         "late_start_s": GATE1_LATE_START_S,
-        "overall_pass": overall["ratio"] <= GATE1_MAX_LOSS_RATIO,
+        "overall_pass": overall is not None and overall["ratio"] <= GATE1_MAX_LOSS_RATIO,
         "decades_pass": all(r["ratio"] < GATE1_MAX_DECADE_RATIO for r in by_decade),
         "late_decades_pass": all(r["ratio"] < GATE1_MAX_DECADE_RATIO for r in late),
         "failing_decades_s": [r["t_lo_s"] for r in by_decade if not r["ratio"] < GATE1_MAX_DECADE_RATIO],
     }
-    gate1["pass"] = gate1["overall_pass"] and gate1["decades_pass"]
-    if gate1["applies"]:
-        pf = {True: "PASS", False: "FAIL"}
-        print(f"gate 1 (PROVISIONAL, reported only): overall ratio {overall['ratio']:.4f} <= {GATE1_MAX_LOSS_RATIO:g}: "
-              f"{pf[gate1['overall_pass']]}")
-        print(f"gate 1: ratio < {GATE1_MAX_DECADE_RATIO:g} in every window-start decade: {pf[gate1['decades_pass']]}"
+    gate1["pass"] = gate1["judged"] and gate1["overall_pass"] and gate1["decades_pass"]
+    pf = {True: "PASS", False: "FAIL"}
+    if not gate1["applies"]:
+        print("gate 1 is the stage-1 (one-jump) gate; for this autoregressive run the tables are diagnostics")
+    elif not gate1["judged"]:
+        print(f"gate 1 (PROVISIONAL, reported only): no evolving windows in this selection, so it is not judged. "
+              f"GATE 1: {pf[False]}")
+    else:
+        print(f"\ngate 1 (PROVISIONAL, reported only; evolving windows only): overall ratio {overall['ratio']:.4f} "
+              f"<= {GATE1_MAX_LOSS_RATIO:g}: {pf[gate1['overall_pass']]}")
+        print(f"gate 1: ratio < {GATE1_MAX_DECADE_RATIO:g} in every window-start decade with evolving windows "
+              f"({len(by_decade)} decades): {pf[gate1['decades_pass']]}"
               + (f" (failing decades from {gate1['failing_decades_s']} s)" if gate1["failing_decades_s"] else ""))
         print(f"gate 1: ratio < {GATE1_MAX_DECADE_RATIO:g} in the decades from {GATE1_LATE_START_S:g} s on "
               f"({len(late)} decades): {pf[gate1['late_decades_pass']]}")
         print(f"GATE 1: {pf[gate1['pass']]}")
-        print("gate 1 is scored on all windows, steady state included (its definition); the evolving-only and "
-              "steady-state-only rows above are diagnostics")
-    else:
-        print("gate 1 is the stage-1 (one-jump) gate; for this autoregressive run the table is a diagnostic")
+        print(f"gate 1 leaves out the {n_steady} steady-state windows (no threshold; their absolute error is above)")
 
     split = EVAL_SPLIT
     curve = run_dir / f"rollout_error_curve_{split}.csv"
@@ -589,7 +638,8 @@ def main() -> None:
     per_source = run_dir / f"rollout_error_{split}_per_source.npz"
     np.savez(per_source, dex_at_report=dex_at_report, report_steps=np.asarray(report),
              rows=np.asarray(kept_rows), selection_sha256=np.asarray(selection_sha),
-             window_start_s=t_window, window_loss=m_wl, persistence_window_loss=p_wl, steady_state=steady)
+             window_start_s=t_window, window_loss=m_wl, persistence_window_loss=p_wl, steady_state=steady,
+             window_abs_log10_error=m_wd, persistence_window_abs_log10_error=p_wd)
     shards_by_file = []
     cum = 0
     for r in summary["raw_files"]:
@@ -625,12 +675,17 @@ def main() -> None:
                       "sha256_of_shard_row_list": selection_sha},
         "T": T, "K": K, "start_index": ROLLOUT_START_INDEX, "report_steps": report, "headline_steps": headline,
         "headline_dt": dt_rule,
-        "loss_vs_persistence": {"definition": loss_label, "overall": overall, "by_window_start_decade": by_decade},
+        "loss_vs_persistence": {"definition": loss_label, "population": "evolving windows (gate 1's)",
+                                "overall": overall, "by_window_start_decade": by_decade,
+                                "all_windows_pooled": pooled},
+        "steady_state_abs_log10_error": {"definition": abs_label, "overall": steady_overall,
+                                         "by_window_start_decade": steady_by_decade},
         "strata": {
             "definition": ("steady_state: the window's truth stays within max_dex of its start state, "
                            "max over the K steps and species of |log10 y_true - log10 y_start| (clipped at "
                            "epsilon) <= max_dex, so persistence is nearly exact; evolving: the other windows "
-                           "(the recommended headline); the curve CSVs and gate 1 pool all windows"),
+                           "(the recommended headline and gate 1's population); the curve CSVs pool all "
+                           "windows; steady-state windows are scored by absolute log10 error, not a ratio"),
             "max_dex": STEADY_STATE_MAX_DEX,
             **by_stratum,
         },

@@ -1,5 +1,88 @@
 # Production config decisions — evidence and justification
 
+## REVISION 2026-10-01: decided open items recorded; dt validity and species convention in the export metadata; MIT license; gate 1 on evolving windows (author decisions, theme D3)
+
+Author decisions of 2026-10-01 (open items 16, 21, 23, 24, 26, 30, the launcher part of 31, the
+recorded facts of 25, and gate 1's population). No file under src/ and no config changed, and
+the one preprocessing change is the descriptive units string, outside norm_sha256, so training
+numerics are untouched (no parity run); the smoke passed. What changed:
+- **dt validity (item 21, option (b)).** spec 4.3.10, the README opening and the export metadata
+  now say: the one-step export accepts any in-range dt per call and per row; multi-step rollouts
+  are trained and validated only at constant dt within a rollout; rollouts whose dt changes between
+  steps are unvalidated. The metadata key is `dt_validity` (testing/export.py `DT_VALIDITY`), next
+  to `units`. It is additive, so `metadata_version` stays 2 and nothing else in the contract
+  changes. dt stays stored per step (`dt_norm_mat` [N, T-1]; item 22 stays open). Before any claim
+  that coupling to a host whose dt changes every step (VULCAN) works, the planned fixed-dt
+  generator (item 5) needs a separately reported changing-dt arm. That generator must also apply
+  preprocessing's frozen-tail cut (D2 entry), so its windows come from the same valid rows as
+  training's.
+- **Species convention and helium (item 25; facts from the 2026-10-01 entries of notes.md, which
+  name the scripts).** The species are mixing ratios n_i / n_total over the whole gas of the VULCAN
+  run, untracked species included, not renormalized over the 12 tracked species (renormalizing
+  breaks the late-time equilibrium match; P in barye, T in K, t and dt in s, re-checked
+  independently twice). The training data contain no helium (He starts at the same 1e-30 floor as
+  every other untracked network species): the 12 species sum to 1 at t = 0 within 5e-16 in about
+  6,900 sampled trajectories, H2 is the largest species at t = 0 and no other exceeds 0.5, and the
+  author confirmed it. The initial-composition sampler is recovered (reproduced to 3.3e-16 on 100
+  groups): u = `np.random.RandomState(SEED).uniform(lo, 0, size=11)` with lo = -20 for run6050
+  and -25 for the other three files; the exponents go to H2O, CO, CO2, CH4, C2H2, NH3, N2, HCN, H,
+  OH, O in that order; each weight is 10^u, H2's weight is 1, the other 41 network species
+  (He included) get 1e-30, and all are normalized together. The generating chemistry is the
+  VULCAN-0D NCHO network, 52 C-H-O-N species plus inert He, 290 reversible reactions
+  (github.com/shami-EEG/VULCAN-0D at b3ccf4f). The original wrapper that ran it and wrote the HDF5
+  files is not available; a reconstruction outside the repo (`../datagen/`, unmodified VULCAN-0D
+  b3ccf4f with numpy 1.26.4, scipy 1.13.1, sympy 1.12; its README holds the settings) regenerates
+  24 of 80 sampled trajectories bit for bit from their stored t = 0 rows, and from the sampler
+  agrees to a median 3e-15 dex (max 0.025 dex) on the values VULCAN's error control resolves. The
+  published one-step paper's Section 2.1 is wrong in three places: helium was not sampled
+  (log-uniformly between 10^-1.5 and 10^-0.5, it says; confirmed wrong by the author), the network
+  has 290 reversible reactions, not about 1200, and the main-VULCAN network its footnote cites is a
+  different one (69 species); do not repeat these.
+  The `species` unit string (processing/preprocessing.py `UNITS`, written to normalization.json
+  and copied into the export metadata) now begins "mixing ratio relative to the whole gas;
+  training compositions contain no He" and no longer calls the convention inferred. Units are not
+  part of norm_sha256, so the current real build stays valid for training, but its
+  normalization.json, and every export made from it, keeps the older wording until the build is
+  rebuilt (same shards and fingerprint). Helium-bearing compositions are outside the validated
+  domain (spec 4.3.21). The mapping for a helium-bearing host is still the author's (item 25,
+  options A and B); no code implements either.
+- **AOTI (item 26).** Not run on daw; the torch.export `.pt2` is the deployment artifact. AOTI is
+  revisited with a project-wide torch >= 2.13 upgrade on its own branch, gated on parity; the
+  private-API route (b) is rejected. testing/aoti_export.py is unchanged.
+- **Precision (items 24 and 16; `precision.*` row).** fp32 end to end. The author dropped the
+  float64 export boundary (item 24 option 1); an fp32 vs fp64 test is on the author's to-do list.
+  bf16 stays guarded as today (fp32 preload, the bf16-mixed restrictions, bf16-true kept but lossy,
+  no bf16 export), pending an accuracy study.
+- **Preload cap (item 23).** 0.5 x MemAvailable stays. A loader for data larger than RAM is open;
+  its design is bound by the storage: /home is a rotational disk, poor for random access, and
+  /scratch is NVMe with a 50 GB quota.
+- **Launcher (item 31).** run_daw.sh sets `TORCHINDUCTOR_COMPILE_THREADS=1` (commit 4a134e9): the
+  2026-10-01 pilot saw inductor's compile-worker pool create POSIX semaphores on the shared RAM
+  disk. spec 0.3 and the README now say so.
+- **License (item 30).** MIT: `LICENSE` (copyright 2026 Isaac Malsky), a minimal `CITATION.cff`
+  (title, author, repository-code, license; no version, DOI or ORCID, none being recorded), the
+  pyproject `license = "MIT"` and `license-files` (PEP 639; read back by setuptools 78.1), and a
+  README License section. The archive and a README "Code and data availability" section stay open.
+- **Gate 1 on evolving windows (testing/eval_rollout_error.py).** Gate 1 pooled the steady-state
+  windows, where persistence is exact and the model/persistence ratio means nothing: the D2 smoke
+  eval printed a ratio of 3,560,039 for a decade holding one steady-state window. Gate 1's overall
+  and per-decade ratios are now judged on the evolving windows only (the D2 stratum); a decade
+  without evolving windows has no ratio. The steady-state windows are reported apart by the
+  model's absolute log10 error (per window, mean |dlog10| over species and the val_loss steps;
+  mean and p90 per window-start decade and overall, with persistence's mean beside it), with no
+  threshold. The all-window pooled ratio, the population of training's val_skill, is still printed,
+  as a diagnostic. Gate 1 stays provisional and reported only (pass/fail lines; exit status
+  unchanged). On the smoke's 3-window stage-1 sample: overall ratio 1.4011 on the 2 evolving
+  windows (1.7062 pooled), and the steady-state window shows the model at 3.6e-2 dex against
+  persistence's 1.0e-8. The JSON's `loss_vs_persistence` now holds the evolving rows (plus
+  `all_windows_pooled`), with a new `steady_state_abs_log10_error` block; `gate1` gains
+  `population` and `judged`; the per-source npz gains the per-window absolute errors.
+- **Documents.** spec 1.12 (0.3, 4.3.10, 4.3.21, 4.3.24, 4.4.5), the README, the paper plan, the
+  Validation protocol, the stale rows above (T7 units and sampler, the system.device and
+  precision rows, Element closure, the re-verification record) and the open items below: each
+  decided item is marked with its one-line decision, items 18 and 29 point at the reconstructed
+  generator, and the audit numbers stay.
+
 ## REVISION 2026-10-01: frozen raw tails cut before windowing; steady states as an evaluation stratum (author decision, theme D2)
 
 Author decision of 2026-10-01 (open item 17). It changes the training data (rebuild required;
@@ -49,8 +132,9 @@ nothing to cut (its rebuilt shards and norm_sha256 are bitwise unchanged); they 
   reported for the evolving windows (the recommended headline), the steady-state windows and all
   windows; the decade table gains a steady count, the JSON `strata`, the per-source npz
   `steady_state`. Gate 1 and the curve CSVs still pool all windows (gate 1's definition is the
-  author's). The window-start replay applies the same cut (checked on 300 cut and 300 uncut real
-  validation trajectories; without the cut it raises) and refuses a build recording another or no
+  author's; superseded 2026-10-01, D3 entry: gate 1 now judges the evolving windows only). The
+  window-start replay applies the same cut (checked on 300 cut and 300 uncut real validation
+  trajectories; without the cut it raises) and refuses a build recording another or no
   threshold. `processing/testing.py` (the window figure) applies the cut too.
 
 ## REVISION 2026-10-01: four run-contract fixes from an independent review (theme D1b)
@@ -320,8 +404,10 @@ Data side (one preprocessing change, then one real build of the 4 raw files on d
   for quota). It also validates the manifest's statistics with named errors.
 - **Manifest additions (descriptive; not part of the fingerprint).** `units` (P dyn/cm^2 (barye),
   T K, dt s, species: mixing ratios n_i / n_total over all gas of the generator run (inferred; the
-  generator config is not on daw), the training initial gas held only the tracked species, outputs
-  use the same denominator); `window_start_time_s` (earliest train window start: 0.001 s);
+  generator config is not on daw; corrected 2026-10-01: verified, untracked species included and
+  no He in the training compositions, D3 entry), the training initial gas held only the tracked
+  species, outputs use the same denominator); `window_start_time_s` (earliest train window start:
+  0.001 s);
   `coverage` (train windows per 100 K x 1 dex cell, lowest-retention cell); `species_sum` (the
   train-split distribution of the tracked-species sum per state: min 0.0253, 0.1% / 1% / 5% levels
   0.6467 / 0.9109 / 0.9877 at 1e-4 resolution, median 1.0); `std_floored` (fields whose variance
@@ -340,7 +426,9 @@ Data side (one preprocessing change, then one real build of the 4 raw files on d
   - Per file: drop_below rejects 29.2-29.4% of run10017, run10142 and run9095 but 21.5% of run6050,
     whose initial compositions come from a different distribution (audit: median trace log10 y0
     about -10.1 vs -12.6; inferred to be a different sampler setting; the raw files carry no
-    generator settings). All four files store the same grid: t=0, then 1e-3..1e8 s, 100 points.
+    generator settings; confirmed 2026-10-01: the recovered sampler draws the trace exponents from
+    [-20, 0] for run6050 and [-25, 0] for the other three files, D3 entry). All four files store
+    the same grid: t=0, then 1e-3..1e8 s, 100 points.
   - Window starts: draw 0 of every kept group is anchored at the first positive raw time (1e-3 s),
     draws 1-3 are log-uniform, so 25% of windows start at exactly 1e-3 s and 31.8% of starts fall in
     [1e-3, 1e-2) s against 6.8% per later decade. Whether to keep this weighting is the author's
@@ -366,7 +454,8 @@ Export and evaluation side (contract changes for hosts; the network is unchanged
   coverage and the lowest-retention cell, `species_sum`, `norm_sha256`, the checkpoint's sha256,
   weights source, epoch, step and score, the training TF32 setting, the Lightning version and the
   export code's git commit; `cuda_visible_devices` is removed (slot-dependent; the external VULCAN
-  loader reading it is unverified, author to confirm). `format` is unchanged.
+  loader reading it is unverified, author to confirm). `format` is unchanged. (2026-10-01, D3: the
+  additive key `dt_validity` and a reworded `units.species`; still version 2.)
 - **Export contract.** The run is `paths.work_dir` of `AUTOCHEM_CONFIG_PATH`'s config (no edited
   RUN_DIR; one resolver, testing/run_dir.py, for every testing tool); it must hold COMPLETED and its
   checkpoint must carry the processed data's norm_sha256; every requested device must be available
@@ -703,9 +792,9 @@ Rows whose own text does not support their label carry a bracketed "[rubric: ...
 | `training.early_stopping.min_delta` with ES `patience`, plateau `patience` / `threshold` | min_delta 0.0 (REVISED 2026-09-30, was 1e-5); ES patience 30 / 12; plateau patience 15 / 5 (stage 2: recipe R, 2026-10-01; were 20 / 10), threshold 1e-3 / 1e-4 relative (`threshold_mode` "rel", a named constant in trainer.py) | ES and the plateau observe the same epochs: both ignore the LR warmup and the curriculum ramp and start counting at the first epoch after both (warmup-era epochs stay eligible for best.ckpt). With min_delta 0 every plateau improvement is also a new ES best, and plateau patience + 1 < ES patience (16 < 30, 6 < 12), so once counting has started ES cannot stop before an LR halving. Before, stage 1 could stop at peak LR with zero LR cuts (audit harness, constructed curves with the best inside the warmup: stopped at epochs 35 and 54; with T1 neither stops). Under steady slow improvement `max_epochs` (400 / 120) becomes the binding budget and the relative thresholds decide whether slow progress cuts the LR; tuning them is the author's. The alternative (both monitors keep the warmup-era best, R3-007 option A) was rejected by the author on 2026-10-01 (open item 10). Checked with the real classes on CPU (scripted val_loss, 2026-10-01): stage 1 counts from epoch 29 (stall: cut 45, stop 59); stage 2 under recipe R from epoch 16 (stall: cuts 22 and 28, stop 28; slow steady progress: 11 cuts, the last at epoch 82). A pre-fix run cannot be resumed with these values (the resume config check refuses changed keys). | inherited (min_delta and the shared window: audit) |
 | stage-2 `val_loss` definition (added 2026-10-01, audit R1-034) | K = rollout_steps, steps ≥ skip_steps, uniform | Stage-2 val_loss (hence best.ckpt, early stopping and the plateau) averages the open-loop steps after the skip (steps 1..K−1 at skip 1): the first step from a true state is neither trained nor directly monitored. It is comparable across γ, not across skip_steps. Stage-1 best.ckpt (the handoff and the paper's one-step baseline) is chosen by one-step val, which the sandbox found to correlate only ρ = 0.41 with rollout error. Changing the selection rule is the author's (open items). | n/a (definition) |
 | `runtime.accelerator` / `runtime.devices` | "cuda" / 1 (REVISED 2026-09-30, were "auto") | Explicit single device: "auto" falls back to CPU silently and Lightning's "gpu" alias tries MPS first; a CUDA request with no visible GPU now fails at startup. The launcher picks the GPU with CUDA_VISIBLE_DEVICES (devices=1 means visible index 0). Multi-GPU/DDP is unsupported. | n/a |
-| `system.device` / `training.pin_memory` | "cpu" / true | Every split is preloaded into host RAM (a CUDA preload would put the whole dataset in GPU memory) and batches are pinned for the copy; pin_memory=true with a CUDA preload is rejected. Window indices come from a CPU generator, so the window sequence does not depend on the preload device. Preload budget: a host preload (train + validation, sized from the shard headers) larger than 0.5 × MemAvailable fails at startup instead of being OOM-killed while filling (`_PRELOAD_MAX_FRACTION_OF_MEM_AVAILABLE` in src/main.py, not a config key). MemAvailable is a snapshot on a shared host, not a guarantee. The 0.5 is pending the author: at ~785 GB MemAvailable (daw, T1 smoke log) it caps the preload at ~393 GB, below the ~481 GB the audit infers for all 160 raw files, so a full-data run would be refused today. | decision pending (the fraction) |
+| `system.device` / `training.pin_memory` | "cpu" / true | Every split is preloaded into host RAM (a CUDA preload would put the whole dataset in GPU memory) and batches are pinned for the copy; pin_memory=true with a CUDA preload is rejected. Window indices come from a CPU generator, so the window sequence does not depend on the preload device. Preload budget: a host preload (train + validation, sized from the shard headers) larger than 0.5 × MemAvailable fails at startup instead of being OOM-killed while filling (`_PRELOAD_MAX_FRACTION_OF_MEM_AVAILABLE` in src/main.py, not a config key). MemAvailable is a snapshot on a shared host, not a guarantee. The 0.5 was kept by the author on 2026-10-01 (open item 23): at ~785 GB MemAvailable (daw, T1 smoke log) it caps the preload at ~393 GB, below the ~481 GB the audit infers for all 160 raw files, so a full-data run would be refused today, and data larger than RAM has no loading path (open). | decision (2026-10-01) |
 | `runtime.gradient_clip_val` / `runtime.log_grad_norm` | 1.0 / false | Clip 1.0 is a template value (the v3 reference did not clip; see the Inherited / unjustified table); under AdamW, clipping reweights batches, it does not lower the LR. null is the only "no clipping" value (0 and negatives are rejected). `log_grad_norm` (a required key since 2026-09-30) logs per epoch the mean pre-clip total gradient norm (`grad_norm`) and the fraction of steps where clipping fired (`grad_clip_frac`), in both stages, summed on the GPU. | inherited |
-| `precision.*` | float32, amp_mode "true" | The preload is always float32 (`precision.preload_dtype` removed 2026-09-30: bf16 storage moved states by a median 3.1e-3 dex in the audit, above the ~7e-4 target). loss_dtype must be float32 or float64. Under amp_mode "mixed", model_dtype and input_dtype must be float32 and `model.predict_delta` true: a bf16 input, or a whole next state coming out of the bf16 trunk, would carry the rollout state at bf16 resolution. Under autocast the input block and the delta head run in fp32 (fp32 and bf16-true runs are unchanged); bf16-mixed with fused AdamW and clipping trains. bf16-true is kept but lossy: the rollout state is carried in bf16 (on real trajectories a bf16 state cannot absorb 81.6% of the nonzero true per-step changes, audit R4-025). amp_mode "true" means Lightning's `*-true` precision, i.e. no autocast (32-true here; forced for float32/float64 compute; bf16 + "true" is pure bf16); only "mixed" enables autocast, and TF32 is the separate `precision.allow_tf32` key, so the run log's `amp=true` never means AMP or TF32 (added 2026-10-01, audit R2-013). Replacing amp_mode with an explicit Lightning precision string (keeping the dtype cross-checks) is the author's decision. | decision (float32 default) |
+| `precision.*` | float32, amp_mode "true" | The preload is always float32 (`precision.preload_dtype` removed 2026-09-30: bf16 storage moved states by a median 3.1e-3 dex in the audit, above the ~7e-4 target). loss_dtype must be float32 or float64. Under amp_mode "mixed", model_dtype and input_dtype must be float32 and `model.predict_delta` true: a bf16 input, or a whole next state coming out of the bf16 trunk, would carry the rollout state at bf16 resolution. Under autocast the input block and the delta head run in fp32 (fp32 and bf16-true runs are unchanged); bf16-mixed with fused AdamW and clipping trains. bf16-true is kept but lossy: the rollout state is carried in bf16 (on real trajectories a bf16 state cannot absorb 81.6% of the nonzero true per-step changes, audit R4-025). amp_mode "true" means Lightning's `*-true` precision, i.e. no autocast (32-true here; forced for float32/float64 compute; bf16 + "true" is pure bf16); only "mixed" enables autocast, and TF32 is the separate `precision.allow_tf32` key, so the run log's `amp=true` never means AMP or TF32 (added 2026-10-01, audit R2-013). Replacing amp_mode with an explicit Lightning precision string (keeping the dtype cross-checks) is the author's decision. Decided 2026-10-01 (author; open items 16 and 24): fp32 end to end, the float64 export boundary dropped; bf16 stays guarded as above, pending an accuracy study. | decision (float32 end to end, 2026-10-01) |
 | `testing/export.py` `B_MAX` (code constant) | 16384 | The largest batch the export accepts. Inherited with no recorded rationale; kept pending the host envelope (Canoe's per-rank cell count is unknown). The alternative is to drop the cap (`Dim("B", min=1)`, verified bit-identical to eager at B = 65536 by the audit). The .pt2 raises above it (torch.export input constraints); the AOTI package does not check B, its host guard (`_check_step_inputs`) does, and with `AOTI_RUNTIME_CHECK_INPUTS=1` its compiled check would also reject B = 1 (audit). The export gate checks B = 1, 7 and B_MAX and that B_MAX + 1 is refused. | decision pending (the cap) |
 | `preprocessing.drop_below` | 1e-30 (= normalization.epsilon) | `drop_below >= epsilon` is required (2026-09-30): every kept raw value is then >= epsilon, so the epsilon floors in the log transforms never change a kept value. | n/a (contract) |
 | **rejected: input-noise injection** | not shipped | **E6**: 4/4 noise runs worse, 3/4 catastrophic at fixed-dt (12.4–14.1 dex; σ ∈ {0.01, 0.03} z-space, with and without pushforward, 2 seeds) — *against* the GNS/Stachenfeld prior. No trainer option added. If ever revisited, sweep σ ≤ 1e-3 and re-test. | high (locally decisive) [rubric: below high, 2 seeds, against the literature prior] |
@@ -924,9 +1013,14 @@ pinned CPU threads and one RTX 6000 Ada. Tools: ruff 0.16.9, pyflakes, vulture.
   synthetic and real-data subsets (T6, T1, T5, T9) and one real 4-file build (T7); export
   equivalence and the export gate on CPU and CUDA (T6, T1, T7, T5); bf16-mixed with fused AdamW
   and clipping trains (T1).
-- Not run on daw: AOTI compile and load (torch 2.8 extracts packages into the shared system temp
-  dir; the Python flow ran with compile and load stubbed); any full or real-data training run;
-  mini-chem timing.
+- Author-decision commits (2026-10-01): T2 follow-up 4a134e9 (launcher), D1 c5fab3d and b5488dd,
+  D1b 55c75d3, D2 446aeeb (their checks are in their revision entries above) and D3 (documents,
+  export metadata, license, gate-1 population; no src/ or config change, so the smoke, the reloaded
+  export metadata, the evaluation on the smoke exports and the static checks, without a parity
+  run).
+- Not run on daw: AOTI compile and load (by decision since 2026-10-01, open item 26; torch 2.8
+  extracts packages into the shared system temp dir; the Python flow ran with compile and load
+  stubbed); any full or real-data training run; mini-chem timing.
 Future entries record the commit hash, the tool versions and the rule sets.
 
 ## Element closure of the 12 tracked species (added 2026-10-01, audit R1-014, R4-007)
@@ -935,7 +1029,10 @@ The 12 species sum to 1 at t = 0, but the sum falls below 0.99 at some t > 0 in 
 groups (19.8% at 300–600 K); the t_end deficit reaches p99 0.092 and max 0.94; element ratios drift
 (C/H p90 21%, N/H 39%); groups rejected by drop_below close worse (the sum falls below 0.99 in
 14.7% of them vs 10.6% of kept groups). The raw files cannot tell untracked species from solver
-non-conservation (the generator config is not on daw). Hence:
+non-conservation (the generator config is not on daw). (Updated 2026-10-01: the generating
+chemistry is now identified as the VULCAN-0D NCHO network, whose mixing ratios are over all gas
+species, so a falling 12-species sum is consistent with untracked species forming; the original
+wrapper is not available, and a reconstruction is in `../datagen/`; D3 entry.) Hence:
 - production must not renormalize the model's outputs or project them onto the simplex, and a
   stoichiometric output layer cannot enforce 12-species element conservation, because the
   reference data violate it;
@@ -980,14 +1077,19 @@ The three gates are the author's (2026-06-09). Audit corrections and open points
 (2026-10-01). The runs happen on daw through run_daw.sh (the HPC route is retired).
 
 1. Stage-1: **skill against persistence (PROVISIONAL, author 2026-10-01; revisit after the first
-   trained model)**. Pass if, overall, the model's loss is at most 0.5 × persistence's, and it is
-   below persistence's (ratio < 1) in every window-start decade, especially from 1e3 s on. The loss is
-   the run's val_loss definition; persistence is y_next = y. Reported by
+   trained model)**. Pass if, on the evolving windows, the model's loss is at most 0.5 ×
+   persistence's overall, and below persistence's (ratio < 1) in every window-start decade that has
+   evolving windows, especially from 1e3 s on. Since 2026-10-01 (D3) the steady-state windows (the
+   D2 stratum: truth within 1e-3 dex of the start state at every step and species), where
+   persistence is nearly exact and the ratio meaningless, are left out of both ratios and reported
+   apart by the model's absolute log10 error, with no threshold. The loss is the run's val_loss
+   definition; persistence is y_next = y. Reported by
    `testing/eval_rollout_error.py` as pass/fail lines (constants `GATE1_MAX_LOSS_RATIO`,
    `GATE1_MAX_DECADE_RATIO`, `GATE1_LATE_START_S`), never enforced by training or by the exit
    status. Training logs the same comparison per epoch as diagnostics (`val_persistence_loss`,
-   `val_skill` in metrics.csv and init_val.json). Replaces the earlier gate "val one-jump loss ≤ v3
-   reference (~7e-4)", whose **reference is not comparable (spec 6.7)**: ~7e-4 is v3's first
+   `val_skill` in metrics.csv and init_val.json), pooled over all validation windows, steady state
+   included (the eval prints that pooled ratio too, as a diagnostic). Replaces the earlier gate
+   "val one-jump loss ≤ v3 reference (~7e-4)", whose **reference is not comparable (spec 6.7)**: ~7e-4 is v3's first
    crossing (epoch 45); v3's recorded minimum is 4.03e-4 (epoch 207), on other data and validation
    windows ("Where the evidence is"); persistence scores 0.0112 on the stage-1 validation
    definition, about 16× that threshold (open item 2). The interpolation floor limits what the gate
@@ -1017,9 +1119,11 @@ The three gates are the author's (2026-06-09). Audit corrections and open points
    export's out-of-range NaN rule would flag only about 10% of Pa-for-barye inputs (estimate,
 assuming log10 P uniform over the trained 1 to 1e10 barye; the real P distribution was not used). The
    sibling repo shipped this error once (fixed in its eb122d0). Which side converts is not stated
-   until Canoe-Chem's native pressure unit is checked. Species inputs: the host's mixing ratios
-   (VULCAN normalizes over all species, He included) are not the training convention (spec 4.3);
-   pass-through vs renormalizing the 12 species is an OPEN decision (open items).
+   until Canoe-Chem's native pressure unit is checked. Species inputs (updated 2026-10-01): the
+   training convention is the mixing ratio relative to the whole gas, with no He in the training
+   compositions (spec 4.3.21); a He-free host's ratios are passed through, and renormalizing the
+   12 species is rejected. For a He-bearing host (VULCAN normalizes over all species, He
+   included) the mapping is an OPEN author decision between options A and B (open item 25).
 
 ## Open items for the author (audit 2026-09-29; recorded 2026-10-01)
 
@@ -1044,7 +1148,9 @@ exists, the audit's recommendation. Items already recorded in a row above are po
    and a loss-ratio and skill table by window-start decade, and reports gate 1 (gate 1 under
    "Validation protocol": ratio ≤ 0.5 overall, < 1 in every decade). Revisit the thresholds after
    the first trained model. Unverified audit point (R9-012): persistence may already meet a
-   stage-2 target for late starts; the eval's persistence rows now show it.
+   stage-2 target for late starts; the eval's persistence rows now show it. **2026-10-01 (D3)**: the
+   ratios are judged on the evolving windows only; steady-state windows are reported apart by
+   absolute log10 error.
 3. Selection metric (R1-034; row "stage-2 val_loss definition"). Recommendation: one
    behaviour-neutral diagnostic val_loss over all K steps when skip > 0. If rollout re-ranking is
    wanted: a second, monitor-free ModelCheckpoint every N epochs (about 0.61 GB per full
@@ -1059,8 +1165,10 @@ exists, the audit's recommendation. Items already recorded in a row above are po
    75.8 MFLOP per cell-step: (a) 3.6e16 FLOP, (b) 2.3e16 FLOP, estimates; ask before running).
    Until then, qualify "Stable Long-Horizon" and "GCM-deployable" to the tested horizon. A
    drift-rate bound would be a new acceptance threshold (spec 6.3).
-5. Fixed-dt evaluation generator (R1-043): not implemented. It must start at k ≥ 1 (T7 entry);
-   whether it also gets a changing-dt arm is item 21.
+5. Fixed-dt evaluation generator (R1-043): not implemented. It must start at k ≥ 1 (T7 entry) and
+   apply preprocessing's frozen-tail cut (D2 entry). **2026-10-01 (item 21)**: it needs a separately
+   reported changing-dt arm before any claim that coupling to a host whose dt changes every step
+   (VULCAN) works.
 6. Headline confounds (R1-009). The stage-1 vs stage-2 comparison also changes lambda_z_mse
    0.1 → 0.25, adds up to 120 epochs (recipe R) with a fresh 1-epoch warmup to min(3e-5, the stage-1
    checkpoint's LR), and uses one seed (1234).
@@ -1116,7 +1224,8 @@ exists, the audit's recommendation. Items already recorded in a row above are po
 16. bf16-true (R4-025; precision row): kept per policy but lossy (rollout state in bf16).
     Alternatives: reject compute bf16 with amp_mode "true", or collapse precision to float32 +
     allow_tf32. bf16-mixed is about 47% faster (audit efficiency study) but its accuracy is
-    untested; float32 stays the default.
+    untested; float32 stays the default. **Decided 2026-10-01 (author)**: fp32 end to end; bf16
+    stays guarded as today, pending an accuracy study.
 
 **Data**
 17. Frozen raw tails (R2-006): 326,167 of 649,084 kept groups (50.25%) end in bitwise-constant tails
@@ -1143,27 +1252,36 @@ exists, the audit's recommendation. Items already recorded in a row above are po
     differences −0.29 / −0.24 vs +0.13, a noise signature); 53.8% of kept groups and 4.4% of kept
     values sit below 1e-20 (O 15.2%, C2H2 11.2%). Recommendation: recover the VULCAN-0D generator
     config and have the evaluation report error separately outside solver control (thresholds as
-    named constants); no loss change.
+    named constants); no loss change. (2026-10-01: the reconstruction in `../datagen/` runs
+    VULCAN-0D b3ccf4f with its stock tolerances, rtol 0.05 and atol 1e-2, and records the settings
+    that differ in its README; D3 entry.)
 19. T7 entry items: the drop_below bias (reweighting, a per-cell gate or a composition-aware
     out-of-distribution flag); the window-start weighting (25% of windows start at exactly
     1e-3 s); training never sees t = 0 (a fixed-dt generator must start at k ≥ 1).
 20. Split key (R3-015(b)): keying the split on the group name alone (rename-proof) re-splits
     304,702 of 896,000 groups (34.0%), changes N_train/N_val, and forces a second real build,
     re-derived epoch counts and new parity references.
-21. dt schedule within a rollout (R4-012): spec 4.3.10 makes variable per-step dt mandatory, but
-    every trained, validated and evaluated rollout keeps one dt. Options: (a) give the planned
-    fixed-dt generator a separately reported changing-dt arm (piecewise-constant or alternating
-    in-range dt; truth from the same log-log interpolation at cumulative times) and keep dt stored
-    as [N, T-1]; or (b) reword spec 4.3.10 and README lines 4-6 to "the one-step export accepts any
+21. dt schedule within a rollout (R4-012): spec 4.3.10 made variable per-step dt mandatory (until
+    2026-10-01), but every trained, validated and evaluated rollout keeps one dt. Options: (a) give
+    the planned fixed-dt generator a separately reported changing-dt arm (piecewise-constant or
+    alternating in-range dt; truth from the same log-log interpolation at cumulative times) and
+    keep dt stored as [N, T-1]; or (b) reword spec 4.3.10 and README lines 4-6 to "the one-step export accepts any
     in-range dt per call and per row; multi-step rollouts are trained and validated only at
     constant dt within a rollout; rollouts whose dt changes between steps are unvalidated", and
-    put the same sentence in the export metadata next to the units.
+    put the same sentence in the export metadata next to the units. **Decided 2026-10-01 (author):
+    (b)**, implemented (D3: spec 4.3.10, README, metadata `dt_validity`); dt stays stored per step,
+    and a changing-dt arm for the planned generator (item 5) is needed before claiming coupling to
+    VULCAN, whose dt changes every step.
 22. Per-window dt storage (R2-028): dt is one value repeated 99 times per window, 7.61% of shard
     bytes and of the train+validation preload (about 0.9 GB of about 12 GB on the 4 files;
     22–37 GB at the inferred full scale); a per-window [N] buffer saves 7.53%. It waits on item 21:
-    keep [N, T-1] if changing-dt windows are planned.
+    keep [N, T-1] if changing-dt windows are planned. Still open (2026-10-01): item 21 is decided as
+    (b), and dt stays stored per step.
 23. Preload budget (R1-023; system.device row): 0.5 × MemAvailable would refuse a full 160-file
     preload today (~393 GB cap vs ~481 GB inferred), and data larger than RAM has no loading path.
+    **Decided 2026-10-01 (author)**: keep 0.5 × MemAvailable. Open: a loader for data larger than
+    RAM; its design depends on the storage (/home is a rotational disk, poor for random access;
+    /scratch is NVMe with a 50 GB quota).
 
 **Numerics and deployment**
 24. float32 host state (R1-046 with R3-003). Floors: the float32 half-ulp of log10 y is 6e-8 to
@@ -1183,22 +1301,44 @@ exists, the audit's recommendation. Items already recorded in a row above are po
     0.002%; sub-cycling to dt = N × 6.4 s is a host-side mitigation. Option (1) alone is therefore
     not a fix: every working option needs a float64 host state and the residual add outside the
     float32 network (option (1)'s hook). Float64 training deltas would need both float32 casts in
-    preprocessing removed, at 2× temp-shard disk.
+    preprocessing removed, at 2× temp-shard disk. **Decided 2026-10-01 (author)**: fp32 end to end;
+    the float64 export boundary (option (1)) is dropped; an fp32 vs fp64 test is on the author's
+    to-do list.
 25. Host species convention (R3-008): the export takes mixing ratios in the training convention
     (spec 4.3), while VULCAN normalizes over all species, He included. A real He-bearing column
     (HD209, 69 species) gives a 12-species sum of 0.857 (x_He 0.143) with H2 99.8% of it; that
-    combined state is 2.8e-5 of training states, against 27.4% for the He-free equivalent. OPEN:
-    pass the host's ratios through, or renormalize the 12 species to sum 1 (which counts the He as
-    reactive gas). History: commit 43a539b (2026-03-23) replaced testing/vulcan.py, which
+    combined state is 2.8e-5 of training states, against 27.4% for the He-free equivalent. OPEN
+    (until 2026-10-01; see below): pass the host's ratios through, or renormalize the 12 species
+    to sum 1 (which counts the He as reactive gas). History: commit 43a539b (2026-03-23) replaced testing/vulcan.py, which
     renormalized, by aoti_export.py's pass-through with no note, so copy neither from old code.
     Recommendation: gate any host coupling on a He-bearing VULCAN-0D box compared against truth
-    under both conventions.
+    under both conventions. **Recorded 2026-10-01 (author; facts in the D3 entry)**: the species
+    are mixing ratios over the whole gas of the VULCAN run, untracked species included, not
+    renormalized over the 12; the training data contain no He; the generating chemistry is the
+    VULCAN-0D NCHO network (52 C-H-O-N species plus inert He); the paper's Section 2.1 helium
+    sentence is wrong. A He-free host passes its mixing ratios through (the training convention);
+    renormalizing the 12 species to sum 1 is rejected (it is not the training convention, under
+    which renormalizing breaks the late-time equilibrium match, and it counts He as reactive gas).
+    He-bearing compositions are outside the validated domain (spec 4.3.21). **Still OPEN (author):
+    the mapping for a He-bearing host**, not implemented in code:
+    (A) pass the host's mixing ratios and total P unchanged: no mapping, and the reactive number
+    densities and the collider density are the host's; but the 12 species then sum to about
+    1 − x_He at a fresh composition (0.857 for the HD209 column), a state the training data
+    almost never hold (2.8e-5 of training states, above), so the input is out of distribution.
+    (B) divide each species by all non-He gas (not by the 12-species sum), pass P × (1 − x_He) and
+    scale the outputs back by the non-He fraction: the inputs look like training states and the
+    reactive number densities are unchanged at that instant, but the third-body density M is low by
+    the He fraction (about 14% at x_He = 0.14 for low-pressure three-body rates, less in the falloff
+    regime). Neither is exact; the exact fix is training data with He.
 26. AOTI on daw (R3-009): torch 2.8 extracts each loaded AOTI package (about 152 MB at production
     size) into a hard-coded directory under the root temp dir whatever TMPDIR says, and a killed
     run leaves it there. Routes: (a) torch ≥ 2.13, whose loader honours TMPDIR (conflicts with the
     torch 2.8.* pin: a whole-project upgrade gated on parity); or (b) stay on 2.8 with a zipfile
     extract into TMPDIR plus a private runner API confined to aoti_export.py. Until one is chosen,
-    aoti_export.py is not run on daw.
+    aoti_export.py is not run on daw. **Decided 2026-10-01 (author)**: not run on daw; the
+    torch.export `.pt2` is the deployment artifact; AOTI is revisited with a project-wide
+    torch ≥ 2.13 upgrade on its own branch, gated on parity; route (b), the private API, is
+    rejected.
 27. Export details (T7 and T5 entries): B_MAX = 16384 or no cap (per-key row); MATCH_MAX_DLOG10 and
     EXPORT_PARITY_RTOL to re-check on the first trained model; DEPLOY_BATCH_SIZES = (150,)
     unconfirmed for the VULCAN-0D reference and Canoe; `cuda_visible_devices` was removed from the
@@ -1213,21 +1353,27 @@ exists, the audit's recommendation. Items already recorded in a row above are po
 29. Evidence recovery (R1-010, R2-014): before the old machine is retired, recover EXPERIMENTS.md,
     IMPLEMENTATION_PLAN.md, Robertson_Tests (runs_f*, runs_l*, figures_l1), the mini_chem source
     with bench_dlsode.f90 and bench*.nml, models/v3 (export, config, bench_speedup.csv), models/0,
-    Chemulator_ApJ and the VULCAN-0D generator config. Version small text evidence (docs/evidence/
+    Chemulator_ApJ and the VULCAN-0D generator config (reconstructed 2026-10-01 in `../datagen/`,
+    D3 entry; the original wrapper is not available). Version small text evidence (docs/evidence/
     or an evidence repo); archive binaries and run dirs under a DOI with their location recorded.
 30. License and availability (R2-012): the repo has no LICENSE or CITATION.cff; its GitHub copy is
     public (imalsky/Autoregressive-Chemulator, main = b4760b8 when audited), so others have no reuse
     grant (default copyright); the sibling repo is MIT. Recommendation, after the author picks a
     license: LICENSE, pyproject `license` / `license-files`, a CITATION.cff, and a README "Code and
     data availability" section (which raw files back the paper; where the raw files, both best.ckpt
-    and the exported .pt2 will be archived). The AAS policy only recommends a license.
+    and the exported .pt2 will be archived). The AAS policy only recommends a license. **Decided
+    2026-10-01 (author), implemented (D3)**: MIT; LICENSE (copyright 2026 Isaac Malsky), a minimal
+    CITATION.cff (no version, DOI or ORCID), pyproject `license` / `license-files` and a README
+    License section. Still open: the archive and the README "Code and data availability" section.
 31. Process and unverified points: spec 8.4 ("tests are a non-goal") is the author's to rewrite
     (R9-023); whether run_daw.sh should set TORCHINDUCTOR_COMPILE_THREADS=1 (reported, unverified,
-    to avoid transient semaphores on the shared RAM disk; R9-032). Further R9 gap-round points
-    whose verifiers did not finish are unverified, among them the fullgraph/dynamic compile
-    defaults (R9-011), dropping the unused "standard"/"log-standard" normalization methods
-    (R9-021), a restricted unpickler for .vul inputs (R9-035), and removing the curriculum-off,
-    skip-0 and scheduler-off arms (R9-034).
+    to avoid transient semaphores on the shared RAM disk; R9-032; **decided 2026-10-01, implemented
+    in 4a134e9**: run_daw.sh sets it, after the 2026-10-01 pilot saw inductor's compile-worker pool
+    create POSIX semaphores on the shared RAM disk; the rest of this item stays open). Further R9
+    gap-round points whose verifiers did not finish are unverified, among them the
+    fullgraph/dynamic compile defaults (R9-011), dropping the unused "standard"/"log-standard"
+    normalization methods (R9-021), a restricted unpickler for .vul inputs (R9-035), and removing
+    the curriculum-off, skip-0 and scheduler-off arms (R9-034).
 
 ## Key citations (checked against primary sources 2026-06-09; the List et al. entry was re-checked against arXiv v1 and v2 by the 2026-09 audit and corrected 2026-10-01; the others were not re-checked)
 

@@ -3,6 +3,8 @@ name = "auto-chem"
 version = "1.7.0"
 description = "Autoregressive flow-map neural emulator for stiff chemical kinetics in exoplanet atmospheres."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 # Minor-series bounds only: requirements.lock (the daw venv freeze, torch 2.8.0+cu126 by wheel URL)
 # is the reproducibility source: uv venv --python 3.12.14 && uv pip sync requirements.lock

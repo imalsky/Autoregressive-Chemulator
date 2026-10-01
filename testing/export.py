@@ -13,11 +13,14 @@ Exported module signature (PHYSICAL units, the training data's units; metadata '
   y_next = model(y_phys, dt_seconds, g_phys)
 
 Where:
-  y_phys     : [B, S]  species mixing ratios (n_i / n_total over all gas of the generator run; the
-                       training initial gas held only the tracked species, so they sum to 1 at t=0 and
-                       at most 1 later; metadata 'species_sum'); values <= epsilon are floored at epsilon
-                       before log10; species are not range-checked
-  dt_seconds : [B]     time step in s
+  y_phys     : [B, S]  species mixing ratios relative to the whole gas (n_i / n_total over all gas of
+                       the generator run, untracked species included, not renormalized over the tracked
+                       species); training compositions contain no He, so He-bearing compositions are
+                       outside the validated domain; the training initial gas held only the tracked
+                       species, so they sum to 1 at t=0 and at most 1 later (metadata 'species_sum');
+                       values <= epsilon are floored at epsilon before log10; species are not range-checked
+  dt_seconds : [B]     time step in s; any in-range dt per call and per row (metadata 'dt_validity':
+                       multi-step rollouts are validated only at constant dt within a rollout)
   g_phys     : [B, G]  G = 2 mandatory: P in dyn/cm^2 (barye), T in K
 
 Output:
@@ -118,8 +121,17 @@ EXPORT_PARITY_RTOL = 1e-6
 # a fraction of each input's normalized range; absorbs the float32 round trip at the exact edges.
 OOR_TOL = 1e-6
 # metadata_version 2 (2026-09-30): units, trained box and NaN-row policy, fingerprints and
-# provenance added; cuda_visible_devices removed. 'format' is unchanged.
+# provenance added; cuda_visible_devices removed. 'format' is unchanged. 2026-10-01: the additive key
+# 'dt_validity' (DT_VALIDITY) and the reworded units 'species' string (processing/preprocessing.py
+# UNITS, copied from the build's normalization.json, so a build made before 2026-10-01 still carries
+# the older wording); no key removed or changed in meaning, so the version stays 2.
 METADATA_VERSION = 2
+# What the one-step export's dt input is validated for (docs/DECISIONS.md open item 21, decision (b)).
+DT_VALIDITY = (
+    "the one-step export accepts any in-range dt per call and per row; multi-step rollouts are "
+    "trained and validated only at constant dt within a rollout; rollouts whose dt changes between "
+    "steps are unvalidated"
+)
 
 # Checkpoint state-dict key prefixes (FlowMapRolloutModule): the network under "model.", the
 # training-only loss buffers under "criterion." (dropped).
@@ -1037,6 +1049,7 @@ def build_export(
         "species_variables": list(species_vars),
         "global_variables": list(global_vars),
         "units": manifest["units"],
+        "dt_validity": DT_VALIDITY,
         "normalization_methods": dict(manifest["normalization_methods"]),
         "per_key_stats": manifest["per_key_stats"],
         "epsilon": float(manifest["epsilon"]),

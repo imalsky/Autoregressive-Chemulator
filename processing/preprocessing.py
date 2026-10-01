@@ -134,17 +134,20 @@ log = logging.getLogger(__name__)
 # imports nothing from src/, so it keeps its own copy of src/model.py:_REQUIRED_GLOBALS.
 _REQUIRED_GLOBALS: Tuple[str, str] = ("P", "T")
 # Physical units of the raw inputs, written to normalization.json. The raw files carry no unit
-# attributes and preprocessing applies no conversion, so these declare the VULCAN source's units.
+# attributes and preprocessing applies no conversion, so these declare the VULCAN source's units
+# (re-checked 2026-10-01; species convention and helium: docs/DECISIONS.md open item 25).
 UNITS: Dict[str, str] = {
     "P": "dyn/cm^2 (barye)",
     "T": "K",
     "dt": "s",
     "time": "s (since the raw t=0)",
     "species": (
-        "mixing ratio y_i = n_i / n_total over all gas species of the generator run (inferred; the "
-        "generator config is not on daw); the training initial gas held only the tracked species "
-        "(their sum is 1 at t=0 and at most 1 afterwards; train-split distribution of the sum: "
-        "normalization.json species_sum); model outputs use the same denominator"
+        "mixing ratio relative to the whole gas; training compositions contain no He: y_i = n_i / "
+        "n_total over all gas species of the generator run, untracked species included, not "
+        "renormalized over the tracked species; the training initial gas held only the tracked "
+        "species (their sum is 1 at t=0 and at most 1 afterwards; train-split distribution of the "
+        "sum: normalization.json species_sum); He-bearing compositions are outside the validated "
+        "domain; model outputs use the same denominator"
     ),
 }
 # Split membership: a fixed constant, not preprocessing.seed, so a sampling replicate (another
