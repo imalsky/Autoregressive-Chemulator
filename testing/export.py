@@ -9,16 +9,24 @@ Goal:
 - Support dynamic batch size B (shape-polymorphic) for all inputs.
 - Intended for inference: model is exported in eval() mode with gradients disabled.
 
-Exported module signature (PHYSICAL units):
+Exported module signature (PHYSICAL units, the training data's units; metadata 'units'):
   y_next = model(y_phys, dt_seconds, g_phys)
 
 Where:
-  y_phys     : [B, S]  (positive; values are clamped to epsilon before log10)
-  dt_seconds : [B]     (positive; clamped to epsilon before log10)
-  g_phys     : [B, G]  (G = 2 mandatory: P, T)
+  y_phys     : [B, S]  species mixing ratios (n_i / n_total over all gas of the generator run; the
+                       training initial gas held only the tracked species, so they sum to 1 at t=0 and
+                       at most 1 later; metadata 'species_sum'); values <= epsilon are floored at epsilon
+                       before log10; species are not range-checked
+  dt_seconds : [B]     time step in s
+  g_phys     : [B, G]  G = 2 mandatory: P in dyn/cm^2 (barye), T in K
 
 Output:
-  y_next_phys: [B, S]
+  y_next_phys: [B, S]  same denominator as the input; neither clipped nor renormalized
+
+Out-of-range rows (metadata oor_policy 'nan_row'): a row whose dt, P or T lies outside the train-split
+range recorded in the metadata ('oor_box', in the normalizer's coordinate: log10 for dt and log-*
+methods) by more than OOR_TOL of the range, or whose inputs are not finite, comes back as NaN in
+every species. A NaN row means only that; in-range rows are computed exactly as without the guard.
 
 Saved .pt2 includes an embedded JSON metadata blob via torch.export.save(extra_files=...).
 Read it back with:
@@ -26,13 +34,19 @@ Read it back with:
   ep = torch.export.load("...pt2", extra_files=extra)
   meta = json.loads(extra["metadata.json"])
 
-Default behavior:
-- Try to export CPU and CUDA via `EXPORT_DEVICES = "cpu,cuda"`.
-- Any unavailable target is skipped.
-- If all requested accelerator targets are unavailable, CPU export is used.
+Run (the run directory is paths.work_dir of the config; it must hold COMPLETED, i.e. a finished run):
+  AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u testing/export.py
 
-Typical usage:
-  python -u testing/export.py
+Behavior:
+- Exports every target in EXPORT_DEVICES ("cpu,cuda"); a requested target that is not available is
+  an error (set EXPORT_DEVICES = "cpu" to export CPU only), so a stale artifact is never left
+  silently next to a fresh one.
+- Each artifact is gated before it reaches its final name: written under .partial/, reloaded, and
+  checked on its export device against the eager wrapper (in-range rows finite and equal within
+  EXPORT_PARITY_RTOL, out-of-range rows NaN), then renamed into place.
+- The checkpoint's normalization fingerprint (norm_sha256) must match the processed data's.
+- Re-exporting the same checkpoint with the same code and torch build reproduces the file's sha256:
+  the example inputs are seeded and node stack traces (absolute checkout paths) are stripped.
 
 Notes:
 - For correctness, export uses strict=True by default.
@@ -60,12 +74,21 @@ from torch.export import Dim
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from model import _REQUIRED_GLOBALS, create_model  # noqa: E402
-from utils import load_json_config, non_finite_tensor_keys, require_same_model_block  # noqa: E402
+from run_dir import resolve_run_dir  # noqa: E402
+from utils import (  # noqa: E402
+    file_sha256,
+    git_state,
+    load_json_config,
+    non_finite_tensor_keys,
+    normalization_sha256,
+    require_same_model_block,
+)
 
-# Runtime settings (edit here; no argparse).
-RUN_DIR = (REPO_ROOT / "models" / "stage2").resolve()  # deployable model = stage-2 output
+# Runtime settings (edit here; no argparse). The run directory comes from AUTOCHEM_CONFIG_PATH
+# (testing/run_dir.py).
 # Best-val_loss checkpoint (written by src/main.py after training); relative paths are
 # resolved against the run config directory and the file must exist.
 CHECKPOINT = "checkpoints/best.ckpt"
@@ -73,11 +96,26 @@ CHECKPOINT = "checkpoints/best.ckpt"
 # processed_dir has been relocated. When set, it is the sole candidate and must contain
 # normalization.json. None => use cfg.paths.processed_dir strictly (no fallbacks).
 PROCESSED_DIR_OVERRIDE: Optional[str] = None
-EXPORT_DEVICES = "cpu,cuda"  # requested targets; unavailable devices are skipped with CPU fallback
+EXPORT_DEVICES = "cpu,cuda"  # requested targets; every one must be available (no fallback)
 EXPORT_STRICT = True
 EXAMPLE_BATCH = 4
+# torch.export specializes a dynamic dim whose example size is 1 (torch 2.8).
+MIN_EXAMPLE_BATCH = 2
 B_MIN = 1
 B_MAX = 16384
+# Example inputs only fix the traced shapes; seeding them makes the .pt2 byte-reproducible.
+EXAMPLE_INPUT_SEED = 0
+# The export gate's own in-range draws (independent of the example inputs).
+EXPORT_VERIFY_SEED = 1
+# Export-vs-eager tolerance of the gate (relative, atol 0): CPU is bitwise today; the headroom is for
+# CUDA kernels, to be re-checked on the first trained CUDA export.
+EXPORT_PARITY_RTOL = 1e-6
+# Out-of-range rule (see the module docstring): allowed excursion outside the train-split range, as
+# a fraction of each input's normalized range; absorbs the float32 round trip at the exact edges.
+OOR_TOL = 1e-6
+# metadata_version 2 (2026-09-30): units, trained box and NaN-row policy, fingerprints and
+# provenance added; cuda_visible_devices removed. 'format' is unchanged.
+METADATA_VERSION = 2
 
 # Checkpoint state-dict key prefixes (FlowMapRolloutModule): the network under "model.", the
 # training-only loss buffers under "criterion." (dropped).
@@ -86,6 +124,10 @@ _LOSS_KEY_PREFIX = "criterion."
 # A finished artifact is written under <dir>/.partial/<same name> and os.replace'd onto its final
 # name, so a failed or killed export never leaves a truncated file under the final name.
 _PARTIAL_DIR_NAME = ".partial"
+# Written by src/main.py only when a run finished; export refuses a run without it.
+_COMPLETED_NAME = "COMPLETED"
+# Manifest keys added on 2026-09-30 that the metadata copies; an older processed dir must be rebuilt.
+_REQUIRED_MANIFEST_KEYS = ("units", "window_start_time_s", "coverage")
 
 
 # =============================================================================
@@ -94,11 +136,8 @@ _PARTIAL_DIR_NAME = ".partial"
 
 
 def _cuda_available() -> bool:
-    """True if a usable CUDA device is present (best-effort; never raises)."""
-    try:
-        return bool(torch.cuda.is_available() and torch.cuda.device_count() > 0)
-    except Exception:
-        return False
+    """True if a usable CUDA device is present."""
+    return torch.cuda.is_available()
 
 
 def _print_device_diag() -> None:
@@ -129,17 +168,19 @@ def _load_json(path: Path) -> Dict[str, Any]:
     return load_json_config(path)
 
 
-def save_artifact(final_path: Path, write: Any) -> None:
-    """Run write(staging_path) to produce the artifact, then move it onto final_path atomically.
+def save_artifact(final_path: Path, write: Any, *, verify: Any) -> None:
+    """Run write(staging_path), then verify(staging_path), then move it onto final_path atomically.
 
     The staging path is final_path's name under <dir>/.partial/ (same filesystem; torch requires the
     .pt2 suffix and names the package's internal root after the file's basename, so the artifact
-    is identical to one written in place). The staging file is removed if write fails.
+    is identical to one written in place). The staging file is removed if write or verify fails,
+    so a failed artifact never replaces the previous one.
     """
     staging = final_path.parent / _PARTIAL_DIR_NAME / final_path.name
     staging.parent.mkdir(parents=True, exist_ok=True)
     try:
         write(staging)
+        verify(staging)
         os.replace(staging, final_path)
     except BaseException:
         staging.unlink(missing_ok=True)
@@ -196,11 +237,13 @@ def _resolve_checkpoint_path(raw: str, *, cfg_path: Path) -> Path:
 
 
 def _load_weights_strict(
-    model: nn.Module, ckpt_path: Path, *, expected_model: Mapping[str, Any]
-) -> Tuple[str, Dict[str, Any]]:
+    model: nn.Module, ckpt_path: Path, *, expected_model: Mapping[str, Any], norm_sha256: str
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Load a Lightning checkpoint's network weights into `model` strictly.
 
     - Only a Lightning checkpoint (a mapping with 'state_dict' and hyper_parameters) is accepted.
+    - Its normalization fingerprint (hyper_parameters['norm_sha256']) must equal `norm_sha256`, the
+      fingerprint of the normalization.json being baked (no fingerprint = refused).
     - Its saved model block must equal `expected_model` (comment keys ignored): shape mismatches
       fail in load_state_dict anyway, this also catches predict_delta, activation, layer_norm_eps.
     - 'ema_state_dict' (saved by EMACallback; the weights that produced the checkpoint's
@@ -209,7 +252,9 @@ def _load_weights_strict(
     - Every key must start with 'model.' (one prefix stripped) or 'criterion.' (training-only
       loss buffers, dropped); every floating tensor must be finite.
 
-    Returns (weights source, the checkpoint's model block without comment keys).
+    Returns (checkpoint record for the metadata, the checkpoint's model block without comment keys).
+    The record holds weights_source, epoch, global_step, monitor, checkpoint_score (the val_loss
+    ModelCheckpoint's current_score: this checkpoint's own score) and training_lightning_version.
     """
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     if not isinstance(ckpt, Mapping) or "state_dict" not in ckpt:
@@ -217,6 +262,12 @@ def _load_weights_strict(
     hparams = ckpt.get("hyper_parameters")
     if not isinstance(hparams, Mapping) or "training" not in hparams:
         raise KeyError(f"checkpoint has no hyper_parameters['training'] block: {ckpt_path}")
+    if hparams.get("norm_sha256") != norm_sha256:
+        raise ValueError(
+            f"checkpoint {ckpt_path} norm_sha256={hparams.get('norm_sha256')!r} does not match the "
+            f"normalization.json being exported ({norm_sha256}): it was trained on other normalization "
+            "statistics (or before the fingerprint existed)"
+        )
     model_block = require_same_model_block(hparams.get("model"), expected_model, source=str(ckpt_path))
 
     if "ema_state_dict" in ckpt:
@@ -243,7 +294,21 @@ def _load_weights_strict(
         raise ValueError(f"checkpoint {ckpt_path} has non-finite weights: {bad[:3]}")
 
     model.load_state_dict(cleaned, strict=True)
-    return source, model_block
+
+    score = None
+    for key, state in (ckpt.get("callbacks") or {}).items():
+        if str(key).startswith("ModelCheckpoint") and "'monitor': 'val_loss'" in str(key):
+            v = state.get("current_score")
+            score = float(v) if v is not None else None
+    record = {
+        "weights_source": source,
+        "epoch": ckpt.get("epoch"),
+        "global_step": ckpt.get("global_step"),
+        "monitor": "val_loss",
+        "checkpoint_score": score,
+        "training_lightning_version": ckpt.get("pytorch-lightning_version"),
+    }
+    return record, model_block
 
 
 def _freeze_for_inference(model: nn.Module) -> nn.Module:
@@ -466,25 +531,24 @@ def build_baked_normalizer(
     s_methods = [_method_for(k, allowed=_SUPPORTED_SPECIES_METHODS) for k in species_vars]
     g_methods = [_method_for(k, allowed=_SUPPORTED_GLOBAL_METHODS) for k in global_vars]
 
-    # hi > lo only where the range is a denominator (min-max, log-min-max, dt); the species
-    # log_min/log_max and the globals' min/max otherwise only bound the example inputs (a constant
-    # species has log_min == log_max).
+    # hi > lo only where the range is a denominator: dt, and every global's out-of-range box (linear
+    # [min, max] for standard/min-max, [log_min, log_max] for the log methods), which is also the
+    # min-max / log-min-max scale. The species log_min/log_max only bound the example inputs (a
+    # constant species has log_min == log_max).
     for k in species_vars:  # log-standard
         _finite(k, "log_mean")
         _std(k, "log_std")
         _finite(k, "log_min")
         _finite(k, "log_max")
     for k, m in zip(global_vars, g_methods):
-        _finite(k, "min")
-        _finite(k, "max")
+        _range(k, "min", "max")
         if m == "standard":
             _finite(k, "mean")
             _std(k, "std")
-        elif m == "min-max":
-            _range(k, "min", "max")
         elif m == "log-min-max":
             _range(k, "log_min", "log_max")
         elif m == "log-standard":
+            _range(k, "log_min", "log_max")
             _finite(k, "log_mean")
             _std(k, "log_std")
 
@@ -545,13 +609,16 @@ def build_baked_normalizer(
 
 class OneStepPhysical(nn.Module):
     """
-    Wrapper: physical -> (normalize) -> base.forward_step(z) -> (denormalize) -> physical.
+    Wrapper: physical -> (normalize) -> base.forward_step(z) -> (denormalize) -> physical,
+    with out-of-range and non-finite rows returned as NaN (module docstring, OOR_TOL).
     """
 
     def __init__(self, base: nn.Module, norm: BakedNormalizer) -> None:
         super().__init__()
         self.base = base
         self.norm = norm
+        # A tensor constant: a Python NaN literal in the graph makes torch.export.save fail (torch 2.8).
+        self.register_buffer("nan_fill", torch.tensor(float("nan"), dtype=torch.float32))
 
         self.S = int(getattr(base, "S"))
         self.G = int(getattr(base, "G"))
@@ -563,13 +630,36 @@ class OneStepPhysical(nn.Module):
         if not hasattr(base, "forward_step"):
             raise TypeError("Base model must implement forward_step(y_z, dt_norm, g_z)")
 
+    def in_range(self, y_phys: torch.Tensor, dt_seconds: torch.Tensor, g_phys: torch.Tensor) -> torch.Tensor:
+        """[B] bool: dt and every global inside the train-split box (within OOR_TOL) and y finite.
+
+        Computed from the UNCLAMPED inputs, as fractions of the range in the normalizer's coordinate
+        (log10 for dt and the log-* methods, linear otherwise); NaN, +-inf and dt or P <= 0 fail.
+        """
+        n = self.norm
+        cols = [(torch.log10(dt_seconds.to(torch.float32)) - n.dt_log_min) / (n.dt_log_max - n.dt_log_min)]
+        g = g_phys.to(torch.float32)
+        for j, m in enumerate(n.global_methods):
+            if _canonical_method(m) in ("log-min-max", "log-standard"):
+                cols.append((torch.log10(g[:, j]) - n.g_log_min[j]) / (n.g_log_max[j] - n.g_log_min[j]))
+            else:
+                cols.append((g[:, j] - n.g_min[j]) / (n.g_max[j] - n.g_min[j]))
+        f = torch.stack(cols, dim=-1)  # [B, 1 + G]
+        return ((f >= -OOR_TOL) & (f <= 1.0 + OOR_TOL)).all(dim=-1) & torch.isfinite(y_phys).all(dim=-1)
+
     def forward(self, y_phys: torch.Tensor, dt_seconds: torch.Tensor, g_phys: torch.Tensor) -> torch.Tensor:
-        """Physical-space one step: normalize (y, dt, g) -> base.forward_step -> denormalize to y_next_phys."""
+        """Physical-space one step: normalize (y, dt, g) -> base.forward_step -> denormalize to y_next_phys.
+
+        The clamps in the normalizer stay (the network never sees a non-finite value); rows that
+        fail in_range() are replaced by NaN.
+        """
         y_z = self.norm.normalize_species(y_phys)
         dt_norm = self.norm.normalize_dt_seconds(dt_seconds)  # [B]
         g_z = self.norm.normalize_globals(g_phys)
         y_next_z = self.base.forward_step(y_z, dt_norm, g_z)
-        return self.norm.denormalize_species(y_next_z)
+        y_next = self.norm.denormalize_species(y_next_z)
+        ok = self.in_range(y_phys, dt_seconds, g_phys)
+        return torch.where(ok[:, None], y_next, self.nan_fill.to(y_next.dtype))
 
 
 def _make_example_inputs(
@@ -577,50 +667,105 @@ def _make_example_inputs(
     *,
     B: int,
     device: torch.device,
+    generator: torch.Generator,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Create a numerically sane example batch for export.
+    Create a numerically sane, in-range example batch for export (drawn from `generator`).
 
     We sample y and dt in *log space* within the min/max ranges captured during preprocessing
-    to avoid extreme values that can produce inf/NaN during log10.
+    (train split) and g inside the train-split [min, max] box, so every row is in range.
     """
     S = norm.S
     G = norm.G
 
     # y: sample log10(y) uniformly between observed log_min/log_max.
-    u = torch.rand(B, S, device=device, dtype=torch.float32)
+    u = torch.rand(B, S, device=device, dtype=torch.float32, generator=generator)
     logy = norm.s_log_min.to(device) + u * (norm.s_log_max.to(device) - norm.s_log_min.to(device))
     y = torch.pow(10.0, logy)
 
     # dt_seconds: sample log10(dt) uniformly between cfg log_min/log_max.
-    u_dt = torch.rand(B, device=device, dtype=torch.float32)
+    u_dt = torch.rand(B, device=device, dtype=torch.float32, generator=generator)
     logdt = norm.dt_log_min.to(device) + u_dt * (norm.dt_log_max.to(device) - norm.dt_log_min.to(device))
     dt_seconds = torch.pow(10.0, logdt)
 
-    # g: sample in a reasonable range (roughly within observed min/max).
-    u_g = torch.rand(B, G, device=device, dtype=torch.float32)
+    # g: sample inside the observed min/max box.
+    u_g = torch.rand(B, G, device=device, dtype=torch.float32, generator=generator)
     g = norm.g_min.to(device) + u_g * (norm.g_max.to(device) - norm.g_min.to(device))
 
     return y, dt_seconds, g
 
 
-def _verify_dynamic_batch(
-    ep: torch.export.ExportedProgram,
-    *,
-    device: torch.device,
-    norm: BakedNormalizer,
-) -> None:
-    """
-    Fail hard unless the exported program runs with multiple batch sizes (proves dynamic B).
-    """
-    m = ep.module().to(device=device)
+def _out_of_range_rows(norm: BakedNormalizer, *, device: torch.device) -> Tuple[torch.Tensor, ...]:
+    """A batch whose row 0 is in range and rows 1.. each break one input (dt, P, T or y): every one must be NaN."""
+    gen = torch.Generator(device=device).manual_seed(EXPORT_VERIFY_SEED)
+    y, dt, g = _make_example_inputs(norm, B=7, device=device, generator=gen)
+    dt_lo, dt_hi = float(10.0 ** norm.dt_log_min), float(10.0 ** norm.dt_log_max)
+    dt[1] = dt_hi * 10.0          # above the dt range
+    dt[2] = dt_lo / 10.0          # below the dt range
+    dt[3] = 0.0                   # non-positive dt
+    g[4, 0] = norm.g_max[0] * 10.0  # P above the box
+    g[5, 1] = norm.g_min[1] * 0.5   # T below the box
+    y[6, 0] = float("nan")        # non-finite species input
+    return y, dt, g
 
+
+def _verify_export(module: Any, *, eager: nn.Module, norm: BakedNormalizer, device: torch.device) -> None:
+    """Export gate on `device`: fail unless `module` behaves like the eager wrapper.
+
+    In-range inputs (seeded, B in (1, 7)) must give [B, S] outputs that are all finite and equal to
+    the eager wrapper's within EXPORT_PARITY_RTOL (atol 0); in the out-of-range batch exactly the
+    rows that break the box (or are not finite) must be NaN and the in-range row must match.
+    """
+    gen = torch.Generator(device=device).manual_seed(EXPORT_VERIFY_SEED)
+    S = norm.S
     for B in (1, 7):
-        y, dt, g = _make_example_inputs(norm, B=B, device=device)
+        y, dt, g = _make_example_inputs(norm, B=B, device=device, generator=gen)
         with torch.inference_mode():
-            out = m(y, dt, g)
-        if out.shape[0] != B:
-            raise RuntimeError(f"Dynamic batch verification failed: input B={B} produced output {tuple(out.shape)}")
+            out, ref = module(y, dt, g), eager(y, dt, g)
+        if tuple(out.shape) != (B, S):
+            raise RuntimeError(f"export gate: input B={B} produced output {tuple(out.shape)}, expected {(B, S)}")
+        if not bool(torch.isfinite(out).all()):
+            raise RuntimeError(f"export gate: non-finite output for in-range inputs at B={B}")
+        torch.testing.assert_close(out, ref, rtol=EXPORT_PARITY_RTOL, atol=0.0)
+    y, dt, g = _out_of_range_rows(norm, device=device)
+    with torch.inference_mode():
+        out, ref = module(y, dt, g), eager(y, dt, g)
+    nan_rows = torch.isnan(out).all(dim=-1)
+    expected = torch.ones_like(nan_rows)
+    expected[0] = False
+    if not torch.equal(nan_rows, expected) or not bool(torch.isfinite(out[0]).all()):
+        raise RuntimeError(f"export gate: NaN rows {nan_rows.tolist()} != expected {expected.tolist()}")
+    torch.testing.assert_close(out[0], ref[0], rtol=EXPORT_PARITY_RTOL, atol=0.0)
+
+
+def input_out_of_range_rows(y_phys: np.ndarray, dt_seconds: np.ndarray, g_phys: np.ndarray, meta: Mapping[str, Any]) -> np.ndarray:
+    """[B] bool from the INPUTS and an export's metadata: rows the export returns as NaN.
+
+    Same rule as OneStepPhysical.in_range (float32, metadata oor_box and oor_tol): dt or a global
+    outside its box by more than oor_tol of the range, or a non-finite species input.
+    """
+    tol = np.float32(meta["oor_tol"])
+    bad = np.logical_not(np.isfinite(np.asarray(y_phys)).all(axis=1))
+    g = np.asarray(g_phys)
+    cols = [("dt_seconds", np.asarray(dt_seconds))] + [(name, g[:, j]) for j, name in enumerate(meta["global_variables"])]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        for name, x in cols:
+            box = meta["oor_box"][name]
+            lo, hi = np.float32(box["lo"]), np.float32(box["hi"])
+            x32 = x.astype(np.float32)
+            v = np.log10(x32) if box["coordinate"] == "log10" else x32
+            f = (v - lo) / (hi - lo)
+            bad |= np.logical_not((f >= -tol) & (f <= np.float32(1.0) + tol))
+    return bad
+
+
+def _strip_stack_traces(ep: torch.export.ExportedProgram) -> None:
+    """Drop node stack traces before saving: they carry absolute checkout paths and line numbers
+    (a re-export from another checkout would differ), and inference does not need them."""
+    for gm in ep.graph_module.modules():
+        if isinstance(gm, torch.fx.GraphModule):
+            for n in gm.graph.nodes:
+                n.meta.pop("stack_trace", None)
 
 
 # =============================================================================
@@ -722,30 +867,17 @@ def _parse_devices(raw_devices: str) -> List[str]:
 
 
 def _resolve_export_devices(devices: Sequence[str]) -> List[str]:
-    """Filter requested devices to those actually available, falling back to CPU if none are."""
-    resolved: List[str] = []
+    """Return the requested devices, raising if any of them is unavailable (no skip, no CPU fallback)."""
     for dev in devices:
-        if dev == "cpu":
-            resolved.append(dev)
-            continue
-
         if dev.startswith("cuda"):
-            if _cuda_available():
-                resolved.append(dev)
-            else:
-                print(
-                    "CUDA requested in EXPORT_DEVICES but torch.cuda.is_available() is false; "
-                    f"skipping '{dev}'."
+            if not _cuda_available():
+                raise RuntimeError(
+                    f"CUDA requested in EXPORT_DEVICES ({dev!r}) but torch.cuda.is_available() is false; "
+                    "set EXPORT_DEVICES = 'cpu' to export CPU only"
                 )
-            continue
-
-        raise ValueError(f"Unsupported device '{dev}'. Use cpu|cuda (or cuda:0 style if needed).")
-
-    if not resolved:
-        print("No requested export devices are available. Falling back to CPU.")
-        resolved = ["cpu"]
-
-    return resolved
+        elif dev != "cpu":
+            raise ValueError(f"Unsupported device '{dev}'. Use cpu|cuda (or cuda:0 style if needed).")
+    return list(devices)
 
 
 def _default_out_for(run_dir: Path, device_tag: str) -> Path:
@@ -758,43 +890,99 @@ def _default_out_for(run_dir: Path, device_tag: str) -> Path:
 # =============================================================================
 
 
+def _require_manifest_keys(manifest: Mapping[str, Any], path: Path) -> None:
+    """The keys the metadata copies must exist (processed dirs built before 2026-09-30 lack them)."""
+    missing = [k for k in _REQUIRED_MANIFEST_KEYS if k not in manifest]
+    if missing:
+        raise KeyError(
+            f"{path} has no {missing} (built before 2026-09-30): rebuild the processed data with "
+            "processing/preprocessing.py (the export metadata must state units and the trained domain)"
+        )
+
+
+def _git_or_none(value: Any) -> Any:
+    """utils.git_state values, with the 'error: ...' of a non-checkout recorded as null."""
+    return None if isinstance(value, str) and value.startswith("error:") else value
+
+
+def _oor_box(norm: BakedNormalizer) -> Dict[str, Any]:
+    """The exact float32 box OneStepPhysical.in_range tests, per input in its own coordinate."""
+    box: Dict[str, Any] = {
+        "dt_seconds": {"coordinate": "log10", "lo": float(norm.dt_log_min), "hi": float(norm.dt_log_max)}
+    }
+    for j, (name, m) in enumerate(zip(norm.global_vars, norm.global_methods, strict=True)):
+        if _canonical_method(m) in ("log-min-max", "log-standard"):
+            box[name] = {"coordinate": "log10", "lo": float(norm.g_log_min[j]), "hi": float(norm.g_log_max[j])}
+        else:
+            box[name] = {"coordinate": "linear", "lo": float(norm.g_min[j]), "hi": float(norm.g_max[j])}
+    return box
+
+
+def _coverage_summary(coverage: Mapping[str, Any]) -> Dict[str, Any]:
+    """Compact (T, P) coverage for the metadata: train-window marginals and the lowest-retention cell."""
+    t_marg: Dict[str, int] = {}
+    p_marg: Dict[str, int] = {}
+    for row in coverage["train_windows"]:
+        t_key, p_key = f"{row['T_lo_K']:g}", f"{row['log10P_lo']:g}"
+        t_marg[t_key] = t_marg.get(t_key, 0) + int(row["windows"])
+        p_marg[p_key] = p_marg.get(p_key, 0) + int(row["windows"])
+    return {
+        "units": coverage["units"],
+        "T_bin_K": coverage["T_bin_K"],
+        "log10P_bin_dex": coverage["log10P_bin_dex"],
+        "train_windows_by_T_lo_K": t_marg,
+        "train_windows_by_log10P_lo": p_marg,
+        "lowest_retention_cell": coverage["lowest_retention_cell"],
+    }
+
+
 def build_export(
     run_dir: Path,
     checkpoint: str,
     device: torch.device,
     example_batch: int,
-    *,
-    cuda_visible_devices: str,
-) -> Tuple[torch.export.ExportedProgram, Dict[str, Any]]:
-    """Build the verified one-step physical-space export for `device` and its metadata.
+) -> Tuple[torch.export.ExportedProgram, Dict[str, Any], Any]:
+    """Build the gated one-step physical-space export for `device` and its metadata.
 
-    Loads <run_dir>/config.resolved.json, the checkpoint (EMA weights preferred; its model
-    block must match the config's and is recorded in the metadata) and normalization.json,
-    wraps base+normalizer, exports with a dynamic batch dim and verifies B in (1, 7) on
-    `device`. `cuda_visible_devices` is recorded as given.
+    The run must be finished (<run_dir>/COMPLETED). Loads <run_dir>/config.resolved.json, the
+    checkpoint (EMA weights preferred; its model block must match the config's and its norm_sha256
+    the manifest's) and normalization.json, wraps base+normalizer (with the NaN-row guard), exports
+    with a dynamic batch dim and runs the export gate on `device`.
+
+    Returns (ep, metadata, verify): verify(module) re-runs the gate against the eager wrapper, for a
+    reloaded artifact before it replaces the canonical file.
     """
+    if not (run_dir / _COMPLETED_NAME).is_file():
+        raise FileNotFoundError(
+            f"{run_dir} has no {_COMPLETED_NAME}: the run did not finish (or is being extended); export "
+            "only a finished run"
+        )
+    if example_batch < MIN_EXAMPLE_BATCH:
+        raise ValueError(f"example_batch must be >= {MIN_EXAMPLE_BATCH} (torch.export specializes size 1), got {example_batch}")
     cfg, cfg_path = _load_resolved_config(run_dir)
     ckpt_path = _resolve_checkpoint_path(checkpoint, cfg_path=cfg_path)
 
     processed_dir = _resolve_processed_dir(cfg, cfg_path=cfg_path)
     manifest_path = processed_dir / "normalization.json"
     manifest = _load_json(manifest_path)
+    _require_manifest_keys(manifest, manifest_path)
+    norm_sha = normalization_sha256(manifest)
 
     species_vars, global_vars = _validate_manifest_vs_config(cfg, manifest)
 
     base = create_model(cfg)
-    _, model_block = _load_weights_strict(base, ckpt_path, expected_model=cfg["model"])
+    ckpt_record, model_block = _load_weights_strict(base, ckpt_path, expected_model=cfg["model"], norm_sha256=norm_sha)
     base = _freeze_for_inference(base.to(device=device))
 
     norm = build_baked_normalizer(manifest, species_vars=species_vars, global_vars=global_vars)
     norm = norm.to(device=device)
     norm.eval()
 
-    step = OneStepPhysical(base, norm)
+    step = OneStepPhysical(base, norm).to(device=device)
     step = _freeze_for_inference(step)
 
-    B_ex = int(max(1, example_batch))
-    example_inputs = _make_example_inputs(norm, B=B_ex, device=device)
+    gen = torch.Generator(device=device).manual_seed(EXAMPLE_INPUT_SEED)
+    example_inputs = _make_example_inputs(norm, B=int(example_batch), device=device, generator=gen)
 
     B = Dim("B", min=int(B_MIN), max=int(B_MAX))
     dynamic_shapes = (
@@ -805,37 +993,58 @@ def build_export(
 
     ep = torch.export.export(step, example_inputs, dynamic_shapes=dynamic_shapes, strict=bool(EXPORT_STRICT))
 
-    # Verify on export device.
-    _verify_dynamic_batch(ep, device=device, norm=norm)
+    def verify(module: Any) -> None:
+        _verify_export(module, eager=step, norm=norm, device=device)
 
+    # Gate the in-memory program on the export device (the saved file is gated again on reload).
+    verify(ep.module())
+
+    git = git_state(Path(__file__).resolve().parent)
+    precision, runtime = cfg["precision"], cfg["runtime"]
     meta = {
         "format": "1step_physical_dynB",
+        "metadata_version": METADATA_VERSION,
         "run_dir": _to_repo_relative_str(run_dir),
         "config_path": _to_repo_relative_str(cfg_path),
         "checkpoint_path": _to_repo_relative_str(ckpt_path),
+        "checkpoint_sha256": file_sha256(ckpt_path),
+        **ckpt_record,
+        "training_tf32": bool(precision["allow_tf32"]) and not bool(runtime["deterministic"]),
         "normalization_path": _to_repo_relative_str(manifest_path),
+        "normalization_sha256": file_sha256(manifest_path),
+        "norm_sha256": norm_sha,
+        "export_code_git_commit": _git_or_none(git["head"]),
+        "export_code_git_dirty": _git_or_none(git["dirty"]),
         "torch_version": torch.__version__,
         "torch_cuda_version": getattr(torch.version, "cuda", None),
-        "cuda_visible_devices": cuda_visible_devices,
         "export_device": str(device),
         "export_device_tag": device.type,
         "export_dtype": "float32",
         "model": model_block,
         "species_variables": list(species_vars),
         "global_variables": list(global_vars),
+        "units": manifest["units"],
         "normalization_methods": dict(manifest["normalization_methods"]),
+        "per_key_stats": manifest["per_key_stats"],
         "epsilon": float(manifest["epsilon"]),
+        "species_floor": "species inputs <= epsilon are floored at epsilon before log10 (not range-checked)",
         "dt_log10_min": float(manifest["dt"]["log_min"]),
         "dt_log10_max": float(manifest["dt"]["log_max"]),
         "dt_min_seconds": float(10.0 ** float(manifest["dt"]["log_min"])),
         "dt_max_seconds": float(10.0 ** float(manifest["dt"]["log_max"])),
+        "oor_policy": "nan_row",
+        "oor_tol": OOR_TOL,
+        "oor_box": _oor_box(norm),
+        "window_start_time_s": manifest["window_start_time_s"],
+        "coverage": _coverage_summary(manifest["coverage"]),
+        "species_sum": manifest.get("species_sum", "not computed"),
         "dynamic_batch": {"min": int(B_MIN), "max": int(B_MAX)},
         "signature": {
             "inputs": {"y_phys": ["B", "S"], "dt_seconds": ["B"], "g_phys": ["B", "G"]},
             "output": {"y_next_phys": ["B", "S"]},
         },
     }
-    return ep, meta
+    return ep, meta, verify
 
 
 # =============================================================================
@@ -844,27 +1053,23 @@ def build_export(
 
 
 def main() -> None:
-    """Export RUN_DIR's checkpoint for each requested device and save it with embedded metadata."""
+    """Export the run's checkpoint for each requested device and save it with embedded metadata."""
     _print_device_diag()
 
-    run_dir = RUN_DIR.expanduser().resolve()
-    if not run_dir.exists():
-        raise FileNotFoundError(f"RUN_DIR not found: {run_dir}")
-
+    run_dir = resolve_run_dir()
     for dev in _resolve_export_devices(_parse_devices(EXPORT_DEVICES)):
         device = torch.device(dev)
-        ep, meta = build_export(
-            run_dir,
-            CHECKPOINT,
-            device,
-            int(EXAMPLE_BATCH),
-            cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES", ""),
-        )
+        ep, meta, verify = build_export(run_dir, CHECKPOINT, device, int(EXAMPLE_BATCH))
+        _strip_stack_traces(ep)
 
         out_path = _default_out_for(run_dir, device.type)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         extra = {"metadata.json": json.dumps(meta, indent=2, sort_keys=True)}
-        save_artifact(out_path, lambda staging: torch.export.save(ep, staging, extra_files=extra))
+        save_artifact(
+            out_path,
+            lambda staging: torch.export.save(ep, staging, extra_files=extra),  # noqa: B023 - called now
+            verify=lambda staging: verify(torch.export.load(str(staging)).module()),  # noqa: B023 - called now
+        )
         print(f"Saved export ({device.type}): {out_path}")
 
 

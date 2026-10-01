@@ -92,11 +92,16 @@ Audience: Professional collaborators and maintainers
 12. Export naming standard is mandatory:
 13. `export_{device}_dynB_1step_phys.pt2`
 14. Canonical requested targets are CPU and CUDA.
-15. `testing/export.py` may skip unavailable accelerator targets and may still emit any locally available target instead of failing the whole diagnostic run.
+15. `testing/export.py` exports every requested target; a requested target that is not available is an error (request `cpu` only to export CPU only).
 16. MPS is unsupported; export targets are `cpu` and `cuda` only.
 17. Export metadata source of truth is embedded `metadata.json` inside the `.pt2` artifact.
 18. No sidecar metadata JSON is required.
 19. For `torch.export` artifacts, inference loaders must not call `model.eval()` or `model.train()` on `ep.module()` because these mode-switch APIs are unsupported; run inference under `torch.inference_mode()` instead.
+20. The run is selected by `AUTOCHEM_CONFIG_PATH` (its `paths.work_dir`); export runs only for a finished run (`COMPLETED`) whose checkpoint normalization fingerprint (`norm_sha256`) matches its processed data.
+21. Units (metadata `units`): `dt_seconds` in s; `g_phys` P in dyn/cm^2 (barye) and T in K; `y_phys` and `y_next_phys` are species mixing ratios in the training-data convention (n_i / n_total over all gas of the generator run; the training initial gas held only the tracked species, so they sum to 1 at t=0 and at most 1 later; train-split distribution of the sum: metadata `species_sum`). No unit conversion is applied anywhere.
+22. Species inputs are not range-checked: values at or below `epsilon` are floored at `epsilon` before log10. Outputs are neither clipped nor renormalized and use the same denominator as the inputs.
+23. Out-of-range rows (metadata `oor_policy: "nan_row"`): a row whose `dt_seconds`, P or T lies outside the train-split box in metadata `oor_box` by more than `oor_tol` of the range (in the normalizer's coordinate: log10 for dt and log-* methods, linear otherwise), or whose inputs are not finite, returns NaN in every species. A NaN row means only that; in-range rows are computed exactly as without the rule.
+24. The AOTI package (`testing/aoti_export.py`) does no input validation: callers pass CPU float32 C-contiguous `[B, S]`, `[B]`, `[B, G]` tensors with one `B` inside metadata `dynamic_batch` (metadata `host_input_contract`). It is native code for the build CPU (metadata `build_target`) and is installed only when it matches the fresh export.
 
 ## 4.4 Diagnostic and Testing Scripts
 1. `testing/` holds diagnostic and deployment utilities; they are not release gates.

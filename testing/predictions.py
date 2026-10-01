@@ -4,6 +4,12 @@ Autoregressive rollout evaluation for exported 1-step physical-space models.
 
 Export signature:
     y_next_phys = model(y_phys, dt_seconds, g_phys)
+
+Run (the run directory is paths.work_dir of the config, testing/run_dir.py):
+    AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u testing/predictions.py
+
+The CPU export runs at full float32 (TF32 does not apply on CPU). This script imports nothing from
+src/ (standalone), so it keeps its own normalization helpers.
 """
 
 from __future__ import annotations
@@ -26,26 +32,29 @@ from matplotlib.lines import Line2D
 
 ROOT = Path(__file__).resolve().parents[1]
 
+from run_dir import resolve_run_dir  # noqa: E402  (testing/ is this script's directory)
+
 # -----------------------------------------------------------------------------
 # User-editable settings
 # -----------------------------------------------------------------------------
 
-# Model/artifact selection (main knobs you typically edit first).
-MODEL_RUN_DIR: str = "models/stage2"  # Absolute path or repo-relative path
+# Model/artifact selection: the run comes from AUTOCHEM_CONFIG_PATH (testing/run_dir.py).
 MODEL_EXPORT_FILE: str = "export_cpu_dynB_1step_phys.pt2"
 
 # Inference settings.
 INFER_DEVICE: torch.device = torch.device("cpu")
 INFER_DTYPE: torch.dtype | None = None  # None => use export metadata dtype exactly
 
-# Data selection.
-EVAL_SPLIT: str = "test"
+# Data selection. Validation: this script runs after every training (diagnostics and decisions use
+# the validation split); the test split is for the single final paper evaluation.
+EVAL_SPLIT: str = "validation"
 EVAL_SHARD_INDEX: int | None = None  # None => randomly select a shard from the chosen split
 EVAL_SHARD_RANDOM_SEED: int | None = None  # Optional reproducible seed; None => fresh randomness each run
 EVAL_SAMPLE_INDEX: int | None = None  # None => randomly select a sample/chunk from the selected shard
 EVAL_SAMPLE_RANDOM_SEED: int | None = None  # Optional reproducible seed; None => fresh randomness each run
 
-# Rollout window.
+# Rollout window. Inherited: index 0 of every window is skipped with no recorded rationale;
+# changing it changes the reported errors (testing/eval_rollout_error.py uses the same value).
 ROLLOUT_START_INDEX: int = 1
 ROLLOUT_STEPS: int = 50
 
@@ -60,12 +69,11 @@ PLOT_STYLE: str | None = str((ROOT / "testing" / "science.mplstyle").resolve())
 # imports nothing from src/, so it keeps its own copy of src/model.py:_REQUIRED_GLOBALS.
 REQUIRED_GLOBALS: Tuple[str, str] = ("P", "T")
 
-
-def _resolve_repo_path(raw: str) -> Path:
-    p = Path(raw).expanduser()
-    if not p.is_absolute():
-        p = (ROOT / p).resolve()
-    return p.resolve()
+# Denominator floor of the legacy fractional error |yp - yt| / (|yt| + FRAC_ERR_FLOOR) (inherited
+# from the sibling one-step paper's definition): it hides relative error on trace species below
+# about 1e-12 (24% of scored truth on the 4-file data), so per-species dex error is the headline;
+# the fractional numbers are kept for continuity only.
+FRAC_ERR_FLOOR: float = 1e-12
 
 
 def _resolve_export_path(run_dir: Path) -> Path:
@@ -368,15 +376,16 @@ def _plot(*, t_sec: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray, species_
     plt.close(fig)
 
 
-def _print_errors(y_true: np.ndarray, y_pred: np.ndarray) -> None:
-    eps = 1e-30
+def _print_errors(y_true: np.ndarray, y_pred: np.ndarray, *, eps: float) -> None:
+    """Print the rollout's errors; both arrays are clipped at the manifest epsilon (the species floor)."""
     yt = np.clip(y_true, eps, None)
     yp = np.clip(y_pred, eps, None)
 
-    rel_err = np.abs(yp - yt) / (np.abs(yt) + 1e-12)
+    rel_err = np.abs(yp - yt) / (np.abs(yt) + FRAC_ERR_FLOOR)
     mae = np.mean(np.abs(yp - yt))
     log_err = np.mean(np.abs(np.log10(yp) - np.log10(yt)))
 
+    print(f"Definitions: values clipped at epsilon={eps:g}; rel_err = |yp - yt| / (|yt| + {FRAC_ERR_FLOOR:g})")
     print(f"Physical: rel_err(mean)={rel_err.mean():.3e}, rel_err(max)={rel_err.max():.3e}, MAE={mae:.3e}")
     print(f"Log10:   mean |Δlog10| = {log_err:.3f} orders")
 
@@ -385,7 +394,7 @@ def main() -> None:
     if PLOT_STYLE is not None:
         plt.style.use(PLOT_STYLE)
 
-    run_dir = _resolve_repo_path(MODEL_RUN_DIR)
+    run_dir = resolve_run_dir()
     export_path = _resolve_export_path(run_dir)
     if not export_path.exists():
         raise FileNotFoundError(f"missing export: {export_path}")
@@ -461,7 +470,7 @@ def main() -> None:
     )
     _plot(t_sec=t_eval, y_true=y_true_phys, y_pred=y_pred_phys, species_keys=species_keys, out_path=out_path)
     print(f"Saved: {out_path}")
-    _print_errors(y_true_phys, y_pred_phys)
+    _print_errors(y_true_phys, y_pred_phys, eps=float(manifest["epsilon"]))
 
 
 if __name__ == "__main__":

@@ -120,6 +120,57 @@ Data side (one preprocessing change, then one real build of the 4 raw files on d
     distribution, and the model cannot detect that from its inputs. A future fixed-dt evaluation
     generator must start at k >= 1 (prepare_log_interp maps t=0 to y(1e-3 s)).
 
+Export and evaluation side (contract changes for hosts; the network is unchanged):
+- **Out-of-range rows are NaN (approved policy).** The exported step returns NaN in every species
+  for a row whose dt, P or T lies outside the train-split box by more than `OOR_TOL = 1e-6` of the
+  range (log10 for dt and log-* globals), or whose inputs are not finite. In-range rows are bitwise
+  identical to the previous export (audit check on CPU and CUDA: seeded in-box inputs, validation
+  states, the exact box edges). On the 4-file data 0 of 64,426 validation and 0 of 65,046 test
+  trajectories lie outside the train box (audit pre-count, re-checked on the T7 build). Species are not range-checked (values
+  <= epsilon are floored, as before; the author's decision), and outputs are neither clipped nor
+  renormalized. Hosts (the VULCAN Emulator wrapper, Canoe) must handle NaN rows; an installed
+  model.pt2 made before this change keeps clamping until it is replaced.
+- **Export metadata, version 2** (schema change): adds `units`, the guard's exact float32 box
+  (`oor_box`, `oor_tol`, `oor_policy`), `per_key_stats`, `window_start_time_s`, compact (T, P)
+  coverage and the lowest-retention cell, `species_sum`, `norm_sha256`, the checkpoint's sha256,
+  weights source, epoch, step and score, the training TF32 setting, the Lightning version and the
+  export code's git commit; `cuda_visible_devices` is removed (slot-dependent; the external VULCAN
+  loader reading it is unverified, author to confirm). `format` is unchanged.
+- **Export contract.** The run is `paths.work_dir` of `AUTOCHEM_CONFIG_PATH`'s config (no edited
+  RUN_DIR; one resolver, testing/run_dir.py, for every testing tool); it must hold COMPLETED and its
+  checkpoint must carry the processed data's norm_sha256; every requested device must be available
+  (no CPU fallback). Each artifact is written under .partial/, reloaded and gated on its device
+  (in-range rows finite and within `EXPORT_PARITY_RTOL = 1e-6` of the eager wrapper, bitwise on CPU;
+  out-of-range rows NaN) before it replaces the previous file. Example inputs are seeded and node
+  stack traces stripped, so re-exporting a checkpoint reproduces the file's sha256 with the same code
+  commit and torch build.
+- **AOTI package (implemented, not run on daw).** Validation compares the package with the fresh
+  export at dt_min, 6.4 s and dt_max plus one out-of-range row: identical NaN rows (equal to the
+  inputs' out-of-range rows), no inf, and max |dlog10| <= `MATCH_MAX_DLOG10 = 1e-4` (about 10x the
+  float32 AOTI-vs-eager noise measured on a 10x2048 random-weight proxy, 9.5e-6 dex; re-check on the
+  first trained model). The package is installed only on a pass; otherwise both reports are written
+  and the script exits 1. It is loaded once (default thread-safe mode), its example batch is floored
+  at 2 (torch.export specializes size 1), it records its build target (machine, -march=native
+  resolution, AVX-512/AMX flags, compiler, torch) and build threads, and its metadata is visible to
+  the loader. The package does no input validation; the host contract (CPU float32 C-contiguous, one
+  B in the dynamic range) is in its metadata and spec 4.3, with a Python guard to copy. It must be
+  built on the machine that runs it (or the same CPU generation, OS/glibc and torch).
+- **Rollout evaluation.** eval_rollout_error.py scores a seeded sample of the validation split
+  (4000 sources, one window each; the test split once, for the final paper number), reports
+  per-species dex p50/p90 and signed bias per step (recommended headline; author confirms) with
+  bootstrap CIs, keeps the legacy pooled fractional percentiles (floor `FRAC_ERR_FLOOR = 1e-12`,
+  inherited; 24.3% of scored truth lies below it on the 4-file data, audit measurement) without the hard-coded sibling
+  numbers, ranks diverged entries as +inf error (fixed population), drops out-of-box sources before
+  the rollout (counted apart), and checks that its physical inputs re-normalize to the shard values.
+  Its rows are random-dt windows with K <= 98; a fixed-dt K >= 100 evaluation set does not exist
+  yet. predictions.py also defaults to the validation split.
+- **Latency benchmark.** bench_speedup.py draws its inputs inside the trained box, times every batch
+  size per (device, threads) in interleaved rounds, reports the per-cell cost at the host batch
+  (`DEPLOY_BATCH_SIZES = (150,)`, inherited from the VULCAN HD189 example nz, unconfirmed for the
+  VULCAN-0D reference and Canoe) and the peak throughput separately, prints mini-chem ratios only at
+  mini-chem's 1 thread (cross-host: where mini-chem was timed is unrecorded), and exits non-zero
+  instead of writing a partial CSV.
+
 ## REVISION 2026-09-30: correctness and contract fixes (audit theme T1)
 
 Production training numerics are unchanged by these fixes except the three listed at the end of this

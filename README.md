@@ -37,7 +37,7 @@ every non-default config value.
       aoti_export.py      AOT Inductor packaging + validation
       predictions.py      autoregressive rollout plots (diagnostic)
       training_logs.py    training-curve plots (diagnostic)
-      eval_rollout_error.py   percentile rollout-error vs step (paper headline metric)
+      eval_rollout_error.py   rollout-error curves vs step over a seeded validation sample (per-species dex)
       bench_speedup.py    exported-model (CPU and CUDA) latency sweep vs mini-chem per-cell cost
       science.mplstyle    shared matplotlib style for the paper figures
       run.pbs             HPC: post-training export + plots job
@@ -116,10 +116,25 @@ first checkpoint must be removed by hand.)
 
 ### 4. Export and inspect
 
-    python -u testing/export.py           # 1-step physical-space .pt2 (edit RUN_DIR; defaults to models/stage2)
-    python -u testing/aoti_export.py      # AOT Inductor package + validation
-    python -u testing/predictions.py      # rollout plots against a shard
-    python -u testing/bench_speedup.py    # exported-model latency sweep (edit RUN_DIR)
+Every tool acts on the run named by `AUTOCHEM_CONFIG_PATH` (its `paths.work_dir`), so the
+same commands serve stage 1 and stage 2:
+
+    AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u testing/export.py              # 1-step physical-space .pt2 (CPU + CUDA)
+    AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u testing/aoti_export.py         # AOT Inductor package + validation
+    AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u testing/eval_rollout_error.py  # rollout-error curves (validation split)
+    AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u testing/predictions.py         # rollout plot against a shard
+    AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u testing/bench_speedup.py       # exported-model latency sweep
+    AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u testing/training_logs.py       # loss curves
+
+Export requires a finished run (`COMPLETED`) whose checkpoint matches its processed data
+(`norm_sha256`); every requested device must be available. Inputs are in physical units
+(P in dyn/cm^2, T in K, dt in s, species mixing ratios; see spec 4.3); a row whose dt, P or
+T lies outside the trained range, or whose inputs are not finite, comes back as NaN. Each
+artifact is checked against the eager model before it replaces the previous one.
+`aoti_export.py` installs its package only when it matches the fresh export (otherwise it
+writes its reports and exits 1); the package does no input validation, so hosts must call
+it through `_check_step_inputs` or apply the same checks (spec 4.3). It is not run on daw:
+torch 2.8 extracts AOTI packages into the shared system temp dir.
 
 A fast end-to-end check on synthetic data (no real dataset needed):
 

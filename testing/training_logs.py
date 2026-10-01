@@ -8,12 +8,8 @@ segments are merged in order (unsuffixed = 0, then N, then metrics.csv), so an e
 after a restart takes its latest values. LearningRateMonitor's epoch-less lr/* rows are
 attached to the next epoch row of the same file (the LR at that epoch's start).
 
-Assumes repo layout:
-  <repo>/
-    src/
-    testing/  (this file)
-    testing/science.mplstyle
-    models/<run>/metrics.csv
+Run (the run directory is paths.work_dir of the config, testing/run_dir.py):
+  AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u testing/training_logs.py
 
 Saves:
   <run_dir>/metrics_cleaned.csv
@@ -31,18 +27,19 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 
+from run_dir import resolve_run_dir  # noqa: E402  (testing/ is this script's directory)
+
 # -----------------------------------------------------------------------------
 # User-editable settings
 # -----------------------------------------------------------------------------
 
-# Run/artifact selection (main knobs).
-RUN_DIR: str = "models/stage2"  # Absolute path or repo-relative path
+# Run/artifact selection: the run comes from AUTOCHEM_CONFIG_PATH (testing/run_dir.py).
 METRICS_FILE: str = "metrics.csv"
 
 # Output.
 OUT_NAME: str = "loss_curves.png"
 OUT_CLEAN_METRICS_NAME: str = "metrics_cleaned.csv"
-PLOTS_SUBDIR: str = "plots"  # Relative to RUN_DIR
+PLOTS_SUBDIR: str = "plots"  # Relative to the run directory
 
 # Plot behavior.
 PLOT_COMPONENTS: bool = False  # Set True to also plot log10_mae and z_mse losses
@@ -82,13 +79,6 @@ PREFERRED_METRIC_ORDER: tuple[str, ...] = (
     "val_loss_z_mse",
     "train_rollout_steps",
 )
-
-
-def _resolve_repo_path(raw: str) -> Path:
-    p = Path(raw).expanduser()
-    if not p.is_absolute():
-        p = (ROOT / p).resolve()
-    return p.resolve()
 
 
 # =============================================================================
@@ -330,7 +320,7 @@ def plot_losses(m, out_path: Path, *, run_name: str) -> None:
 
 def main() -> None:
     apply_style()
-    run_dir = _resolve_repo_path(RUN_DIR)
+    run_dir = resolve_run_dir()
     segments = metrics_segments(run_dir)
     clean_metrics_path = _resolve_clean_metrics_path(run_dir)
     out_path = _resolve_output_path(run_dir)
