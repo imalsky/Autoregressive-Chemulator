@@ -1,5 +1,23 @@
 # Production config decisions — evidence and justification
 
+## REVISION 2026-10-01: persistence skill and a provisional gate 1 (author decisions, theme D1)
+
+Author decisions of 2026-10-01 (open items 1 and 2). Training numerics, val_loss and the monitors
+are unchanged (30-step fingerprint bitwise identical to the previous reference; metrics.csv gains
+two columns). What changed:
+- Validation logs `val_persistence_loss` (the val_loss definition, same weights, mask and windows,
+  scored on y_next = y) and `val_skill` = 1 − val_loss / val_persistence_loss from the two epoch
+  means, in metrics.csv and in a weights_only run's init_val.json. Diagnostics only: nothing
+  monitors them.
+- `testing/eval_rollout_error.py` adds persistence curves, a model-vs-persistence loss ratio and
+  skill table by window-start decade (the run's val_loss definition recomputed from the export's
+  outputs), and the gate-1 pass/fail lines; its headline rows state their step and dt. The shards
+  hold no time, so the script now replays each window's start time from the build's raw files
+  with preprocessing's own draws and checks every replayed window against its shard row (about
+  1.5 min of extra reads on the 4-file build, an estimate from one file's sample).
+- Gate 1 is restated as skill against persistence, PROVISIONAL ("Validation protocol"); the
+  stage-2 target stays a reported per-species p90 in dex at a stated step and dt.
+
 ## REVISION 2026-10-01: documents aligned with the code and the audit's measurements (audit theme T8)
 
 Documentation, two docstrings and two code comments, and `_comment` keys in the configs: no code
@@ -834,7 +852,7 @@ training transitions have no raw output strictly inside them. Estimated floors (
 Richardson extrapolation from 2h and 4h subgrids): per-step increments about 2–5e-4 dex mean;
 label values about 1e-3 dex mean (worst interval position p90 about 1.25e-3, p99 about 0.022 dex;
 far worse below 1e-25, leave-one-out p99 0.54 dex). So:
-- run-to-run one-jump val_loss differences below about 5e-4 near the ~7e-4 gate are not accuracy
+- run-to-run one-jump val_loss differences below about 5e-4 near the former ~7e-4 gate are not accuracy
   differences;
 - stage-2 K=10 val_loss carries about 0.5–1.5e-3 dex of label noise (inferred);
 - no absolute-accuracy or per-species p99 claim below about 0.02 dex can be made against an
@@ -851,13 +869,19 @@ dense-output VULCAN reruns for a few (T, P) (recommendation).
 The three gates are the author's (2026-06-09). Audit corrections and open points are marked
 (2026-10-01). The runs happen on daw through run_daw.sh (the HPC route is retired).
 
-1. Stage-1: val one-jump loss ≤ v3 reference (~7e-4). **Reference not comparable (spec 6.7)**:
-   ~7e-4 is v3's first crossing (epoch 45); v3's recorded minimum is 4.03e-4 (epoch 207), on other
-   data and validation windows ("Where the evidence is"). Persistence (y_next = y) scores 0.0112 on
-   the stage-1 validation definition, about 16× the gate, so it is a floor to report beside the
-   gate, not a gate. The threshold is the author's; the audit's recommendation (pending) is a skill
-   ratio against persistence measured on this data (open items). The interpolation floor limits
-   what the gate resolves ("Label accuracy").
+1. Stage-1: **skill against persistence (PROVISIONAL, author 2026-10-01; revisit after the first
+   trained model)**. Pass if, overall, the model's loss is at most 0.5 × persistence's, and it is
+   below persistence's (ratio < 1) in every window-start decade, especially from 1e3 s on. The loss is
+   the run's val_loss definition; persistence is y_next = y. Reported by
+   `testing/eval_rollout_error.py` as pass/fail lines (constants `GATE1_MAX_LOSS_RATIO`,
+   `GATE1_MAX_DECADE_RATIO`, `GATE1_LATE_START_S`), never enforced by training or by the exit
+   status. Training logs the same comparison per epoch as diagnostics (`val_persistence_loss`,
+   `val_skill` in metrics.csv and init_val.json). Replaces the earlier gate "val one-jump loss ≤ v3
+   reference (~7e-4)", whose **reference is not comparable (spec 6.7)**: ~7e-4 is v3's first
+   crossing (epoch 45); v3's recorded minimum is 4.03e-4 (epoch 207), on other data and validation
+   windows ("Where the evidence is"); persistence scores 0.0112 on the stage-1 validation
+   definition, about 16× that threshold (open item 2). The interpolation floor limits what the gate
+   resolves ("Label accuracy").
 2. Stage-2 (the deliverable's real test): held-out test-split **open-loop rollouts at
    fixed dt = 6.4 s for K ≥ 100**, plus dt = 0.5 s and dt = 100 s; require 100% finite
    trajectories, error growth that flattens after the transient (the sandbox shape:
@@ -894,20 +918,23 @@ local raw files unless noted; "inferred" and "estimate" mark what was not measur
 exists, the audit's recommendation. Items already recorded in a row above are pointed to.
 
 **Evaluation, gates and the paper headline**
-1. Stage-2 target (R2-021, R2-027). Recommended default: a reported paper target, not a hard gate
-   (consistent with spec 6.3): per-species p90 in dex (pooled value also reported) on the
-   validation split during development and on the test split once at the end, at a named step and
-   dt, with the % equivalent, against the stage-1 export run through the same script (not the
-   sibling's pooled 56.6%). The threshold is the author's; numbers under gate 2. Today
-   eval_rollout_error.py scores random-dt windows with K ≤ 98.
+1. Stage-2 target (R2-021, R2-027). **Decided 2026-10-01 (author): a reported target, not a hard
+   gate** (spec 6.3): per-species p90 in dex (pooled value also reported) on the validation split
+   during development and on the test split once at the end, at a stated step and dt, with the %
+   equivalent, against the stage-1 export run through the same script (not the sibling's pooled
+   56.6%). eval_rollout_error.py states the step (from its start index) and the dt with every
+   headline row. Still open: the threshold (numbers under gate 2) and a fixed-dt set (item 5);
+   today the script scores random-dt windows (each window's own constant dt) with K ≤ 98.
 2. Gate 1 (R1-013). Persistence (y_next = y) scores 0.0112 on the stage-1 validation definition and
    0.0308 on the stage-2 masked K=10 definition (rebuilt real chunks, approximate statistics); 71% of
    its stage-1 loss comes from the top 1% of windows, and its per-window loss falls from 0.023
    (t_start < 0.1 s) to 1.8e-5 (> 1e5 s), so val_loss mainly measures early transients.
-   Recommendation: log val_persistence_loss and val_skill (ratio of epoch means) as diagnostics, add
-   a persistence row to the rollout evaluation, and restate gate 1 as a skill threshold measured on
-   this data with a per-decade floor (skill > 0 in every window-start decade, especially ≥ 1e3 s).
-   Unverified audit point (R9-012): persistence may already meet a stage-2 target for late starts.
+   **Decided 2026-10-01 (author), implemented, PROVISIONAL**: val_persistence_loss and val_skill
+   (ratio of epoch means) are logged as diagnostics; eval_rollout_error.py adds persistence curves
+   and a loss-ratio and skill table by window-start decade, and reports gate 1 (gate 1 under
+   "Validation protocol": ratio ≤ 0.5 overall, < 1 in every decade). Revisit the thresholds after
+   the first trained model. Unverified audit point (R9-012): persistence may already meet a
+   stage-2 target for late starts; the eval's persistence rows now show it.
 3. Selection metric (R1-034; row "stage-2 val_loss definition"). Recommendation: one
    behaviour-neutral diagnostic val_loss over all K steps when skip > 0. If rollout re-ranking is
    wanted: a second, monitor-free ModelCheckpoint every N epochs (about 0.61 GB per full

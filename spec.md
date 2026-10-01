@@ -1,6 +1,6 @@
 # Autoregressive Chemical Kinetics Emulator Specification
 
-Version: 1.9
+Version: 1.10
 Date: 2026-10-01
 Audience: Professional collaborators and maintainers
 
@@ -108,7 +108,7 @@ Audience: Professional collaborators and maintainers
 2. `testing/export.py` and `testing/aoti_export.py` produce/validate deployment artifacts and follow the strict no-fallback contract.
 3. The plotting/inspection diagnostics (`testing/predictions.py`, `testing/bench_speedup.py`, `testing/training_logs.py`, `testing/efficiency_summary.py`, `testing/profile_training.py`) may use explicit best-effort behavior for portability and local usability.
 4. `testing/run_local_smoke.sh` (run as `bash run_daw.sh smoke`) is the integration gate: the production configs, shrunk, on synthetic data through preprocessing (its two reject paths), both stages with the production compile settings, a deliberate extension and a refused re-run of a finished run, the `best.ckpt` handoff, both stage-2 recipes, the Fourier-dt fallback pair and the gated export with a reload check. It asserts the outcomes (finite losses, epoch counts, `COMPLETED`, `last.ckpt` at the final epoch, a ragged last validation batch, compiled-variant counts, weights that change, NaN rows out of range) and fails on the first wrong one. Run it before committing changes to `src/`, `processing/` or the export.
-5. `testing/eval_rollout_error.py` (rollout error vs step) and the planned fixed-dt evaluation-set generator are diagnostics under 6.3: the stage-2 rollout target in `docs/DECISIONS.md` is not a hard gate while 6.3 stands, and defining it is an open author decision. If the author makes it a gate, both move under the strict contract of 4.4.2: a non-zero exit on NaN percentiles, a K below the requested K, non-finite trajectories, truncated rows or a missed target.
+5. `testing/eval_rollout_error.py` (rollout error vs step, against persistence) and the planned fixed-dt evaluation-set generator are diagnostics under 6.3: the stage-2 rollout target in `docs/DECISIONS.md` is a reported target (per-species p90 in dex at a stated step and dt; its threshold is an open author decision), not a hard gate, and the provisional stage-1 gate (skill against persistence) is printed as pass/fail lines that do not change the exit status. The script reads the build's raw files to recover window-start times. If the author makes either a gate, both move under the strict contract of 4.4.2: a non-zero exit on NaN percentiles, a K below the requested K, non-finite trajectories, truncated rows or a missed target.
 
 ## 5. Data and Schema Contracts
 1. Raw input data schema is stable and assumed unchanged.

@@ -37,7 +37,8 @@ the config values (values without evidence are listed there as inherited / unjus
       aoti_export.py      AOT Inductor packaging + validation
       predictions.py      autoregressive rollout plots (diagnostic)
       training_logs.py    training-curve plots (diagnostic)
-      eval_rollout_error.py   rollout-error curves vs step over a seeded validation sample (per-species dex)
+      eval_rollout_error.py   rollout-error curves vs step over a seeded validation sample (per-species dex),
+                              with persistence, loss vs persistence by window-start decade, gate-1 lines
       bench_speedup.py    exported-model (CPU and CUDA) latency sweep vs mini-chem per-cell cost
       run_local_smoke.sh  end-to-end smoke on synthetic data (the integration gate)
     run_daw.sh            daw launcher: preprocess -> stage 1 -> stage 2, each with its post step

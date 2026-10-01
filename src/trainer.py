@@ -27,6 +27,9 @@ Optional curriculum (training only):
 Logging:
 - Uses Lightning CSVLogger. All self.log(...) metrics are written to metrics.csv.
 - LearningRateMonitor logs LR automatically.
+- Persistence diagnostics (validation): val_persistence_loss is the val_loss definition (same
+  weights, mask and windows) scored on y_next = y, the window's first state carried forward;
+  val_skill = 1 - val_loss / val_persistence_loss from the two epoch means. Neither is monitored.
 - Per-epoch timing uses time.perf_counter at three device-synchronized hook boundaries (epoch
   start, validation start, epoch end; no sync per step):
     epoch_time_sec            training plus the end-of-epoch validation pass (checkpoint writes
@@ -103,7 +106,7 @@ _TRAIN_FLOPS_PER_FORWARD = 3    # forward + backward (input and weight gradients
 _BYTES_PER_GB = 1e9
 _MS_PER_S = 1e3
 _FLOPS_PER_TFLOP = 1e12
-# Float format of the per-epoch INFO line (val_loss near the ~7e-4 stage-1 gate needs more than the
+# Float format of the per-epoch INFO line (val_loss near the former ~7e-4 stage-1 gate needs more than the
 # 3 decimals EarlyStopping prints).
 _EPOCH_LOG_FLOAT_FMT = "%.6e"
 log = logging.getLogger(__name__)
@@ -1047,6 +1050,10 @@ class FlowMapRolloutModule(pl.LightningModule):
         self.log("val_loss", loss_total, on_step=False, on_epoch=True, prog_bar=True)
         self.log("val_loss_log10_mae", losses["loss_log10_mae"], on_step=False, on_epoch=True)
         self.log("val_loss_z_mse", losses["loss_z_mse"], on_step=False, on_epoch=True)
+        # Persistence (y_next = y: the window's first state carried forward) under the same loss,
+        # step weights and mask: the model-free baseline of val_skill (a diagnostic; never monitored).
+        persistence = self.criterion(y0.unsqueeze(1).expand_as(y_true), y_true, step_weights=step_weights)
+        self.log("val_persistence_loss", persistence["loss_total"], on_step=False, on_epoch=True)
 
         return loss_total
 
@@ -1078,6 +1085,11 @@ class FlowMapRolloutModule(pl.LightningModule):
                 f"(global_step {self.global_step}): training diverged; aborting before this "
                 "epoch's checkpoint is written."
             )
+        # val_skill = 1 - val_loss / val_persistence_loss from the two epoch means (a diagnostic, also
+        # logged by the weights_only init validation; a zero persistence mean gives -inf or nan).
+        persistence = self.trainer.callback_metrics.get("val_persistence_loss")
+        if persistence is not None:
+            self.log("val_skill", 1.0 - metric / persistence, on_step=False, on_epoch=True)
         if self.trainer.sanity_checking:  # the pre-training sanity batch is not an epoch
             return
         # No LR cut while the curriculum ramps: val_loss is measured at the full horizon while

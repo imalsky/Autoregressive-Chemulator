@@ -116,7 +116,7 @@ _COMPLETED_NAME = "COMPLETED"
 _PROVENANCE_NAME = "provenance.jsonl"
 # weights_only: the loaded weights' validation scores before any training (separate Trainer).
 _INIT_VAL_NAME = "init_val.json"
-_VAL_METRICS = ("val_loss", "val_loss_log10_mae", "val_loss_z_mse")
+_VAL_METRICS = ("val_loss", "val_loss_log10_mae", "val_loss_z_mse", "val_persistence_loss", "val_skill")
 # The repository checkout that holds this file (git provenance).
 _CODE_DIR = Path(__file__).resolve().parent
 

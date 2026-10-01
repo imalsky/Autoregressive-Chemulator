@@ -8,14 +8,24 @@ seeded window per source. The windows are the processed random-dt shards (dt log
 trained range), so K <= T - 1 - ROLLOUT_START_INDEX (98 today) and every row is labelled
 "random-dt, K <= 98": no fixed-dt evaluation set exists yet.
 
-Reported per rollout step (no pass/fail thresholds; spec 6.3):
+Reported per rollout step, for the model and for persistence (y_next = y, the start state carried
+forward):
 - per-species |log10(yp) - log10(yt)| p50 / p90 in dex (recommended headline; the author confirms
   the paper target) and the median / mean signed log10(yp / yt) (bias); 10% fractional error is
-  about 0.041 dex for an overshoot and 0.046 dex for an undershoot;
+  about 0.041 dex for an overshoot and 0.046 dex for an undershoot. The headline states its rollout
+  step and its dt (each window's own constant dt; there is no fixed-dt set yet);
 - the legacy pooled fractional-error percentiles |yp - yt| / (|yt| + FRAC_ERR_FLOOR) for continuity
   (the floor hides trace-species error; the share of scored truth below 1e-12 and 1e-20 is printed);
 - n_finite. Percentiles keep a fixed population: a diverged (non-finite) entry ranks as +inf error,
   so an inf percentile means more than that tail fraction diverged.
+Loss against persistence: the run's val_loss definition (training.rollout_steps from the rollout
+start, steps >= skip_steps for an AR run, the run's loss weights), recomputed in float64 from the
+export's physical outputs (values clipped at epsilon), for the model and for persistence, as a ratio
+of means and skill = 1 - ratio, overall and by window-start decade. The window-start time is
+t_start + ROLLOUT_START_INDEX * dt; the shards hold no time, so t_start is replayed from the run's
+raw files with preprocessing's own per-trajectory draws and every replayed window is checked
+against its shard row. Gate 1 (the stage-1 accuracy gate, PROVISIONAL; GATE1_* below) is printed as
+pass/fail lines for a one-jump run; it is reported only, never enforced (the exit status ignores it).
 Bootstrap CIs over sources are given at the report steps. Sources whose dt, P or T lies outside the
 export's trained box (NaN rows by the export contract) are dropped before the rollout and counted
 apart from divergence. If this run was started with weights_only from another run whose evaluation
@@ -23,10 +33,12 @@ on the same selection exists, a paired bootstrap of the difference is added.
 
 Run (once per stage, e.g. after export.py):
   AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u testing/eval_rollout_error.py
-Outputs (in the run directory, named by split): rollout_error_curve_<split>.csv,
-rollout_error_species_<split>.csv, rollout_error_<split>.json (provenance and CIs) and
-rollout_error_<split>_per_source.npz (per-source errors at the report steps, for paired comparisons).
-The CPU export runs at full float32 (TF32 does not apply on CPU).
+Outputs (in the run directory, named by split): rollout_error_curve_<split>.csv (model and
+persistence columns), rollout_error_species_<split>.csv, rollout_error_<split>.json (provenance,
+CIs, loss against persistence and the gate-1 lines) and rollout_error_<split>_per_source.npz
+(per-source errors at the report steps, window-start times and losses, for paired comparisons).
+The CPU export runs at full float32 (TF32 does not apply on CPU). Inputs besides the export and the
+shards: the build's raw files (window-start times), as recorded in its preprocessing_summary.json.
 """
 from __future__ import annotations
 
@@ -36,21 +48,25 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
+import h5py
 import numpy as np
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "testing"))
+sys.path.insert(0, str(ROOT / "processing"))
 
 import export as E  # noqa: E402  (export's baked normalizer: the round-trip check; src/utils fingerprint)
 import predictions as P  # noqa: E402  (its independent numpy inverse normalization and loaders)
+import preprocessing as PP  # noqa: E402  (its own window draws: the window-start time replay)
 from run_dir import resolve_run_dir  # noqa: E402
 from utils import file_sha256, normalization_sha256  # noqa: E402
 
 # Every gate, flip and trigger decision uses validation; 'test' only for the single final paper run.
 EVAL_SPLIT = "validation"
 # None => the run config's paths.processed_dir; or the root of a designed evaluation set in the
-# same shard schema and normalization (checked by norm_sha256).
+# same shard schema and normalization (checked by norm_sha256), built by preprocessing.py: the
+# window-start replay reads its preprocessing_summary.json and the raw files it records.
 EVAL_SHARD_ROOT: str | None = None
 EVAL_N_SOURCES = 4000          # inherited (the former trajectory cap); one window per source
 EVAL_SEED = 0                  # source and window selection
@@ -71,6 +87,19 @@ TRUTH_DISCLOSURE_LEVELS = (1e-12, 1e-20)
 # (4.8e-7); a wrong statistic shows up as a much larger error.
 NORM_ROUNDTRIP_TOL_Z = 1e-5
 DATA_LABEL = "random-dt, K <= 98 (processed shards; no fixed-dt evaluation set yet)"
+# Gate 1, the stage-1 accuracy gate (PROVISIONAL, author 2026-10-01; revisit after the first trained
+# model): skill against persistence, because persistence already scores the stage-1 validation loss
+# at ~16x the old ~7e-4 threshold and its loss falls ~1000x from early to late window starts.
+# Pass: overall loss <= GATE1_MAX_LOSS_RATIO x persistence, and loss < persistence in every
+# window-start decade (ratio < GATE1_MAX_DECADE_RATIO); the decades from GATE1_LATE_START_S on (the
+# author's "especially") also get their own line.
+GATE1_MAX_LOSS_RATIO = 0.5
+GATE1_MAX_DECADE_RATIO = 1.0
+GATE1_LATE_START_S = 1e3
+# Window-start replay: a shard row matches a raw group by (P, T) and a replayed draw by dt within
+# this relative tolerance (float32 z and dt_norm storage moves them by ~1e-6), and the replayed
+# window must re-normalize to the shard row within NORM_ROUNDTRIP_TOL_Z.
+REPLAY_MATCH_RTOL = 1e-5
 
 
 def _pctl_fixed_pool(x: np.ndarray, q: Any, axis: Any = None) -> np.ndarray:
@@ -146,12 +175,100 @@ def _check_roundtrip(manifest, species_keys, global_keys, *, y0_phys, g_phys, dt
     print(f"[check] normalization round trip max error per key: {errs}")
 
 
+def _window_start_times(pcfg, summary, manifest, *, g_phys, dt_s, y_z) -> np.ndarray:
+    """t_start (s, the window's first state) of each selected window, replayed from the run's raw files.
+
+    The shards hold no time. Each window's source group is found by its (P, T) among the EVAL_SPLIT
+    groups of the build's raw files, its draws are replayed with preprocessing's own per-trajectory
+    generator (seed, group name) and functions as in sample_file (valid = t_raw > 0), the draw is
+    matched by dt, and the replayed window must re-normalize to the shard row (z) within
+    NORM_ROUNDTRIP_TOL_Z. Any miss raises. g_phys [N, G], dt_s [N] and y_z [N, T, S] are the rows'.
+    """
+    names, files, gs = [], [], []
+    for r in summary["raw_files"]:
+        path = pcfg.raw_dir / r["name"]
+        if not path.is_file() or path.stat().st_size != int(r["size_bytes"]):
+            raise FileNotFoundError(f"{path}: missing or not the size the build recorded ({r['size_bytes']} bytes)")
+        with h5py.File(path, "r") as fin:
+            for name in fin.keys():
+                if PP.split_for_trajectory(r["name"], name, seed=PP.SPLIT_SEED, val_frac=pcfg.val_fraction,
+                                           test_frac=pcfg.test_fraction) != EVAL_SPLIT:
+                    continue
+                grp = fin[name]
+                try:
+                    g = PP.read_globals_vector(grp, global_vars=pcfg.global_variables, leaf_index=PP.leaf_dataset_index(grp))
+                except (KeyError, TypeError, ValueError):
+                    continue  # a group preprocessing rejects at its globals has no windows
+                names.append(name)
+                files.append(path)
+                gs.append(g)
+    raw_g = np.asarray(gs, dtype=np.float64)
+    order = np.argsort(raw_g[:, 0], kind="stable")
+    raw_g = raw_g[order]
+    mu = np.array([float(manifest["per_key_stats"][s]["log_mean"]) for s in pcfg.species_variables])
+    sd = np.array([float(manifest["per_key_stats"][s]["log_std"]) for s in pcfg.species_variables])
+    by_file: Dict[Path, List[tuple[int, str]]] = {}
+    for i in range(g_phys.shape[0]):
+        lo = np.searchsorted(raw_g[:, 0], g_phys[i, 0] * (1.0 - REPLAY_MATCH_RTOL), side="left")
+        hi = np.searchsorted(raw_g[:, 0], g_phys[i, 0] * (1.0 + REPLAY_MATCH_RTOL), side="right")
+        hit = [j for j in range(lo, hi) if abs(raw_g[j, 1] / g_phys[i, 1] - 1.0) <= REPLAY_MATCH_RTOL]
+        if len(hit) != 1:
+            raise ValueError(f"window {i}: (P, T) = {g_phys[i].tolist()} matches {len(hit)} raw {EVAL_SPLIT} groups, not 1")
+        j = int(order[hit[0]])
+        by_file.setdefault(files[j], []).append((i, names[j]))
+    t_start = np.full(g_phys.shape[0], np.nan)
+    offsets = np.arange(pcfg.n_steps, dtype=np.float64)
+    for path, items in by_file.items():
+        with h5py.File(path, "r") as fin:
+            for i, name in items:
+                grp = fin[name]
+                li = PP.leaf_dataset_index(grp)
+                t_raw = PP.read_time(grp, time_key=pcfg.time_key, leaf_index=li)
+                y_raw = PP.read_species_matrix(grp, t_len=t_raw.shape[0], species_vars=pcfg.species_variables, leaf_index=li)
+                valid = t_raw > 0
+                t_valid, y_valid = t_raw[valid], y_raw[valid, :]
+                rng = np.random.default_rng([int(pcfg.seed), PP._seed_word(str(name))])
+                draws = []
+                for sidx in range(pcfg.samples_per_source_trajectory):
+                    d = PP.sample_dt(pcfg, rng)
+                    t0 = PP.pick_t_start(t_raw=t_raw, t_valid=t_valid, dt_s=d, n_steps=pcfg.n_steps, t_min=pcfg.t_min,
+                                         rng=rng, anchor_first=(sidx == 0), max_attempts=pcfg.max_chunk_attempts_per_source)
+                    if t0 is not None and abs(d / dt_s[i] - 1.0) <= REPLAY_MATCH_RTOL:
+                        draws.append((d, t0))
+                if len(draws) != 1:
+                    raise ValueError(f"window {i} ({path.name}:{name}): {len(draws)} replayed draws match dt={dt_s[i]:.9g} s, not 1")
+                d, t0 = draws[0]
+                i0, i1, w = PP.prepare_log_interp(np.log10(t_valid), np.log10(t0 + offsets * d))
+                y_new = PP.interp_loglog(y_valid, i0=i0, i1=i1, w=w, epsilon=pcfg.epsilon).astype(np.float32)
+                z = (np.log10(np.maximum(y_new.astype(np.float64), pcfg.epsilon)) - mu) / sd
+                err = float(np.max(np.abs(z - y_z[i].astype(np.float64))))
+                if err > NORM_ROUNDTRIP_TOL_Z:
+                    raise ValueError(f"window {i} ({path.name}:{name}): the replayed window differs from its shard row by {err:.3g} (z)")
+                t_start[i] = t0
+    return t_start
+
+
+def _loss_definition(cfg: Dict[str, Any], manifest: Dict[str, Any], species_keys: List[str]) -> Dict[str, Any]:
+    """The run's val_loss definition: training.rollout_steps steps, steps >= skip_steps weighted 1 in an AR run."""
+    t = cfg["training"]
+    k = int(t["rollout_steps"])
+    skip = int(t["autoregressive_training"]["skip_steps"]) if t["autoregressive_training"]["enabled"] else 0
+    return {
+        "k": k, "skip": skip, "weights": np.array([0.0 if i < skip else 1.0 for i in range(k)]),
+        "lambda_log10_mae": float(t["loss"]["lambda_log10_mae"]), "lambda_z_mse": float(t["loss"]["lambda_z_mse"]),
+        "log_std": np.array([float(manifest["per_key_stats"][s]["log_std"]) for s in species_keys]),
+    }
+
+
 @torch.inference_mode()
-def _rollout_stats(model, y0_phys, g_phys, dt_seconds, y_true, *, eps: float, b_max: int, report_idx: List[int]):
+def _rollout_stats(model, y0_phys, g_phys, dt_seconds, y_true, *, eps: float, b_max: int, report_idx: List[int],
+                   loss_def: Dict[str, Any]):
     """Steps in the outer loop, row chunks of at most b_max in the inner loop; keep only the [N, S] state.
 
     Returns per-step pooled frac percentiles, pooled dex p90, per-species dex percentiles and bias,
-    n_finite, the truth-below-level shares, and the per-source dex at the report steps.
+    n_finite, the truth-below-level shares, the per-source dex at the report steps, and the per-source
+    loss under loss_def (lambda_log10_mae * mean |dlog10| + lambda_z_mse * mean (dlog10 / log_std)^2
+    over species, weighted over the first loss_def["k"] steps; +inf for a diverged source).
     """
     N, K, S = y_true.shape
     state = torch.from_numpy(y0_phys.astype(np.float32))
@@ -159,6 +276,7 @@ def _rollout_stats(model, y0_phys, g_phys, dt_seconds, y_true, *, eps: float, b_
     dt = torch.from_numpy(dt_seconds.astype(np.float32))
     out: Dict[str, Any] = {"frac": [], "dex_p90": [], "species_dex": [], "bias_median": [], "bias_mean": [],
                            "n_finite": [], "dex_at_report": []}
+    window_loss = np.zeros(N)
     below = {lvl: 0 for lvl in TRUTH_DISCLOSURE_LEVELS}
     for k in range(K):
         nxt = [model(state[i:i + b_max], dt[i:i + b_max, k], g[i:i + b_max]) for i in range(0, N, b_max)]
@@ -182,7 +300,13 @@ def _rollout_stats(model, y0_phys, g_phys, dt_seconds, y_true, *, eps: float, b_
         out["n_finite"].append(int(np.isfinite(yp).all(axis=1).sum()))
         if k in report_idx:
             out["dex_at_report"].append(dex)
+        if k < loss_def["k"] and loss_def["weights"][k] > 0.0:
+            with np.errstate(invalid="ignore"):
+                term = (loss_def["lambda_log10_mae"] * dex.mean(axis=1)
+                        + loss_def["lambda_z_mse"] * np.square(dex / loss_def["log_std"]).mean(axis=1))
+            window_loss += loss_def["weights"][k] * np.where(np.isfinite(term), term, np.inf)
     out["truth_share_below"] = {f"{lvl:g}": below[lvl] / float(N * K * S) for lvl in below}
+    out["window_loss"] = window_loss / loss_def["weights"].sum()
     return out
 
 
@@ -283,10 +407,24 @@ def main() -> None:
     y0_phys, y_true, g_phys, dt_seconds = y0_phys[keep], y_true[keep], g_phys[keep], dt_seconds[keep]
     kept_rows = [r for r, k_ in zip(rows, keep, strict=True) if k_]
 
+    # The build's own preprocessing record (paths relative to its processed_dir) drives the replay.
+    bc = summary["config"]
+    pcfg = PP.PreCfg(**{**bc, "raw_dir": (shard_root / bc["raw_dir"]).resolve(),
+                        "processed_dir": (shard_root / bc["processed_dir"]).resolve()})
+    t_start = _window_start_times(pcfg, summary, manifest, g_phys=g_phys, dt_s=dt_seconds[:, 0], y_z=y_mat[keep])
+    t_window = t_start + ROLLOUT_START_INDEX * dt_seconds[:, 0]
+    print(f"[check] window-start times replayed from {pcfg.raw_dir} for {t_start.size} windows "
+          f"(each re-interpolated window matches its shard row within {NORM_ROUNDTRIP_TOL_Z:g} in z)")
+
     report = sorted({min(s, K) for s in REPORT_STEPS})
     headline = sorted({min(s, K) for s in HEADLINE_STEPS})
+    loss_def = _loss_definition(cfg, manifest, species_keys)
+    if loss_def["k"] > K:
+        raise ValueError(f"training.rollout_steps={loss_def['k']} exceeds the K={K} evaluated steps")
     stats = _rollout_stats(model, y0_phys, g_phys, dt_seconds, y_true, eps=eps, b_max=b_max,
-                           report_idx=[s - 1 for s in report])
+                           report_idx=[s - 1 for s in report], loss_def=loss_def)
+    pstats = _rollout_stats(lambda y, _dt, _g: y, y0_phys, g_phys, dt_seconds, y_true, eps=eps, b_max=b_max,
+                            report_idx=[s - 1 for s in report], loss_def=loss_def)
     n_kept = int(keep.sum())
     print(f"non-finite (diverged) sources at the last step: {n_kept - stats['n_finite'][-1]}/{n_kept}")
     print(f"definitions: values clipped at epsilon={eps:g}; dex = |log10(yp) - log10(yt)|; "
@@ -295,25 +433,81 @@ def main() -> None:
           + f" (the fractional error's {FRAC_ERR_FLOOR:g} floor hides relative error below it)")
 
     names = [s.replace("_evolution", "") for s in species_keys]
-    print(f"\n{'step':>5} " + " ".join(f"frac_p{p:<2}" for p in PCTLS) + "   dex_p90  n_finite")
+    i90 = SPECIES_PCTLS.index(90)
+    print(f"\n{'step':>5} " + " ".join(f"frac_p{p:<2}" for p in PCTLS) + "   dex_p90  persistence_dex_p90  n_finite")
     for k in range(K):
         if (k + 1) in report:
             print(f"{k + 1:>5} " + " ".join(f"{v:7.1f}%" for v in stats["frac"][k])
-                  + f"   {stats['dex_p90'][k]:6.3f}  {stats['n_finite'][k]}")
+                  + f"   {stats['dex_p90'][k]:6.3f}  {pstats['dex_p90'][k]:19.3f}  {stats['n_finite'][k]}")
+    dt_w = dt_seconds[:, 0]
+    dt_rule = (f"each window's own constant dt (log-uniform in [{pcfg.dt_min:g}, {pcfg.dt_max:g}] s; no fixed-dt set yet); "
+               f"this selection: min {dt_w.min():.4g} s, median {np.median(dt_w):.4g} s, max {dt_w.max():.4g} s")
     print("\n=== per-species dex p90 at the headline steps (recommended headline; random-dt windows) ===")
+    print(f"step s = the s-th rollout step from start index {ROLLOUT_START_INDEX}; dt = {dt_rule}")
     for s in headline:
-        row = stats["species_dex"][s - 1][SPECIES_PCTLS.index(90)]
+        row = stats["species_dex"][s - 1][i90]
+        prow = pstats["species_dex"][s - 1][i90]
         print(f"@ step {s}: " + ", ".join(f"{n}={v:.3f}" for n, v in zip(names, row, strict=True)))
+        print(f"@ step {s} persistence: " + ", ".join(f"{n}={v:.3f}" for n, v in zip(names, prow, strict=True)))
+
+    # Loss against persistence, overall and by window-start decade (ratio of means; skill = 1 - ratio).
+    m_wl, p_wl = stats["window_loss"], pstats["window_loss"]
+
+    def vs_persistence(mask: np.ndarray) -> Dict[str, Any]:
+        m, p = float(m_wl[mask].mean()), float(p_wl[mask].mean())
+        with np.errstate(divide="ignore", invalid="ignore"):
+            r = float(np.float64(m) / np.float64(p))
+        return {"n": int(mask.sum()), "model_loss": m, "persistence_loss": p, "ratio": r, "skill": 1.0 - r}
+
+    decade = np.floor(np.log10(t_window)).astype(int)
+    by_decade = [{"t_lo_s": 10.0 ** d, "t_hi_s": 10.0 ** (d + 1), **vs_persistence(decade == d)} for d in sorted(set(decade.tolist()))]
+    overall = vs_persistence(np.ones_like(m_wl, dtype=bool))
+    loss_label = (f"the run's val_loss definition: {loss_def['k']} step(s) from start index {ROLLOUT_START_INDEX}, "
+                  f"steps >= {loss_def['skip']} weighted equally, lambda_log10_mae={loss_def['lambda_log10_mae']:g}, "
+                  f"lambda_z_mse={loss_def['lambda_z_mse']:g}; float64 from the export's outputs, clipped at "
+                  f"epsilon (not training's val_loss); window start = t_start + {ROLLOUT_START_INDEX} x dt")
+    print(f"\n=== loss vs persistence ({loss_label}) ===")
+    print(f"{'window start (s)':<20} {'n':>6} {'model_loss':>12} {'persistence':>12} {'ratio':>8} {'skill':>8}")
+    for row in by_decade + [dict(overall, t_lo_s=None)]:
+        span = "all" if row["t_lo_s"] is None else f"[{row['t_lo_s']:.0e}, {row['t_hi_s']:.0e})"
+        print(f"{span:<20} {row['n']:>6} {row['model_loss']:12.4e} {row['persistence_loss']:12.4e} "
+              f"{row['ratio']:8.4f} {row['skill']:8.4f}")
+    late = [r for r in by_decade if r["t_lo_s"] >= GATE1_LATE_START_S]
+    gate1 = {
+        "provisional": True, "enforced": False,
+        "applies": not bool(cfg["training"]["autoregressive_training"]["enabled"]),
+        "max_overall_ratio": GATE1_MAX_LOSS_RATIO, "max_decade_ratio": GATE1_MAX_DECADE_RATIO,
+        "late_start_s": GATE1_LATE_START_S,
+        "overall_pass": overall["ratio"] <= GATE1_MAX_LOSS_RATIO,
+        "decades_pass": all(r["ratio"] < GATE1_MAX_DECADE_RATIO for r in by_decade),
+        "late_decades_pass": all(r["ratio"] < GATE1_MAX_DECADE_RATIO for r in late),
+        "failing_decades_s": [r["t_lo_s"] for r in by_decade if not r["ratio"] < GATE1_MAX_DECADE_RATIO],
+    }
+    gate1["pass"] = gate1["overall_pass"] and gate1["decades_pass"]
+    if gate1["applies"]:
+        pf = {True: "PASS", False: "FAIL"}
+        print(f"gate 1 (PROVISIONAL, reported only): overall ratio {overall['ratio']:.4f} <= {GATE1_MAX_LOSS_RATIO:g}: "
+              f"{pf[gate1['overall_pass']]}")
+        print(f"gate 1: ratio < {GATE1_MAX_DECADE_RATIO:g} in every window-start decade: {pf[gate1['decades_pass']]}"
+              + (f" (failing decades from {gate1['failing_decades_s']} s)" if gate1["failing_decades_s"] else ""))
+        print(f"gate 1: ratio < {GATE1_MAX_DECADE_RATIO:g} in the decades from {GATE1_LATE_START_S:g} s on "
+              f"({len(late)} decades): {pf[gate1['late_decades_pass']]}")
+        print(f"GATE 1: {pf[gate1['pass']]}")
+    else:
+        print("gate 1 is the stage-1 (one-jump) gate; for this autoregressive run the table is a diagnostic")
 
     split = EVAL_SPLIT
     curve = run_dir / f"rollout_error_curve_{split}.csv"
     with open(curve, "w") as f:
         f.write("step," + ",".join(f"frac_p{p}" for p in PCTLS) + ",dex_p90,n_finite,"
-                + ",".join(f"dex_p90_{n}" for n in names) + "\n")
+                + ",".join(f"dex_p90_{n}" for n in names) + ",persistence_dex_p90,"
+                + ",".join(f"persistence_dex_p90_{n}" for n in names) + "\n")
         for k in range(K):
-            sp90 = stats["species_dex"][k][SPECIES_PCTLS.index(90)]
+            sp90 = stats["species_dex"][k][i90]
+            pp90 = pstats["species_dex"][k][i90]
             f.write(f"{k + 1}," + ",".join(f"{v:.6f}" for v in stats["frac"][k])
-                    + f",{stats['dex_p90'][k]:.6f},{stats['n_finite'][k]}," + ",".join(f"{v:.6f}" for v in sp90) + "\n")
+                    + f",{stats['dex_p90'][k]:.6f},{stats['n_finite'][k]}," + ",".join(f"{v:.6f}" for v in sp90)
+                    + f",{pstats['dex_p90'][k]:.6f}," + ",".join(f"{v:.6f}" for v in pp90) + "\n")
     long = run_dir / f"rollout_error_species_{split}.csv"
     with open(long, "w") as f:
         f.write("step,species,n_finite," + ",".join(f"dex_p{p}" for p in SPECIES_PCTLS) + ",bias_median_dex,bias_mean_dex\n")
@@ -325,7 +519,8 @@ def main() -> None:
     dex_at_report = np.stack(stats["dex_at_report"])  # [R, N, S]
     per_source = run_dir / f"rollout_error_{split}_per_source.npz"
     np.savez(per_source, dex_at_report=dex_at_report, report_steps=np.asarray(report),
-             rows=np.asarray(kept_rows), selection_sha256=np.asarray(selection_sha))
+             rows=np.asarray(kept_rows), selection_sha256=np.asarray(selection_sha),
+             window_start_s=t_window, window_loss=m_wl, persistence_window_loss=p_wl)
     shards_by_file = []
     cum = 0
     for r in summary["raw_files"]:
@@ -360,6 +555,9 @@ def main() -> None:
         "selection": {"seed": EVAL_SEED, "n_sources": EVAL_N_SOURCES, "rule": "uniform sources by (P, T) key, one uniform window each",
                       "sha256_of_shard_row_list": selection_sha},
         "T": T, "K": K, "start_index": ROLLOUT_START_INDEX, "report_steps": report, "headline_steps": headline,
+        "headline_dt": dt_rule,
+        "loss_vs_persistence": {"definition": loss_label, "overall": overall, "by_window_start_decade": by_decade},
+        "gate1": gate1,
         "clip_eps": eps, "frac_err_floor": FRAC_ERR_FLOOR,
         "truth_share_below": stats["truth_share_below"],
         "infer_dtype": str(infer_dtype), "torch": torch.__version__, "numpy": np.__version__,
