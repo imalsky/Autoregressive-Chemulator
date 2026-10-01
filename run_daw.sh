@@ -129,7 +129,8 @@ GPU_LOGGER_PID=""
 POST_FAILURES=()
 run_py() {  # run_py <log name> <config> <script>: python's exit status (not tee's)
   local name="$1" cfg="$2" script="$3" rc=0
-  AUTOCHEM_CONFIG_PATH="${cfg}" "${PY}" -u "${script}" > >(exec tee -a "${LOG_DIR}/${name}.log" 9>&-) 2>&1 &
+  # tee -i: Ctrl-C signals the whole process group, and tee must outlive it to log python's stop.
+  AUTOCHEM_CONFIG_PATH="${cfg}" "${PY}" -u "${script}" > >(exec tee -i -a "${LOG_DIR}/${name}.log" 9>&-) 2>&1 &
   CHILD_PID=$!
   wait "${CHILD_PID}" || rc=$?
   CHILD_PID=""
@@ -143,11 +144,10 @@ stop_gpu_logger() {
   fi
 }
 on_signal() {  # on_signal <signal> <exit status>: SIGTERM to the recorded child only (an async child ignores SIGINT)
-  log "received SIG$1: sending SIGTERM to python pid ${CHILD_PID:-none} and waiting for it"
-  if [ -n "${CHILD_PID}" ]; then
-    kill -s TERM "${CHILD_PID}" 2>/dev/null || true
-    wait "${CHILD_PID}" 2>/dev/null || true
-  fi
+  # Forward before any write: stderr may be a hung-up tty or a dead pipe, and a failed write ends this trap.
+  if [ -n "${CHILD_PID}" ]; then kill -s TERM "${CHILD_PID}" 2>/dev/null || true; fi
+  log "received SIG$1: sent SIGTERM to python pid ${CHILD_PID:-none}; waiting for it" || true
+  if [ -n "${CHILD_PID}" ]; then wait "${CHILD_PID}" 2>/dev/null || true; fi
   exit "$2"
 }
 trap stop_gpu_logger EXIT
