@@ -11,8 +11,9 @@ This script is validation-first:
 - it benchmarks the direct model-call latency for the raw and AOTI paths
 - it writes a JSON report plus a markdown report into the run directory
 
-Pass/fail: in every validation case (each benchmark batch size at dt_min, HOST_DT_SECONDS and dt_max
-from the export metadata, plus one batch with an out-of-range dt row) the AOTI package and the fresh
+Pass/fail: in every validation case (each benchmark batch size and dynamic_batch.max at dt_min,
+HOST_DT_SECONDS and dt_max from the export metadata, plus one batch with an out-of-range dt row;
+model inputs floored at the export's epsilon, the training floor) the AOTI package and the fresh
 export must return identical NaN rows, equal to the rows the inputs put outside the trained box; no
 +-inf; and max |log10(aoti) - log10(fresh)| <= MATCH_MAX_DLOG10 over the in-range rows (a case whose
 rows are all out of range checks the NaN rows only); the cases together must hold at least one
@@ -87,8 +88,12 @@ BENCHMARK_BATCH_SIZES: tuple[int | str, ...] = (1, "nz", "2*nz")
 HOST_DT_SECONDS = 6.4
 # The out-of-range validation row: one decade above dt_max, unambiguously outside the box.
 OOR_PROBE_DT_FACTOR = 10.0
-INPUT_FLOOR = 1.0e-15
-EPSILON = 1.0e-30
+# Floor of a column row's total number density before dividing by it: a guard against an empty row,
+# not a physics value (inherited 1e-30; unrelated to the normalization epsilon, which floors the
+# model inputs).
+TOTAL_DENSITY_FLOOR = 1.0e-30
+# Latency benchmark: untimed warm-up calls (first-call allocations, thread-pool start-up), then timed
+# calls averaged per (model, batch). Inherited; no recorded rationale.
 BENCHMARK_WARMUP_ITERS = 3
 BENCHMARK_ITERS = 20
 # AOTI-vs-fresh tolerance in dex: about 10x the float32 AOTI-vs-eager noise measured on a 10x2048
@@ -391,11 +396,13 @@ def _column_inputs(
     reference_column: ReferenceColumn,
     *,
     model_species: tuple[str, ...],
+    floor: float,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
-    """The column's model inputs (float32, floored) and the tracked-species sum / H2 share per row.
+    """The column's model inputs (float32, floored at `floor`) and the tracked-species sum / H2 share per row.
 
-    The sum and the share are taken before the float32 cast and INPUT_FLOOR (diagnostic only; the
-    pass/fail rule does not use them).
+    `floor` is the export's epsilon, the floor the model applies itself, so trace values down to the
+    training floor reach the comparison unchanged. The sum and the share are taken before the
+    float32 cast and the floor (diagnostic only; the pass/fail rule does not use them).
     """
     species_index = {
         species_name: position for position, species_name in enumerate(reference_column.species)
@@ -407,7 +414,7 @@ def _column_inputs(
 
     total_density = np.sum(reference_column.y_full, axis=1, keepdims=True)
     y_active = reference_column.y_full[:, active_indices]
-    ymix_active = y_active / np.maximum(total_density, EPSILON)
+    ymix_active = y_active / np.maximum(total_density, TOTAL_DENSITY_FLOOR)
     row_sum = ymix_active.sum(axis=1)
     h2_share = (ymix_active[:, model_species.index("H2")] / row_sum) if "H2" in model_species else None
     composition = {
@@ -421,7 +428,7 @@ def _column_inputs(
     }
     ymix_sanitized = np.maximum(
         np.clip(ymix_active.astype(np.float32), 0.0, None),
-        INPUT_FLOOR,
+        np.float32(floor),
     )  # shape: (nz, n_model_species)
     pco_barye = reference_column.pco_barye.astype(np.float32)
     Tco_K = reference_column.Tco_K.astype(np.float32)
@@ -675,6 +682,8 @@ def _validate_package(
         aoti_rows.append(_compute_validation_metrics(
             comparison_name="aoti_vs_fresh_raw", case=case, reference_output=fresh_output,
             candidate_output=_call_model(compiled_model, case), eps=eps, expected_nan_rows=expected))
+        if case.batch_size == b_max:  # the B_MAX case checks the package; the installed model may predate it
+            continue
         installed_rows.append(_compute_validation_metrics(
             comparison_name="installed_raw_vs_fresh_raw", case=case, reference_output=fresh_output,
             candidate_output=_call_model(installed_raw_model, case), eps=eps, expected_nan_rows=expected))
@@ -739,19 +748,24 @@ def main() -> None:
             f"installed={installed_global_variables}, fresh={fresh_export.global_variables}"
         )
 
-    y_rows, g_rows, composition = _column_inputs(reference_column, model_species=fresh_export.model_species)
+    y_rows, g_rows, composition = _column_inputs(
+        reference_column, model_species=fresh_export.model_species, floor=float(meta["epsilon"]))
+    # The largest exported batch is validated too (not benchmarked).
+    b_max = int(meta["dynamic_batch"]["max"])
+    validation_batch_sizes = batch_sizes + (() if b_max in batch_sizes else (b_max,))
     dts = {
         "dt_min": float(meta["dt_min_seconds"]),
         "host_dt": HOST_DT_SECONDS,
         "dt_max": float(meta["dt_max_seconds"]),
     }
-    cases = _build_model_call_cases(reference_column, y_rows=y_rows, g_rows=g_rows, batch_sizes=batch_sizes, dts=dts)
+    cases = _build_model_call_cases(
+        reference_column, y_rows=y_rows, g_rows=g_rows, batch_sizes=validation_batch_sizes, dts=dts)
     guard_case = next(c for c in cases if c.batch_size == reference_column.nz and c.dt_label == "host_dt")
     oor_dt = guard_case.dt_seconds.clone()
     oor_dt[0] = float(meta["dt_max_seconds"]) * OOR_PROBE_DT_FACTOR
     cases.append(ModelCallCase(batch_size=guard_case.batch_size, dt_label="host_dt + one dt above dt_max",
                                y_phys=guard_case.y_phys, dt_seconds=oor_dt, g_phys=guard_case.g_phys))
-    benchmark_cases = [c for c in cases if c.dt_label == "host_dt"]
+    benchmark_cases = [c for c in cases if c.dt_label == "host_dt" and c.batch_size in batch_sizes]
     b1_case = next(c for c in cases if c.batch_size == 1) if 1 in batch_sizes else ModelCallCase(
         batch_size=1, dt_label="host_dt", y_phys=guard_case.y_phys[:1].contiguous(),
         dt_seconds=guard_case.dt_seconds[:1].contiguous(), g_phys=guard_case.g_phys[:1].contiguous())
@@ -799,6 +813,7 @@ def main() -> None:
             "reference_nz": reference_column.nz,
             "aoti_example_batch": example_batch,
             "benchmark_batch_sizes": list(batch_sizes),
+            "validation_batch_sizes": list(validation_batch_sizes),
             "validation_dt_seconds": dts,
             "oor_probe_dt_seconds": float(oor_dt[0]),
             "match_max_dlog10": MATCH_MAX_DLOG10,
@@ -811,9 +826,11 @@ def main() -> None:
             "fresh_raw_export_dtype": meta["export_dtype"],
             "fresh_raw_dt_min_seconds": meta["dt_min_seconds"],
             "fresh_raw_dt_max_seconds": meta["dt_max_seconds"],
+            "fresh_raw_epsilon": meta["epsilon"],
             "installed_raw_export_dtype": installed_metadata.get("export_dtype"),
             "installed_raw_dt_min_seconds": installed_metadata.get("dt_min_seconds"),
             "installed_raw_dt_max_seconds": installed_metadata.get("dt_max_seconds"),
+            "installed_raw_epsilon": installed_metadata.get("epsilon"),
             "installed_raw_oor_policy": installed_metadata.get("oor_policy"),
             "input_guard": outcome["guard"],
             "column_composition": composition,
@@ -845,8 +862,10 @@ def main() -> None:
     interface_lines = [
         f"- model_species: {', '.join(fresh_export.model_species)}",
         f"- global_variables: {', '.join(fresh_export.global_variables)}",
-        f"- fresh_raw_export_dtype: {meta['export_dtype']}; dt range [{meta['dt_min_seconds']:.6e}, {meta['dt_max_seconds']:.6e}] s",
-        f"- installed_raw: dtype {installed_metadata.get('export_dtype')}, oor_policy {installed_metadata.get('oor_policy')}",
+        f"- fresh_raw_export_dtype: {meta['export_dtype']}; dt range [{meta['dt_min_seconds']:.6e}, {meta['dt_max_seconds']:.6e}] s; "
+        f"epsilon {meta['epsilon']:g}",
+        f"- installed_raw: dtype {installed_metadata.get('export_dtype')}, oor_policy {installed_metadata.get('oor_policy')}, "
+        f"epsilon {installed_metadata.get('epsilon')}",
         f"- input guard: all invalid inputs refused = {outcome['guard']['all_negative_refused']}; B=1 {outcome['guard']['positive_b1']}",
         f"- column tracked-species sum min/median/max: {tsum['min']:.4g} / {tsum['median']:.4g} / {tsum['max']:.4g} "
         f"(training: {meta.get('species_sum', {}).get('quantiles') if isinstance(meta.get('species_sum'), dict) else meta.get('species_sum')})",

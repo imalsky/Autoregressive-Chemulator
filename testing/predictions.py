@@ -15,6 +15,8 @@ src/ (standalone), so it keeps its own normalization helpers.
 from __future__ import annotations
 
 import json
+import math
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Tuple
@@ -26,7 +28,8 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib import colors as mcolors
+from cycler import cycler
+from matplotlib.colors import to_rgb
 from matplotlib.lines import Line2D
 
 
@@ -48,10 +51,15 @@ INFER_DTYPE: torch.dtype | None = None  # None => use export metadata dtype exac
 # Data selection. Validation: this script runs after every training (diagnostics and decisions use
 # the validation split); the test split is for the single final paper evaluation.
 EVAL_SPLIT: str = "validation"
-EVAL_SHARD_INDEX: int | None = None  # None => randomly select a shard from the chosen split
-EVAL_SHARD_RANDOM_SEED: int | None = None  # Optional reproducible seed; None => fresh randomness each run
-EVAL_SAMPLE_INDEX: int | None = None  # None => randomly select a sample/chunk from the selected shard
-EVAL_SAMPLE_RANDOM_SEED: int | None = None  # Optional reproducible seed; None => fresh randomness each run
+# Fixed default window (the first sample of the first shard of the split), so every run, and the
+# stage-1 and stage-2 figures (both stages read the same processed_dir), show the same trajectory.
+# The pick is stable only while the processed dataset is unchanged: shards carry no trajectory id, so
+# a rebuild with other raw files or settings moves it. Set an index to None to opt in to a seeded
+# random pick instead (EVAL_*_RANDOM_SEED).
+EVAL_SHARD_INDEX: int | None = 0
+EVAL_SHARD_RANDOM_SEED: int = 0
+EVAL_SAMPLE_INDEX: int | None = 0
+EVAL_SAMPLE_RANDOM_SEED: int = 0
 
 # Rollout window. Inherited: index 0 of every window is skipped with no recorded rationale;
 # changing it changes the reported errors (testing/eval_rollout_error.py uses the same value).
@@ -61,9 +69,43 @@ ROLLOUT_STEPS: int = 50
 # Plotting/output.
 PLOTS_SUBDIR: str = "plots"  # Relative to MODEL_RUN_DIR
 PLOT_TIME_LOG_SCALE: bool = False  # If True, use log-scale on time axis
-PLOT_Y_LIM: Tuple[float, float] = (1e-30, 3.0)
-PLOT_MARKER_EVERY: int = 10
-PLOT_STYLE: str | None = str((ROOT / "testing" / "science.mplstyle").resolve())
+
+# Figure style: the user's scientific-plotting rules, inlined (repo scripts do not import them).
+# Okabe-Ito cycle (yellow dropped), charcoal ink, serif text, ticks in on all sides, frameless
+# 10 pt legend, zero x-margin and the style's 0.1 y-margin (limits from the data), 1.5 pt lines, PNG at 300 dpi.
+_CYC = ("#0072B2", "#D55E00", "#009E73", "#E69F00", "#CC79A7", "#56B4E9")
+_INK = "#2b2b2b"
+_RC = {
+    "font.size": 12, "font.family": "serif",
+    "font.serif": ["Times New Roman", "Palatino", "DejaVu Serif", "serif"],
+    "mathtext.fontset": "stix",
+    "axes.linewidth": 1.5, "axes.labelsize": "large", "axes.labelpad": 5, "axes.xmargin": 0, "axes.ymargin": 0.1,
+    "axes.formatter.limits": (-6, 6), "axes.formatter.use_mathtext": True,
+    "axes.formatter.useoffset": False, "axes.prop_cycle": cycler(color=list(_CYC)),
+    "xtick.direction": "in", "xtick.top": True, "xtick.minor.visible": True, "xtick.labelsize": "large",
+    "xtick.major.size": 8, "xtick.major.width": 1.3, "xtick.minor.size": 4, "xtick.minor.width": 1,
+    "xtick.major.pad": 6,
+    "ytick.direction": "in", "ytick.right": True, "ytick.minor.visible": True, "ytick.labelsize": "large",
+    "ytick.major.size": 8, "ytick.major.width": 1.3, "ytick.minor.size": 4, "ytick.minor.width": 1,
+    "ytick.major.pad": 6,
+    "legend.frameon": False, "legend.fontsize": 10, "legend.borderaxespad": 1,
+    "legend.handlelength": 1.5, "legend.labelspacing": 0.3,
+    "lines.linewidth": 1.5, "savefig.bbox": "tight",
+}
+_DPI = 300
+# Square panels of len(_CYC) species each (one cycle colour per species within a panel); allowed
+# layouts only, so at most 4 * 6 = 24 species.
+_PANEL_LAYOUTS = {1: (1, 1), 2: (1, 2), 3: (1, 3), 4: (2, 2)}
+_PANEL_SIZE_IN = (5.33, 5.2)  # per panel (width, height)
+# Overlay recipe (several coincident pairs in a panel): the truth as a tint of the species colour
+# underneath, the prediction in the full colour dashed on top, at every step. One style source for
+# the plotted lines and the legend proxies.
+_TINT_KEEP = 0.6
+_TRUTH_KW = {"lw": 2.5, "ls": "-", "solid_capstyle": "round"}
+_PRED_KW = {"lw": 1.2, "ls": "--"}
+_LEGEND_CORNERS = ("upper right", "upper left", "lower right", "lower left")
+# Points sampled along each drawn segment when scoring a legend corner.
+_SEGMENT_SAMPLES = 20
 
 # Fixed global set, in this order (spec.md section 5, items 4-6). This standalone script
 # imports nothing from src/, so it keeps its own copy of src/model.py:_REQUIRED_GLOBALS.
@@ -232,8 +274,7 @@ def _choose_shard(processed_dir: Path, *, split: str, shard_index: int | None) -
     if shard_index is None:
         rng = np.random.default_rng(EVAL_SHARD_RANDOM_SEED)
         picked = int(rng.integers(0, len(shards)))
-        seed_msg = f", seed={EVAL_SHARD_RANDOM_SEED}" if EVAL_SHARD_RANDOM_SEED is not None else ""
-        print(f"[data] randomly selected shard index {picked} of {len(shards)}{seed_msg}")
+        print(f"[data] randomly selected shard index {picked} of {len(shards)}, seed={EVAL_SHARD_RANDOM_SEED}")
         return picked, shards[picked]
 
     if shard_index < 0 or shard_index >= len(shards):
@@ -257,8 +298,7 @@ def _choose_sample(n_samples: int, *, sample_index: int | None) -> int:
     if sample_index is None:
         rng = np.random.default_rng(EVAL_SAMPLE_RANDOM_SEED)
         picked = int(rng.integers(0, n_samples))
-        seed_msg = f", seed={EVAL_SAMPLE_RANDOM_SEED}" if EVAL_SAMPLE_RANDOM_SEED is not None else ""
-        print(f"[data] randomly selected sample index {picked} of {n_samples}{seed_msg}")
+        print(f"[data] randomly selected sample index {picked} of {n_samples}, seed={EVAL_SAMPLE_RANDOM_SEED}")
         return picked
 
     if sample_index < 0 or sample_index >= n_samples:
@@ -290,90 +330,102 @@ def _rollout(
     return torch.stack(preds, dim=0).numpy().astype(np.float64, copy=False)
 
 
-def _distinct_colors(n: int) -> List[Tuple[float, float, float]]:
-    cmaps = ["tab20", "tab20b", "tab20c", "Set3", "Dark2", "Paired", "Accent"]
-    cols: List[Tuple[float, float, float]] = []
-    for name in cmaps:
-        cmap = plt.get_cmap(name)
-        cols.extend([tuple(mcolors.to_rgb(c)) for c in getattr(cmap, "colors", [])])
-    if n > len(cols):
-        hs = np.linspace(0.0, 1.0, n, endpoint=False)
-        cols = [tuple(mcolors.hsv_to_rgb((h, 0.85, 0.95))) for h in hs]
-    return cols[:n]
+def _tint(color: str) -> Tuple[float, float, float]:
+    """`color` blended toward white, keeping _TINT_KEEP of it (the truth underlay)."""
+    return tuple(1.0 - _TINT_KEEP + _TINT_KEEP * v for v in to_rgb(color))
 
 
-def _plot(*, t_sec: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray, species_keys: List[str], out_path: Path) -> None:
-    labels = [s.replace("_evolution", "") for s in species_keys]
-    order = np.argsort(y_true.max(axis=0))[::-1]
-    colors = _distinct_colors(len(order))
+def _drawn_points(ax, line) -> np.ndarray:
+    """Display coordinates of a line's points, plus _SEGMENT_SAMPLES points along each drawn segment
+    (so a line crossing a legend counts, not only its vertices)."""
+    xy = ax.transData.transform(np.column_stack([line.get_xdata(), line.get_ydata()]))
+    xy = xy[np.isfinite(xy).all(axis=1)]
+    if line.get_linestyle() in ("None", "", " ") or len(xy) < 2:
+        return xy
+    t = np.linspace(0.0, 1.0, _SEGMENT_SAMPLES)[:, None, None]
+    return (xy[:-1] * (1.0 - t) + xy[1:] * t).reshape(-1, 2)
 
-    me = max(1, int(PLOT_MARKER_EVERY))
-    marker_idx = np.arange(0, len(t_sec), me)
 
-    fig, ax = plt.subplots(figsize=(7, 7))
-    for r, j in enumerate(order):
-        c = colors[r]
-        ax.plot(t_sec, y_true[:, j], linestyle="-", lw=2.5, alpha=1.0, color=c)
-        ax.plot(
-            t_sec[marker_idx],
-            y_pred[marker_idx, j],
-            linestyle="None",
-            marker="o",
-            ms=3.5,
-            alpha=1.0,
-            color=c,
-            markerfacecolor="none",
-            markeredgecolor=c,
-            markeredgewidth=0.9,
+def _legend(ax, handles: list) -> None:
+    """Legend in the corner covering the fewest plotted points, one column then two; matplotlib's
+    'best' when every corner covers data. Never changes the limits."""
+    fig = ax.figure
+    for ncol in (1, 2):
+        scores = {}
+        for loc in _LEGEND_CORNERS:
+            leg = ax.legend(handles=handles, loc=loc, ncol=ncol)
+            fig.canvas.draw()
+            x0, y0, x1, y1 = leg.get_window_extent().extents
+            n = 0
+            for line in ax.lines:
+                xy = _drawn_points(ax, line)
+                n += int(np.sum((xy[:, 0] > x0) & (xy[:, 0] < x1) & (xy[:, 1] > y0) & (xy[:, 1] < y1)))
+            scores[loc] = n
+        loc = min(scores, key=scores.get)
+        if scores[loc] == 0:
+            ax.legend(handles=handles, loc=loc, ncol=ncol)
+            return
+    ax.legend(handles=handles, loc="best")
+
+
+def _species_label(key: str) -> str:
+    """'CH4_evolution' -> 'CH$_{4}$' (digits as mathtext subscripts)."""
+    return re.sub(r"(\d+)", r"$_{\1}$", key.replace("_evolution", ""))
+
+
+def _plot(
+    *,
+    t_sec: np.ndarray,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    species_keys: List[str],
+    source: str,
+    out_path: Path,
+) -> None:
+    """Truth (tinted) and prediction (dashed) per species, len(_CYC) species per square panel, by abundance."""
+    n_species = len(species_keys)
+    n_panels = math.ceil(n_species / len(_CYC))
+    if n_panels not in _PANEL_LAYOUTS:
+        raise ValueError(
+            f"{n_species} species need {n_panels} panels of {len(_CYC)}; the allowed layouts hold at most "
+            f"{max(_PANEL_LAYOUTS) * len(_CYC)} species"
         )
+    rows, cols = _PANEL_LAYOUTS[n_panels]
+    order = np.argsort(y_true.max(axis=0))[::-1]  # most abundant first
 
-    if PLOT_TIME_LOG_SCALE:
-        if float(np.min(t_sec)) <= 0.0:
-            raise ValueError("PLOT_TIME_LOG_SCALE=True requires strictly positive evaluation times.")
-        ax.set_xscale("log")
+    with plt.rc_context(_RC):
+        fig, axes = plt.subplots(
+            rows, cols, figsize=(_PANEL_SIZE_IN[0] * cols, _PANEL_SIZE_IN[1] * rows),
+            squeeze=False, constrained_layout=True,
+        )
+        for p, ax in enumerate(axes.flat):
+            idx = order[p * len(_CYC):(p + 1) * len(_CYC)]
+            if idx.size == 0:
+                ax.set_axis_off()
+                continue
+            handles = []
+            for j, color in zip(idx, _CYC, strict=False):  # the last panel may hold fewer species
+                ax.plot(t_sec, y_true[:, j], color=_tint(color), **_TRUTH_KW)
+                ax.plot(t_sec, y_pred[:, j], color=color, **_PRED_KW)
+                handles.append(Line2D([0], [0], color=color, label=_species_label(species_keys[j])))
+            if p == 0:  # the line styles and the window's provenance, once
+                handles += [
+                    Line2D([0], [0], color=_tint(_INK), label=f"truth\n{source}", **_TRUTH_KW),
+                    Line2D([0], [0], color=_INK, label="prediction", **_PRED_KW),
+                ]
+            if PLOT_TIME_LOG_SCALE:
+                if float(np.min(t_sec)) <= 0.0:
+                    raise ValueError("PLOT_TIME_LOG_SCALE=True requires strictly positive evaluation times.")
+                ax.set_xscale("log")
+            ax.set_yscale("log")
+            ax.set_xlabel("time since rollout start (s)")
+            ax.set_ylabel("mixing ratio")
+            ax.set_box_aspect(1)
+            _legend(ax, handles)
 
-    ax.set_yscale("log")
-    ax.set(
-        xlim=(float(t_sec[0]), float(t_sec[-1])),
-        ylim=PLOT_Y_LIM,
-        xlabel="Time (s)",
-        ylabel="Relative Abundance",
-        title=f"Autoregressive rollout ({EVAL_SPLIT}): {len(t_sec)} steps (exported 1-step PHYS model)",
-    )
-    ax.set_box_aspect(1)
-
-    species_handles = [Line2D([0], [0], color=colors[r], lw=2) for r in range(len(order))]
-    leg1 = ax.legend(
-        species_handles,
-        [labels[int(i)] for i in order],
-        loc="lower left",
-        title="Species",
-        ncol=2,
-        fontsize=8,
-    )
-    ax.add_artist(leg1)
-
-    style_handles = [
-        Line2D([0], [0], color="k", lw=2.5, alpha=1.0, label="Ground Truth"),
-        Line2D(
-            [0],
-            [0],
-            color="k",
-            linestyle="None",
-            marker="o",
-            ms=3.5,
-            alpha=1.0,
-            markerfacecolor="none",
-            markeredgecolor="k",
-            markeredgewidth=0.9,
-            label=f"Prediction (every {me} step{'s' if me != 1 else ''})",
-        ),
-    ]
-    ax.legend(handles=style_handles, loc="lower right")
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=_DPI)
+        plt.close(fig)
 
 
 def _print_errors(y_true: np.ndarray, y_pred: np.ndarray, *, eps: float) -> None:
@@ -391,9 +443,6 @@ def _print_errors(y_true: np.ndarray, y_pred: np.ndarray, *, eps: float) -> None
 
 
 def main() -> None:
-    if PLOT_STYLE is not None:
-        plt.style.use(PLOT_STYLE)
-
     run_dir = resolve_run_dir()
     export_path = _resolve_export_path(run_dir)
     if not export_path.exists():
@@ -468,7 +517,9 @@ def main() -> None:
             f"_run-{run_stamp}.png"
         )
     )
-    _plot(t_sec=t_eval, y_true=y_true_phys, y_pred=y_pred_phys, species_keys=species_keys, out_path=out_path)
+    source = f"{EVAL_SPLIT} {shard_path.stem}, sample {sample_index}, start {ROLLOUT_START_INDEX}"
+    _plot(t_sec=t_eval, y_true=y_true_phys, y_pred=y_pred_phys, species_keys=species_keys, source=source,
+          out_path=out_path)
     print(f"Saved: {out_path}")
     _print_errors(y_true_phys, y_pred_phys, eps=float(manifest["epsilon"]))
 

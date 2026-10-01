@@ -321,6 +321,18 @@ def _require_int(mapping: Dict, key: str) -> int:
     return int(obj)
 
 
+def _require_optional_cap(mapping: Dict, key: str) -> Optional[int]:
+    """Return a required cap: null (no cap) or an int > 0 (bools rejected), or raise TypeError/ValueError."""
+    obj = _require(mapping, key)
+    if obj is None:
+        return None
+    if isinstance(obj, bool) or not isinstance(obj, int):
+        raise TypeError(f"config.{key} must be null (no cap) or an int")
+    if obj <= 0:
+        raise ValueError(f"config.{key} must be null (no cap) or > 0, got {obj}")
+    return int(obj)
+
+
 def _require_float(mapping: Dict, key: str) -> float:
     """Return a required finite number as float (bools rejected), or raise TypeError/ValueError."""
     obj = _require(mapping, key)
@@ -373,7 +385,11 @@ class PreCfg:
     n_steps: int
     t_min: float
 
-    output_trajectories_per_file: int
+    # Per-file caps; None = no cap (consume every group). A finite value is a deliberate subsample:
+    # pool_size caps the source groups drawn from a file (reservoir sample), and
+    # output_trajectories_per_file caps the windows written per file (samples_per_source_trajectory
+    # per kept group), so it binds first. Both are recorded per file in preprocessing_summary.json.
+    output_trajectories_per_file: Optional[int]
     shard_size: int
     overwrite: bool
 
@@ -390,7 +406,7 @@ class PreCfg:
     methods: Dict[str, str]
 
     seed: int
-    pool_size: int
+    pool_size: Optional[int]
     samples_per_source_trajectory: int
     max_chunk_attempts_per_source: int
     drop_below: float
@@ -494,7 +510,7 @@ def parse_precfg(cfg: Dict, *, cfg_path: Path) -> PreCfg:
     if t_min < 0.0:
         raise ValueError("preprocessing.t_min must be >= 0")
 
-    output_trajectories_per_file = _require_int(pr, "output_trajectories_per_file")
+    output_trajectories_per_file = _require_optional_cap(pr, "output_trajectories_per_file")
     shard_size = _require_int(pr, "shard_size")
     overwrite = _require_bool(pr, "overwrite")
 
@@ -506,7 +522,7 @@ def parse_precfg(cfg: Dict, *, cfg_path: Path) -> PreCfg:
         raise ValueError("Require 0 <= val_fraction, 0 <= test_fraction, and val_fraction + test_fraction < 1")
 
     seed = _require_int(pr, "seed")
-    pool_size = _require_int(pr, "pool_size")
+    pool_size = _require_optional_cap(pr, "pool_size")
     samples_per_source_trajectory = _require_int(pr, "samples_per_source_trajectory")
     max_chunk_attempts_per_source = _require_int(pr, "max_chunk_attempts_per_source")
     drop_below = _require_float(pr, "drop_below")
@@ -514,12 +530,8 @@ def parse_precfg(cfg: Dict, *, cfg_path: Path) -> PreCfg:
 
     if num_workers <= 0:
         raise ValueError("preprocessing.num_workers must be > 0")
-    if output_trajectories_per_file <= 0:
-        raise ValueError("preprocessing.output_trajectories_per_file must be > 0")
     if shard_size <= 0:
         raise ValueError("preprocessing.shard_size must be > 0")
-    if pool_size <= 0:
-        raise ValueError("preprocessing.pool_size must be > 0")
     if samples_per_source_trajectory <= 0:
         raise ValueError("preprocessing.samples_per_source_trajectory must be > 0")
     if max_chunk_attempts_per_source <= 0:
@@ -1017,7 +1029,7 @@ def sample_file(
     anchored = {sp: 0 for sp in _SPLITS}
     t_start_range: Dict[str, List[float]] = {}
 
-    target = int(cfg.output_trajectories_per_file)
+    target = cfg.output_trajectories_per_file  # None: no cap
     written = 0
     truncated = False
 
@@ -1026,11 +1038,13 @@ def sample_file(
     with h5py.File(file_path, "r") as fin:
         n_groups = len(fin)
         name_digests = np.fromiter((_seed_word(str(k)) for k in fin.keys()), dtype=np.uint64, count=n_groups)
-        pool = reservoir_sample(fin.keys(), int(cfg.pool_size), rng)
+        # No cap: every group. The shuffle stays unconditional (reservoir_sample with k >= n keeps
+        # the key order and draws nothing, so both branches give the same pool and RNG stream).
+        pool = list(fin.keys()) if cfg.pool_size is None else reservoir_sample(fin.keys(), cfg.pool_size, rng)
         rng.shuffle(pool)
 
         for traj_name in pool:
-            if written >= target:
+            if target is not None and written >= target:
                 truncated = True
                 break
             groups_seen += 1
@@ -1156,7 +1170,7 @@ def sample_file(
             t_anchor = max(float(cfg.t_min), float(t_valid[0]))
 
             for sidx in range(int(cfg.samples_per_source_trajectory)):
-                if written >= target:
+                if target is not None and written >= target:
                     truncated = True
                     break
 
@@ -1952,7 +1966,6 @@ def _build_dataset(
 
     t0 = time.time()
 
-    per_file_cap = int(cfg.output_trajectories_per_file)
     rows_by_idx: Dict[int, Dict[str, Any]] = {}
     aggs_by_idx: Dict[int, Dict[str, Any]] = {}
 
@@ -1976,12 +1989,21 @@ def _build_dataset(
                 row, agg = fut.result()
                 rows_by_idx[row["file_idx"]] = row
                 aggs_by_idx[row["file_idx"]] = agg
+                if row["n_pooled"] < row["n_groups"]:
+                    log.warning(
+                        "File %s: pool_size=%d drew %d of its %d source groups (deliberate subsample)",
+                        futures[fut].name,
+                        cfg.pool_size,
+                        row["n_pooled"],
+                        row["n_groups"],
+                    )
                 if row["truncated"]:
                     log.warning(
-                        "File %s hit output_trajectories_per_file=%d; remaining "
-                        "source groups in that file were not sampled",
+                        "File %s hit output_trajectories_per_file=%d (a cap on written windows, "
+                        "%d per kept group); its remaining pooled source groups were not sampled",
                         futures[fut].name,
-                        per_file_cap,
+                        cfg.output_trajectories_per_file,
+                        cfg.samples_per_source_trajectory,
                     )
         except BaseException:
             # Cancel queued files so a worker failure (or Ctrl+C) fails fast instead of

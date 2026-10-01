@@ -86,6 +86,10 @@ _VAL_STEP_GAMMA = 1.0
 # only when it beats the best by the relative fraction training.scheduler.threshold (1e-3 stage 1,
 # 1e-4 stage 2); `patience` epochs without one cut the LR.
 _PLATEAU_THRESHOLD_MODE = "rel"
+# The one monitored metric and its direction, shared by the LR plateau, top-k checkpointing
+# (best.ckpt) and early stopping (no config key: any other value would desynchronize them).
+_MONITOR_METRIC = "val_loss"
+_MONITOR_MODE = "min"
 # last.ckpt must hold the latest completed epoch (auto-resume starts from it).
 LAST_CKPT_EVERY_N_EPOCHS = 1
 # One validation batch before epoch 0 runs the validation step (and its compiled path) once, so a
@@ -1117,8 +1121,8 @@ class FlowMapRolloutModule(pl.LightningModule):
         (they run in on_train_epoch_end), so a diverged epoch writes no checkpoint and every
         checkpoint holds the scheduler state after this epoch's plateau step (resume-safe).
         """
-        # configure_optimizers enforces scheduler.monitor == "val_loss" for the plateau path.
-        metric = self.trainer.callback_metrics.get("val_loss")
+        # The plateau monitors _MONITOR_METRIC (val_loss).
+        metric = self.trainer.callback_metrics.get(_MONITOR_METRIC)
         if metric is None:
             return
         metric_val = float(metric.detach().cpu().item()) if isinstance(metric, torch.Tensor) else float(metric)
@@ -1156,7 +1160,8 @@ class FlowMapRolloutModule(pl.LightningModule):
         """Build the AdamW optimizer (with norm/bias WD exclusion) and the LR scheduler.
 
         The scheduler is ReduceLROnPlateau wrapped with a linear warmup (the only scheduler).
-        Returns the Lightning optimizer/scheduler dict; scheduler.monitor is required to be "val_loss".
+        Returns the Lightning optimizer/scheduler dict; the plateau monitors _MONITOR_METRIC (mode
+        _MONITOR_MODE).
         """
         tcfg = dict(self.hparams["training"])
         opt_cfg = dict(tcfg["optimizer"])
@@ -1203,16 +1208,12 @@ class FlowMapRolloutModule(pl.LightningModule):
         patience = int(sched_cfg["patience"])
         threshold = float(sched_cfg["threshold"])
         min_lr = float(sched_cfg["min_lr"])
-        mode = str(sched_cfg["mode"])
-        monitor = str(sched_cfg["monitor"])
         warmup_steps = self._scheduler_warmup_steps(int(sched_cfg["warmup_epochs"]))
-        if monitor != "val_loss":
-            raise ValueError("scheduler.monitor must be 'val_loss'")
 
         sched = WarmupReduceLROnPlateau(
             opt,
             warmup_steps=warmup_steps,
-            mode=mode,
+            mode=_MONITOR_MODE,
             factor=factor,
             patience=patience,
             threshold=threshold,
@@ -1230,7 +1231,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         # Lightning still requires "monitor" for a plateau scheduler under automatic optimization
         # (stage 1) and warns about it under manual optimization (stage 2).
         if self.automatic_optimization:
-            lr_scheduler["monitor"] = monitor
+            lr_scheduler["monitor"] = _MONITOR_METRIC
 
         return {"optimizer": opt, "lr_scheduler": lr_scheduler}
 
@@ -1245,7 +1246,7 @@ def build_lightning_trainer(
     *,
     work_dir: Path,
     precision_config: PrecisionConfig,
-    train_batches_per_epoch: Optional[int] = None,
+    train_batches_per_epoch: int,
 ) -> pl.Trainer:
     """Construct the Lightning Trainer from the (validated) config.
 
@@ -1262,22 +1263,18 @@ def build_lightning_trainer(
     devices = runtime["devices"]
     accelerator = runtime["accelerator"]
     lightning_precision = precision_config.lightning_precision
-    log_every_n_steps = int(runtime["log_every_n_steps"])
-    if log_every_n_steps <= 0:
-        raise ValueError("runtime.log_every_n_steps must be > 0")
-    if train_batches_per_epoch is not None:
-        if int(train_batches_per_epoch) <= 0:
-            raise ValueError("train_batches_per_epoch must be > 0 when provided")
-        log_every_n_steps = min(log_every_n_steps, int(train_batches_per_epoch))
+    # Every metric is logged per epoch (on_epoch=True, LearningRateMonitor per epoch), so the step
+    # logging interval is only Lightning's bookkeeping: one interval per epoch logs nothing extra
+    # and keeps Lightning's "interval larger than the epoch" warning quiet.
+    if int(train_batches_per_epoch) <= 0:
+        raise ValueError(f"train_batches_per_epoch must be > 0, got {train_batches_per_epoch}")
+    log_every_n_steps = int(train_batches_per_epoch)
 
     ckpt_cfg = dict(runtime["checkpointing"])
     enable_ckpt = bool(ckpt_cfg["enabled"])
     ckpt_every_n_epochs = int(ckpt_cfg["every_n_epochs"])
     save_top_k = int(ckpt_cfg["save_top_k"])
     save_last = bool(ckpt_cfg["save_last"])
-    monitor = str(ckpt_cfg["monitor"])
-    if monitor != "val_loss":
-        raise ValueError("runtime.checkpointing.monitor must be 'val_loss'")
 
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -1294,16 +1291,16 @@ def build_lightning_trainer(
     if enable_ckpt:
         ckpt_dir = work_dir / "checkpoints"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
-        # Top-k by val_loss. It must stay the first checkpoint callback: main.py publishes
-        # best.ckpt from the callback whose monitor is val_loss.
+        # Top-k by _MONITOR_METRIC (val_loss). It must stay the first checkpoint callback: main.py
+        # publishes best.ckpt from the callback whose monitor is val_loss.
         callbacks.append(
             ModelCheckpoint(
                 dirpath=str(ckpt_dir),
                 filename="epoch{epoch:03d}-val{val_loss:.6f}",
                 auto_insert_metric_name=False,
-                monitor=monitor,
+                monitor=_MONITOR_METRIC,
                 save_top_k=save_top_k,
-                mode="min",
+                mode=_MONITOR_MODE,
                 every_n_epochs=ckpt_every_n_epochs,
                 save_last=False,
             )
@@ -1332,8 +1329,8 @@ def build_lightning_trainer(
         callbacks.append(
             CurriculumAwareEarlyStopping(
                 start_epoch=es_start_epoch,
-                monitor="val_loss",
-                mode="min",
+                monitor=_MONITOR_METRIC,
+                mode=_MONITOR_MODE,
                 patience=int(es_cfg["patience"]),
                 min_delta=float(es_cfg["min_delta"]),
                 check_finite=True,

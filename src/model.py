@@ -35,7 +35,11 @@ from utils import as_bool, as_float, as_int
 
 ActivationFactory = Callable[[], nn.Module]
 
-# Small output init for delta heads. This reduces early rollout blow-ups.
+# Small output init for delta heads. This reduces early rollout blow-ups. Inherited (docs/DECISIONS.md).
+# The std is absolute, not scaled by fan-in, so the initial per-step delta std is about
+# 1e-3 * sqrt(fan_in) * RMS(head input): ~0.045 z-units for the production residual+LN trunk at width
+# 2048 (unit-RMS LayerNorm output) and ~0.027 for the non-residual fallback (post-SiLU RMS ~0.6;
+# audit measurement). A width change therefore rescales the initial step as sqrt(width).
 _DELTA_OUT_INIT_STD = 1e-3
 # Negative slope for the optional "leaky_relu" activation factory.
 _LEAKY_RELU_SLOPE = 0.1

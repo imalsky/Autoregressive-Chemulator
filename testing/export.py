@@ -102,6 +102,10 @@ EXAMPLE_BATCH = 4
 # torch.export specializes a dynamic dim whose example size is 1 (torch 2.8).
 MIN_EXAMPLE_BATCH = 2
 B_MIN = 1
+# Largest exported batch. Inherited with no recorded rationale and kept pending the host envelope
+# (Canoe's per-rank cell count is unknown; docs/DECISIONS.md). The .pt2 raises above it (torch.export
+# input constraints, checked by the export gate); the AOTI package does not check B (its host guard
+# does; testing/aoti_export.py). Dim("B", min=1) without a max was verified bit-identical to eager.
 B_MAX = 16384
 # Example inputs only fix the traced shapes; seeding them makes the .pt2 byte-reproducible.
 EXAMPLE_INPUT_SEED = 0
@@ -712,13 +716,14 @@ def _out_of_range_rows(norm: BakedNormalizer, *, device: torch.device) -> Tuple[
 def _verify_export(module: Any, *, eager: nn.Module, norm: BakedNormalizer, device: torch.device) -> None:
     """Export gate on `device`: fail unless `module` behaves like the eager wrapper.
 
-    In-range inputs (seeded, B in (1, 7)) must give [B, S] outputs that are all finite and equal to
-    the eager wrapper's within EXPORT_PARITY_RTOL (atol 0); in the out-of-range batch exactly the
-    rows that break the box (or are not finite) must be NaN and the in-range row must match.
+    In-range inputs (seeded, B in (1, 7, B_MAX)) must give [B, S] outputs that are all finite and
+    equal to the eager wrapper's within EXPORT_PARITY_RTOL (atol 0); B_MAX + 1 must be refused; in
+    the out-of-range batch exactly the rows that break the box (or are not finite) must be NaN and
+    the in-range row must match.
     """
     gen = torch.Generator(device=device).manual_seed(EXPORT_VERIFY_SEED)
     S = norm.S
-    for B in (1, 7):
+    for B in (1, 7, B_MAX):
         y, dt, g = _make_example_inputs(norm, B=B, device=device, generator=gen)
         with torch.inference_mode():
             out, ref = module(y, dt, g), eager(y, dt, g)
@@ -727,6 +732,14 @@ def _verify_export(module: Any, *, eager: nn.Module, norm: BakedNormalizer, devi
         if not bool(torch.isfinite(out).all()):
             raise RuntimeError(f"export gate: non-finite output for in-range inputs at B={B}")
         torch.testing.assert_close(out, ref, rtol=EXPORT_PARITY_RTOL, atol=0.0)
+    y, dt, g = _make_example_inputs(norm, B=B_MAX + 1, device=device, generator=gen)
+    try:
+        with torch.inference_mode():
+            module(y, dt, g)
+    except RuntimeError:
+        pass  # torch.export's input-constraint check: B above the exported range
+    else:
+        raise RuntimeError(f"export gate: B={B_MAX + 1} > B_MAX={B_MAX} was not refused")
     y, dt, g = _out_of_range_rows(norm, device=device)
     with torch.inference_mode():
         out, ref = module(y, dt, g), eager(y, dt, g)

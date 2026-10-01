@@ -1,5 +1,41 @@
 # Production config decisions — evidence and justification
 
+## REVISION 2026-09-30: named constants, explicit sentinels, figure style, provenance (audit theme T5)
+
+Training numerics are unchanged (30-step fingerprint of both stages bitwise identical to the T7
+reference). What changed:
+- **Caps are explicit.** `preprocessing.pool_size` and `preprocessing.output_trajectories_per_file`
+  are `null` in both configs: null means no cap (every source group of every raw file), replacing
+  the 1e6 values that meant "all" but acted as caps. An integer is a deliberate per-file subsample;
+  pool subsampling is now logged at WARNING (before, it was silent), and the output-cap warning says
+  it counts written windows (4 per kept group). Per-file `n_groups`, `n_pooled` and `truncated` are
+  in preprocessing_summary.json (T7). Outputs are unchanged while no cap binds (audit check on the
+  synthetic set). The recorded preprocessing block of a processed dir built with 1e6 differs from
+  the config, so src/main.py refuses such a build: rebuild it (the 4-file real build of 2026-09-30
+  included).
+- **Removed config keys** (now unknown keys): `runtime.log_every_n_steps` (every metric is logged
+  per epoch; Lightning's step-logging interval is set to the epoch length, which the old 1e6 value
+  was clamped to anyway), `runtime.checkpointing.monitor` and `training.scheduler.monitor` (could
+  only be "val_loss"), and `training.scheduler.mode` ("max" was accepted and would have cut the LR
+  while val_loss fell, against "min" checkpointing and early stopping). The monitored metric and
+  direction are the constants `_MONITOR_METRIC = "val_loss"` / `_MONITOR_MODE = "min"` in
+  src/trainer.py, shared by the plateau, checkpointing and early stopping. A pre-change
+  `config.resolved.json` is refused by src/main.py until these keys are deleted.
+- **Export batch cap.** `B_MAX = 16384` stays (per-key row); the export gate now also checks B = B_MAX
+  and that B_MAX + 1 is refused, and the AOTI validation adds a B_MAX case (not run on daw).
+- **AOTI validation inputs** are floored at the export's epsilon (the training floor, 1e-30), not at
+  1e-15, so trace species down to the training floor reach the comparison (implemented, not run on
+  daw).
+- **Diagnostics.** The rollout figure plots a fixed window by default (first sample of the first
+  validation shard; seeded random selection is opt-in), against "time since rollout start", with
+  the shard, sample and start index in the legend. The loss figure reports the best val_loss and
+  its epoch (best.ckpt's) and the last values, and draws the stage-2 training rollout horizon K on a
+  right axis (train_loss is averaged over the curriculum K, val_loss always over
+  `training.rollout_steps`). All figure scripts follow the user's figure rules with inline settings;
+  `testing/science.mplstyle` is deleted.
+- **Provenance.** The "Inherited / unjustified config values" table below lists every config value
+  with no per-key evidence row, its v3 reference value and library default.
+
 ## REVISION 2026-09-30: per-epoch timing, throughput and job-log line (audit theme T4)
 
 Training numerics are unchanged (30-step fingerprint of both stages bitwise identical to the T7
@@ -307,7 +343,7 @@ stage-1 `preprocessing.output_trajectories_per_file` from 1e6 to 1e5 while addin
 the config's own inline comment, and stage2.json. Restored to 1e6; both configs now
 carry identical preprocessing blocks except `overwrite` (stage-1 true, stage-2 false),
 with `num_workers: 64` added to stage2.json for parity (superseded 2026-09-30: 16 in both
-configs, see the per-key table). If a processed dataset was
+configs, see the per-key table; and both caps are now `null` = no cap, T5 entry). If a processed dataset was
 already built on the HPC after df2c44f, check the recorded value in the processed
 dir's `preprocessing_summary.json` and rebuild if it was made with the 1e5 cap
 (run.pbs skips preprocessing whenever the processed dir exists).
@@ -411,7 +447,7 @@ no inversion of any adopted finding.
 | `model.mlp.hidden_dims` 10×2048, residual, LN, SiLU, `predict_delta` | unchanged from v3 lineage | v3 (10×2048) reached val ~7e-4 and is deployed; LN value re-confirmed locally (MLP+LN 2.9× over MLP, E1); delta-head small-init is the sandbox/paper convention. Not re-tuned: out of local scope. | inherited |
 | `preprocessing.dt_min/dt_max` | 0.1 / 1000.0 s | User deployment decision (Canoe dt≈6.4 s sits ~1.3 decades inside each edge — Fourier features interpolate well inside support, poorly outside; Tancik). | decision |
 | `preprocessing.samples_per_source_trajectory` | 4 (was 1) | E2 mechanism: per-state dt diversity is the robustness lever; 4 (dt, t_start) draws per source trajectory maximize (state, dt) coverage from the same raws. dt is log-uniform in every draw; draw 0 starts at the first positive raw time (1e-3 s; 25% of windows), draws 1-3 at a log-uniform time (T7 entry). | medium |
-| `preprocessing.output_trajectories_per_file`, `pool_size` | 1e6 (consume all) | "Use the full dataset" (user decision); ~62M samples across ~160 raw files. | decision |
+| `preprocessing.output_trajectories_per_file`, `pool_size` | null = no cap (REVISED 2026-09-30, was 1e6) | "Use the full dataset" (user decision); ~62M samples across ~160 raw files. The 1e6 values meant "consume all" but were caps: the output cap counts written windows (4 per kept group), so it would bind at 250,000 kept groups per file, about 1.1-1.5x today's 224,000 groups per file (audit). An integer is a deliberate, logged and recorded subsample. | decision |
 | `training.batch_size` | 2048 | Paper finding: >2048 degraded generalization; v2_bigger_batch (8192) plateaued at val ~9e-3. | high (production-scale evidence) |
 | stage-1 `lr` / `wd` / scheduler / EMA 0.9995 / early-stop | template values | v3-lineage except the scheduler (v3 used `cosine_with_warmup`, see REVISION 2026-09-30; the shipped plateau schedule is not v3-lineage); converged to val ~7e-4 historically. EMA window rule (1/(1−d) ≈ 1–10% of updates, ACE uses 0.9999): 0.9995 is a 2,000-step horizon, 0.06 of a 32,475-step stage-1 epoch and 0.015% of the 400-epoch budget (0.999 in stage 2: 1,000 steps, 0.011 of a 93,367-step epoch); 0.9999 would be 10,000 steps; not locally discriminable. | inherited |
 | `dataset.train_batches_per_epoch` / `dataset.val_samples` | stage 1 32,475 / 8,246,528; stage 2 93,367 / 23,708,768 (since 2026-09-30, replacing `windows_per_trajectory` 32 / 92) | The epoch is a count of optimizer steps (one per batch of 2048 windows drawn with replacement) plus a fixed validation set, not a function of the dataset size. The values reproduce the old epoch on the 4-file build (N_train 2,078,448 and N_val 257,704 windows): floor(N_train x 32 / 2048), N_val x 32 and floor(N_train x 92 / 2048), N_val x 92. In optimizer steps: stage 1 LR warmup 30 epochs = 974,250, plateau patience 15 = 487,125, ES patience 30 = 974,250, 400 epochs = 12,990,000; stage 2 warmup 5 = 466,835, plateau patience 10 = 933,670, ES patience 20 = 1,867,340, curriculum ramp 30 = 2,801,010, 200 epochs = 18,673,400. The 32 / 92 windows per trajectory behind them are inherited with no recorded rationale. When raw data is added these counts stay fixed unless edited (re-derive them from the new N if the epoch should scale). Stage-2 validation (val_samples >= its 23,193,360 enumerated windows) scores every window. | inherited (32 / 92) |
@@ -432,12 +468,57 @@ no inversion of any adopted finding.
 | `training.early_stopping.min_delta` with ES `patience`, plateau `patience` / `threshold` | min_delta 0.0 (REVISED 2026-09-30, was 1e-5); ES patience 30 / 20; plateau patience 15 / 10, threshold 1e-3 / 1e-4 relative (`threshold_mode` "rel", a named constant in trainer.py) | ES and the plateau observe the same epochs: both ignore the LR warmup and the curriculum ramp and start counting at the first epoch after both (warmup-era epochs stay eligible for best.ckpt). With min_delta 0 every plateau improvement is also a new ES best, and plateau patience + 1 < ES patience (16 < 30, 11 < 20), so once counting has started ES cannot stop before an LR halving. Before, stage 1 could stop at peak LR with zero LR cuts (audit harness, constructed curves with the best inside the warmup: stopped at epochs 35 and 54; with T1 neither stops). Under steady slow improvement `max_epochs` (400 / 200) becomes the binding budget and the relative thresholds decide whether slow progress cuts the LR; tuning them is the author's. Alternative pending the author: both monitors keep the warmup-era best (an annealing-policy choice). A pre-fix run cannot be resumed with these values (the resume config check refuses changed keys). | inherited (min_delta and the shared window: audit) |
 | `runtime.accelerator` / `runtime.devices` | "cuda" / 1 (REVISED 2026-09-30, were "auto") | Explicit single device: "auto" falls back to CPU silently and Lightning's "gpu" alias tries MPS first; a CUDA request with no visible GPU now fails at startup. The launcher picks the GPU with CUDA_VISIBLE_DEVICES (devices=1 means visible index 0). Multi-GPU/DDP is unsupported. | n/a |
 | `system.device` / `training.pin_memory` | "cpu" / true | Every split is preloaded into host RAM (a CUDA preload would put the whole dataset in GPU memory) and batches are pinned for the copy; pin_memory=true with a CUDA preload is rejected. Window indices come from a CPU generator, so the window sequence does not depend on the preload device. Preload budget: a host preload (train + validation, sized from the shard headers) larger than 0.5 × MemAvailable fails at startup instead of being OOM-killed while filling (`_PRELOAD_MAX_FRACTION_OF_MEM_AVAILABLE` in src/main.py, not a config key). MemAvailable is a snapshot on a shared host, not a guarantee. The 0.5 is pending the author: at ~785 GB MemAvailable (daw, T1 smoke log) it caps the preload at ~393 GB, below the ~481 GB the audit infers for all 160 raw files, so a full-data run would be refused today. | decision pending (the fraction) |
-| `runtime.gradient_clip_val` / `runtime.log_grad_norm` | 1.0 / false | Clip 1.0 is inherited; under AdamW, clipping reweights batches, it does not lower the LR. null is the only "no clipping" value (0 and negatives are rejected). `log_grad_norm` (a required key since 2026-09-30) logs per epoch the mean pre-clip total gradient norm (`grad_norm`) and the fraction of steps where clipping fired (`grad_clip_frac`), in both stages, summed on the GPU. | inherited |
+| `runtime.gradient_clip_val` / `runtime.log_grad_norm` | 1.0 / false | Clip 1.0 is a template value (the v3 reference did not clip; see the Inherited / unjustified table); under AdamW, clipping reweights batches, it does not lower the LR. null is the only "no clipping" value (0 and negatives are rejected). `log_grad_norm` (a required key since 2026-09-30) logs per epoch the mean pre-clip total gradient norm (`grad_norm`) and the fraction of steps where clipping fired (`grad_clip_frac`), in both stages, summed on the GPU. | inherited |
 | `precision.*` | float32, amp_mode "true" | The preload is always float32 (`precision.preload_dtype` removed 2026-09-30: bf16 storage moved states by a median 3.1e-3 dex in the audit, above the ~7e-4 target). loss_dtype must be float32 or float64. Under amp_mode "mixed", model_dtype and input_dtype must be float32 and `model.predict_delta` true: a bf16 input, or a whole next state coming out of the bf16 trunk, would carry the rollout state at bf16 resolution. Under autocast the input block and the delta head run in fp32 (fp32 and bf16-true runs are unchanged); bf16-mixed with fused AdamW and clipping trains. bf16-true is kept but lossy: the rollout state is carried in bf16. | decision (float32 default) |
+| `testing/export.py` `B_MAX` (code constant) | 16384 | The largest batch the export accepts. Inherited with no recorded rationale; kept pending the host envelope (Canoe's per-rank cell count is unknown). The alternative is to drop the cap (`Dim("B", min=1)`, verified bit-identical to eager at B = 65536 by the audit). The .pt2 raises above it (torch.export input constraints); the AOTI package does not check B, its host guard (`_check_step_inputs`) does, and with `AOTI_RUNTIME_CHECK_INPUTS=1` its compiled check would also reject B = 1 (audit). The export gate checks B = 1, 7 and B_MAX and that B_MAX + 1 is refused. | decision pending (the cap) |
 | `preprocessing.drop_below` | 1e-30 (= normalization.epsilon) | `drop_below >= epsilon` is required (2026-09-30): every kept raw value is then >= epsilon, so the epsilon floors in the log transforms never change a kept value. | n/a (contract) |
 | **rejected: input-noise injection** | not shipped | **E6**: 4/4 noise runs worse, 3/4 catastrophic at fixed-dt (12.4–14.1 dex; σ ∈ {0.01, 0.03} z-space, with and without pushforward, 2 seeds) — *against* the GNS/Stachenfeld prior. No trainer option added. If ever revisited, sweep σ ≤ 1e-3 and re-test. | high (locally decisive) |
 | **rejected: K=20 detached training** | — | E3: consistently worse + one 1-dex blow-up; List 2024 agrees. (K>10 with BPTT untested locally — plausible future direction, not a default.) | medium |
 | **not adopted: inference-time renormalization** | off | Sturm 2024: naive projection degrades radicals/trace species (exactly what dominates a log-standardized loss); weighted projection neutral-to-positive. Track conservation drift as an EVAL metric; if the host solver needs hard conservation, the stoichiometric-output-layer route (Sturm & Wexler 2022) is the accuracy-neutral fix. | high (literature) |
+
+## Inherited / unjustified config values
+
+Every value of the two shipped configs that has no per-key evidence row above (structural values
+such as paths, species lists, enable flags and the compile settings are left out). "v3 reference" is
+the v3 run's `config.resolved.json` (`git show 09748d7:models_old/v3/config.resolved.json`); "library
+default" is the torch 2.8 / Lightning 2.6.6 signature default. None of these values was tuned
+locally; "inherited" means carried unchanged from the v3 reference, and a value that differs from v3
+with no recorded reason is marked so. Stage 1's `training.autoregressive_training` and
+`training.curriculum` sub-keys are inert (both blocks are disabled; the one-jump path never reads
+them, src/trainer.py) but schema-required.
+
+| Key | Stage 1 | Stage 2 | v3 reference | Library default | Source / status |
+|---|---|---|---|---|---|
+| `system.seed` | 1234 | 1234 | 1234 | — | inherited; arbitrary seed |
+| `preprocessing.seed` | 1234 | 1234 | 1234 | — | inherited; seeds the window draws (split membership uses the code constant `SPLIT_SEED = 1234`, T7) |
+| `model.fourier_dt.seed` | 0 | 0 | absent (Fourier-dt added 2026-06-09) | — | new, arbitrary; the frequencies come from their own `torch.Generator` (src/model.py), so they do not change with `system.seed`; inert while fourier_dt is disabled |
+| `preprocessing.val_fraction` / `test_fraction` | 0.1 / 0.1 | 0.1 / 0.1 | 0.1 / 0.1 | — | inherited |
+| `preprocessing.n_steps` | 100 | 100 | 300 | — | changed since v3, no recorded reason; 100 states (99 transitions) per window |
+| `preprocessing.shard_size` | 4096 | 4096 | 4096 | — | inherited |
+| `preprocessing.max_chunk_attempts_per_source` | 200 | 200 | 200 | — | inherited |
+| `preprocessing.t_min` | 0.0 | 0.0 | 0.0 | — | inherited; windows start at max(t_min, first positive raw time) |
+| `preprocessing.dt_sampling` | loguniform | loguniform | loguniform | — | inherited (the only implemented value) |
+| `normalization.epsilon` | 1e-30 | 1e-30 | 1e-30 | — | inherited |
+| `normalization.min_std` | 1e-12 | 1e-12 | 1e-12 | — | inherited |
+| `preprocessing.drop_below` | 1e-30 | 1e-30 | 1e-30 | — | inherited value (its bias is measured in the T7 entry; the `>= epsilon` contract has a per-key row) |
+| `model.layer_norm_eps` | 1e-5 | 1e-5 | 1e-5 | 1e-5 (`nn.LayerNorm`) | inherited; equals the torch default |
+| `model.dropout` | 0.0 | 0.0 | 0.0 | — | inherited (no dropout) |
+| `training.loss.lambda_log10_mae` | 1.0 | 1.0 | 1.0 | — | inherited |
+| `training.loss.lambda_z_mse` | 0.1 | 0.25 | 0.1 | — | stage 1 inherited; stage 2's 0.25 comes from the stage-2 template (first in git 43a539b, 2026-03-23) with no recorded reason; whether 0.1 -> 0.25 is intended is open (author) |
+| `training.optimizer.lr` / `weight_decay` (stage 1) | 3e-4 / 1e-5 | (per-key rows) | 3e-4 / 1e-5 | 1e-3 / 1e-2 | inherited |
+| `training.optimizer.betas` / `eps` | (0.9, 0.999) / 1e-8 | same | same | same (`torch.optim.AdamW`) | inherited; equal to the torch defaults |
+| `training.scheduler.warmup_epochs` | 30 | 5 | 30 | — | stage 1 inherited, but v3 warmed a cosine schedule (`cosine_with_warmup`); stage 2 template value |
+| `training.scheduler.factor` | 0.5 | 0.5 | 0.5 (unused: cosine) | 0.1 | template value; v3 carried the plateau keys but ran cosine, so no v3 run exercised them |
+| `training.scheduler.patience` | 15 | 10 | 10 (unused: cosine) | 10 | stage 2 equals the torch default; stage 1's 15 has no recorded reason |
+| `training.scheduler.threshold` (relative) | 1e-3 | 1e-4 | 1e-4 (unused: cosine) | 1e-4 | stage 2 equals the torch default; stage 1's 1e-3 has no recorded reason |
+| `training.scheduler.min_lr` | 1e-7 | 1e-8 | 0.0 (unused: cosine) | 0 | no recorded reason (both are the stage's peak LR / 3000; inferred pattern) |
+| `training.ema.decay` | 0.9995 | 0.999 | absent (no EMA in v3) | — | template values (horizons in the lump rows above) |
+| `training.early_stopping.patience` | 30 | 20 | absent (no early stopping in v3) | 3 | template values; the relation to the plateau patience is in the min_delta row |
+| `training.max_epochs` | 400 | 200 | 300 | — | changed since v3, no recorded reason (v3's cosine schedule spanned 300) |
+| `runtime.checkpointing.save_top_k` | 3 | 3 | 1 | 1 (`ModelCheckpoint`) | changed since v3, no recorded reason; best.ckpt is the top-1 either way |
+| `runtime.checkpointing.every_n_epochs` | 1 | 1 | 1 | — | inherited |
+| `runtime.gradient_clip_val` | 1.0 | 1.0 | 0.0 | None (no clipping) | not the v3 value: v3's 0.0 means no clipping (Lightning skips clip values <= 0; how the v3-era code passed it is unverified); where 1.0 came from is unrecorded |
+| `runtime.accumulate_grad_batches` | 1 | 1 | 1 | 1 | inherited; the Lightning default |
 
 ## Documented alternatives (evidence-backed; not shipped as default configs)
 

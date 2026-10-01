@@ -10,7 +10,7 @@
     "  autoregressive_training.detach_between_steps=true,",
     "  autoregressive_training.backward_per_step=true,",
     "  autoregressive_training.loss_discount_gamma=0.9   <- REQUIRED with detach (E3)",
-    "Evidence per key: docs/DECISIONS.md.",
+    "docs/DECISIONS.md: per-key evidence, and the Inherited / unjustified table for values without it.",
     "Stage 2 reuses the stage-1 processed shards; do NOT rerun preprocessing.",
     "Run: AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u src/main.py"
   ],
@@ -42,11 +42,9 @@
     "enable_progress_bar": false,
     "gradient_clip_val": 1.0,
     "log_grad_norm": false,
-    "log_every_n_steps": 1000000,
     "checkpointing": {
       "enabled": true,
       "every_n_epochs": 1,
-      "monitor": "val_loss",
       "save_top_k": 3,
       "save_last": true
     },
@@ -103,14 +101,14 @@
     "dt_sampling": "loguniform",
     "n_steps": 100,
     "t_min": 0.0,
-    "output_trajectories_per_file": 1000000,
+    "output_trajectories_per_file": null,
     "shard_size": 4096,
     "overwrite": false,
     "time_key": "t_time",
     "val_fraction": 0.1,
     "test_fraction": 0.1,
     "seed": 1234,
-    "pool_size": 1000000,
+    "pool_size": null,
     "samples_per_source_trajectory": 4,
     "max_chunk_attempts_per_source": 200,
     "drop_below": 1e-30,
@@ -184,9 +182,7 @@
       "factor": 0.5,
       "patience": 10,
       "threshold": 0.0001,
-      "min_lr": 1e-08,
-      "mode": "min",
-      "monitor": "val_loss"
+      "min_lr": 1e-08
     },
     "autoregressive_training": {
       "enabled": true,

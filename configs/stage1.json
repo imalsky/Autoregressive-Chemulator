@@ -1,7 +1,7 @@
 {
   "_comment": [
     "PRODUCTION stage 1 (one-jump pretrain) - single dt-conditioned model over dt in [0.1, 1e3] s.",
-    "Evidence and justification for every non-default key: docs/DECISIONS.md.",
+    "docs/DECISIONS.md: per-key evidence, and the Inherited / unjustified table for values without it.",
     "Preprocess first (writes ../data/processed):",
     "  AUTOCHEM_CONFIG_PATH=configs/stage1.json python -u processing/preprocessing.py",
     "Then train:",
@@ -35,11 +35,9 @@
     "enable_progress_bar": false,
     "gradient_clip_val": 1.0,
     "log_grad_norm": false,
-    "log_every_n_steps": 1000000,
     "checkpointing": {
       "enabled": true,
       "every_n_epochs": 1,
-      "monitor": "val_loss",
       "save_top_k": 3,
       "save_last": true
     },
@@ -83,8 +81,10 @@
   },
   "preprocessing": {
     "_comment_full_dataset": [
-      "Full-dataset settings: pool_size and output_trajectories_per_file are set high",
-      "enough to consume every trajectory in every raw file (~160 files).",
+      "Full-dataset settings: pool_size and output_trajectories_per_file are null (no cap):",
+      "every source trajectory of every raw file is used. An integer is a deliberate per-file",
+      "subsample (pool_size counts source groups, output_trajectories_per_file written windows),",
+      "logged at WARNING and recorded per file in preprocessing_summary.json.",
       "samples_per_source_trajectory=4 draws 4 (dt, t_start) chunks per source trajectory",
       "(draw 0 anchored at the first positive raw time, draws 1-3 log-uniform; dt log-uniform",
       "in every draw) - dt-diversity per state is the load-bearing robustness ingredient found",
@@ -99,14 +99,14 @@
     "dt_sampling": "loguniform",
     "n_steps": 100,
     "t_min": 0.0,
-    "output_trajectories_per_file": 1000000,
+    "output_trajectories_per_file": null,
     "shard_size": 4096,
     "overwrite": true,
     "time_key": "t_time",
     "val_fraction": 0.1,
     "test_fraction": 0.1,
     "seed": 1234,
-    "pool_size": 1000000,
+    "pool_size": null,
     "samples_per_source_trajectory": 4,
     "max_chunk_attempts_per_source": 200,
     "drop_below": 1e-30,
@@ -180,17 +180,17 @@
       "factor": 0.5,
       "patience": 15,
       "threshold": 0.001,
-      "min_lr": 1e-07,
-      "mode": "min",
-      "monitor": "val_loss"
+      "min_lr": 1e-07
     },
     "autoregressive_training": {
+      "_comment": "Inert in stage 1 (disabled; the one-jump path never reads the sub-keys), but schema-required.",
       "enabled": false,
       "skip_steps": 0,
       "detach_between_steps": true,
       "backward_per_step": true
     },
     "curriculum": {
+      "_comment": "Inert in stage 1 (disabled; the sub-keys are not read), but schema-required.",
       "enabled": false,
       "start_steps": 1,
       "end_steps": 1,

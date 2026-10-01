@@ -8,8 +8,8 @@ time `t`, the model predicts `y(t + dt)` under variable timesteps:
 where `g = (P, T)` are per-trajectory global conditioning parameters. The
 production model is a single dt-conditioned MLP flow-map trained in two stages
 (one-jump pretrain -> autoregressive fine-tune). See [`spec.md`](spec.md) for the
-full design and [`docs/DECISIONS.md`](docs/DECISIONS.md) for the evidence behind
-every non-default config value.
+full design and [`docs/DECISIONS.md`](docs/DECISIONS.md) for the per-key evidence behind
+the config values (values without evidence are listed there as inherited / unjustified).
 
 ## Layout
 
@@ -17,7 +17,7 @@ every non-default config value.
       stage1.json         production stage 1 (one-jump pretrain) config
       stage2.json         production stage 2 (autoregressive fine-tune) config
     docs/
-      DECISIONS.md        per-key evidence + justification for the configs
+      DECISIONS.md        per-key evidence for the configs + inherited / unjustified values
       AR_PAPER_PLAN.md    ApJ paper plan, outline, and evidence map
     data/                 raw HDF5 + processed NPZ shards live here (not source)
     models/               training outputs / checkpoints live here (not source)
@@ -39,7 +39,6 @@ every non-default config value.
       training_logs.py    training-curve plots (diagnostic)
       eval_rollout_error.py   rollout-error curves vs step over a seeded validation sample (per-species dex)
       bench_speedup.py    exported-model (CPU and CUDA) latency sweep vs mini-chem per-cell cost
-      science.mplstyle    shared matplotlib style for the paper figures
       run.pbs             HPC: post-training export + plots job
       run_local_smoke.sh  end-to-end smoke on synthetic data
     run.pbs               HPC: stage 1 (preprocess + pretrain)

@@ -30,12 +30,21 @@ SPECIES = [
     "N2_evolution", "NH3_evolution", "OH_evolution", "O_evolution",
 ]
 
+# Generation settings (no argparse; module-level constants per spec 9.3.4): the time grid, the
+# per-trajectory distributions and the run settings below. Smoke use only: not traced to the real
+# data except where noted. The output directory is the one run-varying input and comes from a required
+# environment variable (mirrors the AUTOCHEM_CONFIG_PATH fail-fast convention).
 T_POINTS = 600
 T_START, T_END = 1e-6, 5e5   # spans the full production dt band x n_steps
-
-# Generation settings (no argparse; module-level constants per spec 9.3.4).
-# The output directory is the one run-varying input and comes from a required
-# environment variable (mirrors the AUTOCHEM_CONFIG_PATH fail-fast convention).
+# Per-species curves y(t) = 10 ** (log_eq + (log_init - log_eq) * exp(-t / tau)):
+LOG_EQ_RANGE = (-20.0, -0.5)        # log10 of the equilibrium level, uniform per species
+LOG_INIT_OFFSET_DEX = 3.0           # log10 initial level = log_eq + U(-this, this)
+LOG_TAU_RANGE_S = (-2.0, 4.0)       # log10 of the relaxation time (s), uniform per species
+# Per-trajectory globals. P is in Pa here (the real data use dyn/cm^2 over 1..1e10); aligning the
+# synthetic range and unit with the real data is a separate change (audit R1-055).
+LOG_P_RANGE_PA = (-2.0, 8.0)        # log10 P (Pa), uniform
+T_RANGE_K = (300.0, 3000.0)         # T (K), uniform; matches the real 300-3000 K envelope
+# Run settings.
 OUT_DIR_ENV_VAR = "AUTOCHEM_SYNTH_OUT_DIR"
 N_FILES = 2
 N_TRAJ = 30  # trajectories per file
@@ -46,14 +55,14 @@ def synth_trajectory(rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray, 
     t = np.logspace(np.log10(T_START), np.log10(T_END), T_POINTS)
     s = len(SPECIES)
     # Smooth positive curves: equilibrium level + decaying component, in log10 space.
-    log_eq = rng.uniform(-20.0, -0.5, size=s)
-    log_init = log_eq + rng.uniform(-3.0, 3.0, size=s)
-    tau = 10.0 ** rng.uniform(-2.0, 4.0, size=s)
+    log_eq = rng.uniform(*LOG_EQ_RANGE, size=s)
+    log_init = log_eq + rng.uniform(-LOG_INIT_OFFSET_DEX, LOG_INIT_OFFSET_DEX, size=s)
+    tau = 10.0 ** rng.uniform(*LOG_TAU_RANGE_S, size=s)
     decay = np.exp(-t[:, None] / tau[None, :])
     log_y = log_eq[None, :] + (log_init - log_eq)[None, :] * decay
     y = 10.0 ** log_y
-    P = float(10.0 ** rng.uniform(-2.0, 8.0))   # Pa
-    T_K = float(rng.uniform(300.0, 3000.0))
+    P = float(10.0 ** rng.uniform(*LOG_P_RANGE_PA))
+    T_K = float(rng.uniform(*T_RANGE_K))
     return t, y, P, T_K
 
 
