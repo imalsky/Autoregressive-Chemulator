@@ -664,10 +664,12 @@ them, src/trainer.py) but schema-required.
 Two production ports of the June 2026 Robertson-sandbox AR recipe exist, and neither is the code
 that produced the sandbox evidence (not on daw): Auto-Chem's `configs/stage{1,2}.json` (2026-06-15)
 and the sibling repo imalsky/Chemulator's `config/config_stage{1,2}.jsonc` (efa5378, 2026-07-29;
-unchanged at 071b3e0), which calls itself "the campaign-validated AR recipe". Neither repo
-references the other. Which one matches the sandbox runs cannot be checked until EXPERIMENTS.md is
-recovered; in particular the sandbox's skip and curriculum handling at K < 3 is unrecorded. Every
-row is untested at production scale. Whether to align either side is the author's.
+unchanged at 071b3e0), which calls itself "the campaign-validated AR recipe". The sibling repo
+never mentions Auto-Chem; Auto-Chem cited only the sibling paper until 2026-10-01, when this
+document and the paper plan began citing the sibling repo's code and configs. Which port matches
+the sandbox runs cannot be checked until EXPERIMENTS.md is recovered; in particular the sandbox's
+skip and curriculum handling at K < 3 is unrecorded. Every row is untested at production scale.
+Whether to align either side is the author's.
 
 | Setting | Auto-Chem | Sibling (Chemulator) |
 |---|---|---|
@@ -1020,16 +1022,18 @@ exists, the audit's recommendation. Items already recorded in a row above are po
     than the float32 resolution (37.0% excluding constant raw tails); with a perfect delta, 4.1%
     freeze while still relaxing (12.4% at 1e7–1e8 s), missing a median 0.14 dex by 1e8 s; 39.8% of
     the training target deltas are stored as exactly zero; K ≤ 100 evaluations cannot see it; the
-    deployment impact is inferred. Options: (1) no retraining or contract change: a FlowMapMLP hook
-    returning the network output before the residual add (bitwise identical) and float64 species
-    log10 / z / residual add / 10^x inside the export wrapper (measured 5.34% → 1.93% frozen at
-    6.4 s; export and AOTI verified on CPU); (2) the complete fix needs the host: a float64 host
+    deployment impact is inferred. Options: (1) a partial mitigation, not a standalone fix (R3-003),
+    with no retraining or contract change: a FlowMapMLP hook returning the network output before
+    the residual add (bitwise identical) and float64 species log10 / z / residual add / 10^x inside
+    the export wrapper, float32 I/O kept (export and AOTI verified on CPU). Frozen while relaxing
+    at 6.4 s: 5.34% → 1.93% per pair (4–5% at t ≥ 1e6 s); about 5% weighted by deployment steps,
+    against about 12% today, so it misses the audit science panel's ~1%-of-deployment-steps
+    trigger; useful only as a step toward (2); (2) the complete fix needs the host: a float64 host
     state through float64 I/O or an export returning dlog10 y (a spec 4.3 amendment), measured
-    0.002%; sub-cycling to dt = N × 6.4 s is a host-side mitigation. A float64 normalizer with
-    float32 I/O alone is dropped as an option (about 1.9% still frozen while relaxing, 4–5% at
-    t ≥ 1e6 s; about 5% weighted by deployment steps, against about 12% today): every working
-    option needs a float64 host state and the residual add outside the float32 network. Float64
-    training deltas would need both float32 casts in preprocessing removed, at 2× temp-shard disk.
+    0.002%; sub-cycling to dt = N × 6.4 s is a host-side mitigation. Option (1) alone is therefore
+    not a fix: every working option needs a float64 host state and the residual add outside the
+    float32 network (option (1)'s hook). Float64 training deltas would need both float32 casts in
+    preprocessing removed, at 2× temp-shard disk.
 25. Host species convention (R3-008): the export takes mixing ratios in the training convention
     (spec 4.3), while VULCAN normalizes over all species, He included. A real He-bearing column
     (HD209, 69 species) gives a 12-species sum of 0.857 (x_He 0.143) with H2 99.8% of it; that
