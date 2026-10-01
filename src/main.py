@@ -48,7 +48,7 @@ from lightning.pytorch.utilities.exceptions import SIGTERMException
 
 from dataset import FlowMapRolloutDataset, create_train_dataloader, create_val_dataloader, preload_nbytes
 from model import _REQUIRED_GLOBALS, create_model
-from trainer import FlowMapRolloutModule, build_lightning_trainer, build_loss_buffers
+from trainer import _MONITOR_METRIC, FlowMapRolloutModule, build_lightning_trainer, build_loss_buffers
 from utils import (
     as_bool,
     as_int,
@@ -1300,7 +1300,7 @@ def _init_checkpoint_record(ckpt_path: Optional[Path]) -> Any:
     opt_states = obj.get("optimizer_states") or []
     rec["optimizer_lr"] = [float(g["lr"]) for g in opt_states[0]["param_groups"]] if opt_states else None
     for key, state in (obj.get("callbacks") or {}).items():
-        if str(key).startswith("ModelCheckpoint") and "'monitor': 'val_loss'" in str(key):
+        if str(key).startswith("ModelCheckpoint") and f"'monitor': {_MONITOR_METRIC!r}" in str(key):
             for name in ("current_score", "best_model_score"):
                 v = state.get(name)
                 rec[f"val_loss_{name}"] = float(v) if v is not None else None
@@ -1333,9 +1333,9 @@ def _completion(trainer: pl.Trainer, *, ckpt_enabled: bool) -> Dict[str, Any]:
             f"training stopped at epoch {trainer.current_epoch} of max_epochs={trainer.max_epochs} without "
             "early stopping (interrupted?); not publishing best.ckpt or COMPLETED; resume from last.ckpt"
         )
-    last = trainer.callback_metrics.get("val_loss")
+    last = trainer.callback_metrics.get(_MONITOR_METRIC)
     if last is None or not math.isfinite(float(last)):
-        raise RuntimeError(f"last val_loss is {last!r}; not publishing best.ckpt or COMPLETED")
+        raise RuntimeError(f"last {_MONITOR_METRIC} is {last!r}; not publishing best.ckpt or COMPLETED")
     rec: Dict[str, Any] = {
         "stop_reason": stop_reason,
         "epochs": int(trainer.current_epoch),
@@ -1344,12 +1344,12 @@ def _completion(trainer: pl.Trainer, *, ckpt_enabled: bool) -> Dict[str, Any]:
         "best": None,
     }
     if ckpt_enabled:
-        top_k = [c for c in trainer.checkpoint_callbacks if getattr(c, "monitor", None) == "val_loss"]
+        top_k = [c for c in trainer.checkpoint_callbacks if getattr(c, "monitor", None) == _MONITOR_METRIC]
         if len(top_k) != 1:
-            raise RuntimeError(f"expected exactly one val_loss ModelCheckpoint callback, found {len(top_k)}")
+            raise RuntimeError(f"expected exactly one {_MONITOR_METRIC} ModelCheckpoint callback, found {len(top_k)}")
         score = top_k[0].best_model_score
         if score is None or not math.isfinite(float(score)):
-            raise RuntimeError(f"best val_loss score is {score!r}; not publishing best.ckpt or COMPLETED")
+            raise RuntimeError(f"best {_MONITOR_METRIC} score is {score!r}; not publishing best.ckpt or COMPLETED")
         rec["best"] = {"source": str(top_k[0].best_model_path or ""), "val_loss": float(score)}
     return rec
 

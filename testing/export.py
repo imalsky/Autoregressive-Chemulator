@@ -125,6 +125,9 @@ METADATA_VERSION = 2
 # training-only loss buffers under "criterion." (dropped).
 _MODEL_KEY_PREFIX = "model."
 _LOSS_KEY_PREFIX = "criterion."
+# The metric best.ckpt was selected by; must equal src/trainer.py _MONITOR_METRIC (not imported:
+# trainer pulls in Lightning).
+_MONITOR_METRIC = "val_loss"
 # A finished artifact is written under <dir>/.partial/<same name> and os.replace'd onto its final
 # name, so a failed or killed export never leaves a truncated file under the final name.
 _PARTIAL_DIR_NAME = ".partial"
@@ -301,14 +304,14 @@ def _load_weights_strict(
 
     score = None
     for key, state in (ckpt.get("callbacks") or {}).items():
-        if str(key).startswith("ModelCheckpoint") and "'monitor': 'val_loss'" in str(key):
+        if str(key).startswith("ModelCheckpoint") and f"'monitor': {_MONITOR_METRIC!r}" in str(key):
             v = state.get("current_score")
             score = float(v) if v is not None else None
     record = {
         "weights_source": source,
         "epoch": ckpt.get("epoch"),
         "global_step": ckpt.get("global_step"),
-        "monitor": "val_loss",
+        "monitor": _MONITOR_METRIC,
         "checkpoint_score": score,
         "training_lightning_version": ckpt.get("pytorch-lightning_version"),
     }
