@@ -1,5 +1,45 @@
 # Production config decisions — evidence and justification
 
+## REVISION 2026-09-30: correctness and contract fixes (audit theme T1)
+
+Production training numerics are unchanged by these fixes: the 30-step fingerprint of both stages
+(live and EMA weights, every training loss, val_loss) is bitwise identical to the pre-audit baseline,
+preprocessing outputs (synthetic set and a real-data subset) compare equal array by array, and exports
+of the smoke checkpoint give identical weights and outputs (the graph loses five no-op denominator
+clamps; the metadata gains the checkpoint's `model` block). What changed:
+- Configs are checked harder before anything is written or loaded: duplicate JSON keys and
+  NaN/Infinity, `_x` keys other than `_comment*`, dotted raw keys (`"a.b": v`; write the nested
+  block), wrong value types (e.g. `400.0` epochs, `"false"`), value ranges (max_epochs >= 1,
+  optimizer/scheduler ranges, gradient_clip_val null or > 0, save_top_k -1 or >= 1), cross-key
+  curriculum/skip/checkpointing rules, and duplicate species names (config, manifest, export).
+  `runtime.log_grad_norm` and `preprocessing.num_workers` are now required keys.
+- Early stopping and the LR plateau observe the same epochs: both start counting at the first epoch
+  after the LR warmup and the curriculum ramp (training behaviour; per-key row below).
+- Run directory: the training process flocks `work_dir` (a second launch on a live run fails at
+  startup) and writes `train.log` there (appended on resume); a `work_dir` holding only `train.log`
+  counts as empty for a fresh start. A resume must continue the same run: its checkpoint in this
+  run's `checkpoints/`, ModelCheckpoint state written there (a moved or copied run dir is refused;
+  restart it with `checkpoint_mode="weights_only"`), and a config equal to `config.resolved.json`
+  except `training.checkpoint_mode`, `runtime.checkpoint` and `training.max_epochs`; a resume writes
+  `config.resume[.N].json` beside the untouched `config.resolved.json`. `last.ckpt` always holds the
+  latest completed epoch. A non-finite val_loss aborts the run (exit 1) before that epoch's checkpoint
+  is written and publishes no best.ckpt (finite top-k and last.ckpt files remain); launchers must gate
+  on the exit status, not on "any *.ckpt". SIGTERM exits 143 and best.ckpt is not published.
+  weights_only refuses non-finite weights, a checkpoint whose model block differs from the config's
+  (comment keys ignored), and a missing `ema_state_dict` when the source run used EMA.
+- Preprocessing: one run per processed dir (`<processed_dir>.lock`, a persistent 0-byte sibling
+  file); the previous dataset stays intact until the new one is complete (built in `_tmp_final/`,
+  swapped in with `normalization.json` last); each physical shard is deleted once its final shard is
+  written; the published row counts must equal the sampled counts; worker processes die with the
+  parent (Linux PR_SET_PDEATHSIG). P/T: a non-scalar value fails the run (schema mismatch); a
+  non-finite one or one that is not > 0 as float32 rejects only that trajectory group, counted as
+  `non_finite` / `non_positive_global` in `preprocessing_summary.json` (no current group is affected:
+  all have P >= 1.0001, T >= 300.002, audit measurement). `drop_below >= epsilon` is required.
+- Export: only Lightning checkpoints are accepted (keys under `model.`/`criterion.`), EMA weights are
+  required when the run used EMA, the checkpoint's model block must equal the config's, weights must
+  be finite and every normalization statistic is validated (NaN-safe; stds >= min_std, ranges hi > lo
+  as float32); artifacts are written under `.partial/` and renamed into place.
+
 ## REVISION 2026-09-30: per-step training overhead cut; stage-1 CUDA graphs (audit theme T3)
 
 Training numerics are unchanged: the 30-step fingerprint of both stages (live and EMA weights, every
@@ -60,7 +100,8 @@ stage-1 `preprocessing.output_trajectories_per_file` from 1e6 to 1e5 while addin
 `num_workers: 64`, contradicting the "consume all" user decision in the table below,
 the config's own inline comment, and stage2.json. Restored to 1e6; both configs now
 carry identical preprocessing blocks except `overwrite` (stage-1 true, stage-2 false),
-with `num_workers: 64` added to stage2.json for parity. If a processed dataset was
+with `num_workers: 64` added to stage2.json for parity (superseded 2026-09-30: 16 in both
+configs, see the per-key table). If a processed dataset was
 already built on the HPC after df2c44f, check the recorded value in the processed
 dir's `preprocessing_summary.json` and rebuild if it was made with the 1e5 cap
 (run.pbs skips preprocessing whenever the processed dir exists).
@@ -70,7 +111,11 @@ Stage-1 -> stage-2 checkpoint handoff (status note): stage 2 initializes from
 best-val_loss checkpoint. Whether the handoff should use last or best val_loss is an
 OPEN decision to settle before launch; the config's checkpoint path stays unchanged
 until it is. `testing/export.py` exports `checkpoints/best.ckpt`, matching the
-val_loss selection contract (spec 1.3 / 6.2).
+val_loss selection contract (spec 1.3 / 6.2). Correction 2026-09-30 (audit T1): with Lightning 2.6
+the top-k callback's `save_last` refreshes `last.ckpt` only in epochs that enter the top-k
+(`lightning/pytorch/callbacks/model_checkpoint.py` 494-498), so `last.ckpt` could lag the final
+epoch; a separate monitor-free callback now writes it every epoch, so "last.ckpt" means stage 1's
+true final epoch.
 
 ## REVISION 2026-06-11: `fourier_dt.enabled` flipped to **false**
 
@@ -171,12 +216,19 @@ no inversion of any adopted finding.
 | `autoregressive_training.skip_steps` | 1 | Brandstetter 2022 canonical pushforward (unroll 2, backprop last; "more stable"); composes with BPTT. Sandbox used skip 2 at K≥4 successfully; 1 is the literature value and wastes fewer target steps. | medium |
 | `autoregressive_training.detach_between_steps` | **false (full BPTT)** | **E4**: BPTT ≈ detach locally (geometric 2.6–3.0e-3 vs 2.4e-3; fixed-dt 0.30–0.37 vs 0.37–0.55 — within noise, both seeds). Tie broken by literature: every SOTA AR forecaster backprops through the rollout (GraphCast, Keisler, FourCastNet, Stormer, NeuralGCM, ACE2); the only *chemistry* precedent (Kelp 2020, 24-step recurrent) is full BPTT; List 2024: BPTT 38% vs detached 23%. Memory at K=10/10×2048/batch-2048 is fine on GH200. | medium (local tie; high literature prior) |
 | `autoregressive_training.loss_discount_gamma` | 1.0 (with BPTT) | **E3+E4 interaction**: under BPTT, γ=1.0 ≈ γ=0.9 (3.3e-3 vs 2.6e-3, within noise); uniform matches all SOTA practice. **Under DETACH, γ<1 is required**: uniform was 4–14× worse in both seeds (1.1e-2, 3.3e-2 vs 2.4e-3 at γ=0.9). Hence fallback recipe pins γ=0.9. | medium-high |
-| `backward_per_step` | false | Only meaningful in the detached path; BPTT does one backward. Fallback recipe sets true (memory). | n/a |
+| `backward_per_step` | false | Only meaningful in the detached path; BPTT does one backward, so `backward_per_step=true` with `detach_between_steps=false` is rejected (since 2026-09-30). Fallback recipe sets true (memory). `detach=true` with `backward_per_step=false` gives the fallback's gradients but holds all K−skip step graphs until one backward (9 at K=10, skip 1, against 1 for the per-step fallback: BPTT's activation memory); rejecting that pair too is the author's call. | n/a |
 | stage-2 `lr` | 3e-5 (= stage-1 peak / 10) | **E5**: staged pretrain→fine-tune at LR peak/10 gave the best fixed-dt result of the whole campaign (0.256 vs 0.379 from-scratch); LR peak/3 (1e-4) doubled geometric error with no fixed-dt gain. Literature: AR fine-tune LR is 5–3000× below pretrain peak (FourCastNet /5, Keisler /10 per stage, Stormer /100–/1000, GraphCast /3000); /10 is at the aggressive-but-precedented end, and the old template's 2e-5 is also fine. | medium-high |
 | stage-2 `wd` | 1e-5 (= stage 1; old template's 0.005 dropped) | No SOTA fine-tune cranks WD ×500 at the phase boundary; the 0.005 value was untested (stage 2 never ran). Keep optimizer geometry constant except LR. | medium (literature/consistency) |
 | stage-2 `lambda_z_mse` 0.25, EMA 0.999, early-stop 20, plateau warmup 5 | template values | Inherited from the stage-2 template; not locally discriminated. EMA re-warms automatically at stage start (fresh callback state); ACE evidence says EMA helps long-rollout metrics up to 15%. | inherited |
 | `runtime.torch_compile.compile_open_loop_unroll` | stage-1 true / stage-2 false | The flag affects only the validation open-loop rollout (`trainer.py` `_eval_step`), never the AR training loop, and eval K ignores the curriculum. Stage 2 disables whole-unroll compilation because a fullgraph K=10 unroll of the 10x2048 trunk is a 10x-deep inductor graph (long compile time; recompiles on a ragged final validation batch with dynamic=false); eval still runs the compiled forward step per step. Stage-1 true is redundant-but-harmless at eval K=1. | n/a (throughput only; no effect on math) |
-| `runtime.torch_compile.mode` | stage-1 `reduce-overhead` (REVISED 2026-09-30, was `default`) / stage-2 `default` | Stage 1 replays its compiled training step and validation rollouts as CUDA graphs, which cuts host-side launch work: on a CPU-bound proxy (10x256 trunk, logging fixes applied) the stage-1 CPU time per step fell from 3.85 to 2.82 ms (audit efficiency study). On daw's RTX 6000 Ada stage 1 is GPU-bound and wall time did not change (-0.9%, inside noise); a gain is expected only where stage 1 is CPU-bound, e.g. on the GH200 (not measured). Numerics are identical: bitwise 30-step fingerprints (live/EMA weights, every loss, val_loss), and a 3-epoch run that replays every training and validation graph (ragged last batch included, after the EMA weight swap) matches `default` bit for bit. Compile variants with a ragged last validation batch: forward step 1, validation rollout 2 (the recompile limit is 8). Under CUDA graphs the next step's replay reuses the previous step's `.grad` memory, so nothing may read gradients across steps; nothing does (`runtime.log_grad_norm` is read only in the stage-2 manual-optimization path, within the step). Stage 2 keeps `default`: it is GPU-bound (no expected gain), and its no-grad pushforward output feeds the grad-mode step, which the study expects to conflict with CUDA-graph output reuse (inferred, not run). | n/a (throughput only; bitwise-identical) |
+| `runtime.torch_compile.mode` | stage-1 `reduce-overhead` (REVISED 2026-09-30, was `default`) / stage-2 `default` | Stage 1 replays its compiled training step and validation rollouts as CUDA graphs, which cuts host-side launch work: on a CPU-bound proxy (10x256 trunk, logging fixes applied) the stage-1 CPU time per step fell from 3.85 to 2.82 ms (audit efficiency study). On daw's RTX 6000 Ada stage 1 is GPU-bound and wall time did not change (-0.9%, inside noise); a gain is expected only where stage 1 is CPU-bound, e.g. on the GH200 (not measured). Numerics are identical: bitwise 30-step fingerprints (live/EMA weights, every loss, val_loss), and a 3-epoch run that replays every training and validation graph (ragged last batch included, after the EMA weight swap) matches `default` bit for bit. Compile variants with a ragged last validation batch: forward step 1, validation rollout 2 (the recompile limit is 8). Under CUDA graphs the next step's replay reuses the previous step's `.grad` memory, so nothing may read gradients across steps; nothing does (`runtime.log_grad_norm` reads the gradients in both stages, but only within the step, before the optimizer step; since 2026-09-30). Stage 2 keeps `default`: it is GPU-bound (no expected gain), and its no-grad pushforward output feeds the grad-mode step, which the study expects to conflict with CUDA-graph output reuse (inferred, not run). | n/a (throughput only; bitwise-identical) |
+| `preprocessing.num_workers` | 16 (REVISED 2026-09-30, was 64) | Preprocessing runs on daw, where one job uses at most 16 cores; the fan-out is also capped at the number of raw files and of cores the process may run on. Outputs do not depend on the worker count (per-file RNG and shard names): 1 and 4 workers gave identical arrays and normalization.json on the synthetic set (audit T1 check). Supersedes the 2026-07-16 "num_workers 64 for parity" note. | n/a (throughput only) |
+| `training.early_stopping.min_delta` with ES `patience`, plateau `patience` / `threshold` | min_delta 0.0 (REVISED 2026-09-30, was 1e-5); ES patience 30 / 20; plateau patience 15 / 10, threshold 1e-3 / 1e-4 relative (`threshold_mode` "rel", a named constant in trainer.py) | ES and the plateau observe the same epochs: both ignore the LR warmup and the curriculum ramp and start counting at the first epoch after both (warmup-era epochs stay eligible for best.ckpt). With min_delta 0 every plateau improvement is also a new ES best, and plateau patience + 1 < ES patience (16 < 30, 11 < 20), so once counting has started ES cannot stop before an LR halving. Before, stage 1 could stop at peak LR with zero LR cuts (audit harness, constructed curves with the best inside the warmup: stopped at epochs 35 and 54; with T1 neither stops). Under steady slow improvement `max_epochs` (400 / 200) becomes the binding budget and the relative thresholds decide whether slow progress cuts the LR; tuning them is the author's. Alternative pending the author: both monitors keep the warmup-era best (an annealing-policy choice). A pre-fix run cannot be resumed with these values (the resume config check refuses changed keys). | inherited (min_delta and the shared window: audit) |
+| `runtime.accelerator` / `runtime.devices` | "cuda" / 1 (REVISED 2026-09-30, were "auto") | Explicit single device: "auto" falls back to CPU silently and Lightning's "gpu" alias tries MPS first; a CUDA request with no visible GPU now fails at startup. The launcher picks the GPU with CUDA_VISIBLE_DEVICES (devices=1 means visible index 0). Multi-GPU/DDP is unsupported. | n/a |
+| `system.device` / `training.pin_memory` | "cpu" / true | Every split is preloaded into host RAM (a CUDA preload would put the whole dataset in GPU memory) and batches are pinned for the copy; pin_memory=true with a CUDA preload is rejected. Window indices come from a CPU generator, so the window sequence does not depend on the preload device. Preload budget: a host preload (train + validation, sized from the shard headers) larger than 0.5 × MemAvailable fails at startup instead of being OOM-killed while filling (`_PRELOAD_MAX_FRACTION_OF_MEM_AVAILABLE` in src/main.py, not a config key). MemAvailable is a snapshot on a shared host, not a guarantee. The 0.5 is pending the author: at ~785 GB MemAvailable (daw, T1 smoke log) it caps the preload at ~393 GB, below the ~481 GB the audit infers for all 160 raw files, so a full-data run would be refused today. | decision pending (the fraction) |
+| `runtime.gradient_clip_val` / `runtime.log_grad_norm` | 1.0 / false | Clip 1.0 is inherited; under AdamW, clipping reweights batches, it does not lower the LR. null is the only "no clipping" value (0 and negatives are rejected). `log_grad_norm` (a required key since 2026-09-30) logs per epoch the mean pre-clip total gradient norm (`grad_norm`) and the fraction of steps where clipping fired (`grad_clip_frac`), in both stages, summed on the GPU. | inherited |
+| `precision.*` | float32, amp_mode "true" | The preload is always float32 (`precision.preload_dtype` removed 2026-09-30: bf16 storage moved states by a median 3.1e-3 dex in the audit, above the ~7e-4 target). loss_dtype must be float32 or float64. Under amp_mode "mixed", model_dtype and input_dtype must be float32 and `model.predict_delta` true: a bf16 input, or a whole next state coming out of the bf16 trunk, would carry the rollout state at bf16 resolution. Under autocast the input block and the delta head run in fp32 (fp32 and bf16-true runs are unchanged); bf16-mixed with fused AdamW and clipping trains. bf16-true is kept but lossy: the rollout state is carried in bf16. | decision (float32 default) |
+| `preprocessing.drop_below` | 1e-30 (= normalization.epsilon) | `drop_below >= epsilon` is required (2026-09-30): every kept raw value is then >= epsilon, so the epsilon floors in the log transforms never change a kept value. | n/a (contract) |
 | **rejected: input-noise injection** | not shipped | **E6**: 4/4 noise runs worse, 3/4 catastrophic at fixed-dt (12.4–14.1 dex; σ ∈ {0.01, 0.03} z-space, with and without pushforward, 2 seeds) — *against* the GNS/Stachenfeld prior. No trainer option added. If ever revisited, sweep σ ≤ 1e-3 and re-test. | high (locally decisive) |
 | **rejected: K=20 detached training** | — | E3: consistently worse + one 1-dex blow-up; List 2024 agrees. (K>10 with BPTT untested locally — plausible future direction, not a default.) | medium |
 | **not adopted: inference-time renormalization** | off | Sturm 2024: naive projection degrades radicals/trace species (exactly what dominates a log-standardized loss); weighted projection neutral-to-positive. Track conservation drift as an EVAL metric; if the host solver needs hard conservation, the stoichiometric-output-layer route (Sturm & Wexler 2022) is the accuracy-neutral fix. | high (literature) |
@@ -229,10 +281,13 @@ Each ~20 stage-1 epochs (~5% of a full run) on one GH200, comparing val curves:
   error against 3.3e-7 for fp32, and the bf16 export option was removed on 2026-09-30).
   Review findings addressed: fallback_banded path depth fixed (+ resolution verified);
   `fourier_dt` block without `enabled` now raises; `loss_discount_gamma` outside AR mode now
-  raises; Fourier projection computed in fp32 internally (bf16-config fidelity). Known
+  raises; Fourier projection computed in at least float32 internally (bf16 upcast, float64 kept;
+  bf16-config fidelity). Known
   non-blocking notes: val_loss is intentionally uniform-weighted even when training γ<1
-  (cross-config comparability — commented in trainer.py); AR + bf16-mixed + fused-optimizer + clipping fails at first step
-  (pre-existing Lightning guard; production configs are fp32-true and unaffected).
+  (cross-config comparability — commented in trainer.py); bf16-mixed + fused optimizer + clipping failed at
+  the first step in both stages (Lightning's GradScaler-only fused-optimizer guard). Since 2026-09-30 (audit
+  T1) the module clips with `clip_grad_norm_` itself and that combination trains in both stages (30-step
+  runs bitwise equal to the efficiency study's patched runs); production configs are fp32-true.
 - ruff/vulture clean on all changed files; all 7 configs pass the strict schema;
   legacy configs unaffected.
 

@@ -23,6 +23,17 @@ import torch
 # The EMA update runs mul_ then add_ per group of at most ~20 MB, so the add_ pass finds the group's
 # freshly written EMA tensors in L2 (96 MB on RTX 6000 Ada, 50 MB on H100) with 2 launches per group.
 _GROUP_BYTES = 20_000_000
+# Floating shadow tensors are kept at >= float32: at bf16, (1 - decay) * (live - ema) falls below the
+# weight's resolution and the shadow never moves. float64 shadows are kept, never downcast.
+EMA_SHADOW_MIN_DTYPE = torch.float32
+
+
+def _shadow_copy(t: torch.Tensor) -> torch.Tensor:
+    """Detached copy for the EMA shadow: floating tensors promoted to >= EMA_SHADOW_MIN_DTYPE, others cloned."""
+    t = t.detach()
+    if t.dtype.is_floating_point:
+        return t.to(dtype=torch.promote_types(t.dtype, EMA_SHADOW_MIN_DTYPE), copy=True)
+    return t.clone()
 
 
 class EMACallback(pl.Callback):
@@ -39,8 +50,8 @@ class EMACallback(pl.Callback):
         self._cache = None  # cached (ema, live) tensor groups; reset whenever ema_sd is replaced
 
     def _init_ema_from_module(self, pl_module: pl.LightningModule) -> None:
-        """Initialize the EMA shadow as a detached clone of the module's current state_dict."""
-        self.ema_sd = {k: v.detach().clone() for k, v in pl_module.state_dict().items()}
+        """Initialize the EMA shadow as a detached copy of the module's current state_dict."""
+        self.ema_sd = {k: _shadow_copy(v) for k, v in pl_module.state_dict().items()}
         self._cache = None
 
     def setup(self, trainer: pl.Trainer, pl_module: pl.LightningModule, stage: str) -> None:
@@ -132,7 +143,7 @@ class EMACallback(pl.Callback):
         """Restore the EMA shadow from the checkpoint, or re-initialize it if absent."""
         ema = checkpoint.get("ema_state_dict")
         if isinstance(ema, dict) and ema:
-            self.ema_sd = {k: v.detach().clone() for k, v in ema.items()}
+            self.ema_sd = {k: _shadow_copy(v) for k, v in ema.items()}
         else:
             self._init_ema_from_module(pl_module)
         self._cache = None

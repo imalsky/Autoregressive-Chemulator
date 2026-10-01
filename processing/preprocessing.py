@@ -12,8 +12,16 @@ Outputs (under paths.processed_dir):
   test/shard_*.npz
 
 Temporary stage (under paths.processed_dir):
-  _tmp_physical/<split>/shard_*_physical.npz
-  (removed automatically on successful completion)
+  _tmp_physical/<split>/shard_*_physical.npz   (each deleted once its final shard is written)
+  _tmp_final/                                  (the new dataset, built before anything is replaced)
+  _tmp_old/                                    (the previous dataset while it is being swapped out)
+  All three are removed on success. A failed run leaves them in place; the next run wipes
+  them (preprocessing.overwrite=true) or refuses (false). The previous dataset stays intact
+  until the new one is complete: only preprocessing-owned entries are swapped, with
+  normalization.json (the launchers' "dataset complete" marker) moved out first and in last.
+
+Lock: <processed_dir>.lock, a persistent 0-byte sibling file, is flocked for the whole run so
+two preprocessing runs (or leftover workers of a killed run) never share a processed_dir.
 
 Shard schema:
   Physical shards (temporary):
@@ -29,7 +37,9 @@ Shard schema:
 This script is intentionally strict:
 - Configuration must use the canonical schema (the file named by AUTOCHEM_CONFIG_PATH).
 - Dataset names must match exactly (no implicit renaming).
-- Globals must be scalar per trajectory (time-series globals are rejected).
+- Globals must be scalar per trajectory: a non-scalar P/T fails the run as a schema
+  mismatch; a non-finite one (non_finite) or one that is not > 0 as float32
+  (non_positive_global) rejects only that trajectory group, counted in the summary.
 
 Run:
   AUTOCHEM_CONFIG_PATH=configs/stage1.json python -u processing/preprocessing.py
@@ -37,30 +47,36 @@ Run:
 
 from __future__ import annotations
 
+import ctypes
+import fcntl
 import hashlib
 import json
 import logging
+import math
+import multiprocessing
 import os
 import shutil
+import signal
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-# Cap native BLAS/OpenMP threads to 1 BEFORE numpy/h5py load their backends. The
-# preprocessing fan-out runs one process per raw file (preprocessing.num_workers);
-# without this, each of the ~64 workers would spawn its own BLAS thread-pool and
-# oversubscribe the node. Hard-assigned: launcher-exported training thread counts
-# (e.g. OMP_NUM_THREADS=16 from run.pbs) must not leak into the fan-out.
-for _thread_var in (
-    "OMP_NUM_THREADS",
-    "OPENBLAS_NUM_THREADS",
-    "MKL_NUM_THREADS",
-    "NUMEXPR_NUM_THREADS",
-    "VECLIB_MAXIMUM_THREADS",
-):
-    os.environ[_thread_var] = "1"
+# When run as a script, cap native BLAS/OpenMP threads to 1 BEFORE numpy/h5py load their
+# backends: the fan-out runs one worker process per raw file (up to preprocessing.num_workers),
+# and each worker would otherwise start its own BLAS thread pool and oversubscribe the cores.
+# Hard-assigned, so thread counts exported for training do not leak into the fan-out. Modules
+# that import this file (processing/testing.py) keep their own thread settings.
+if __name__ == "__main__":
+    for _thread_var in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ):
+        os.environ[_thread_var] = "1"
 
 # These imports must stay below the thread-cap loop: the BLAS/OpenMP backends
 # read the env vars above at import time.
@@ -93,6 +109,13 @@ log = logging.getLogger(__name__)
 _REQUIRED_GLOBALS: Tuple[str, str] = ("P", "T")
 _REQUIRED_DT_SAMPLING = "loguniform"
 _ALLOWED_GLOBAL_METHODS = {"standard", "min-max", "log-min-max", "log-standard"}
+# Config keys starting with this prefix are comments (same rule as src/utils.py); any other
+# '_'-prefixed key is unknown.
+_COMMENT_KEY_PREFIX = "_comment"
+# One preprocessing run per processed_dir: <processed_dir>.lock is flocked for the whole run.
+_LOCK_SUFFIX = ".lock"
+# prctl(2) option from <linux/prctl.h>: signal this process when its parent thread exits.
+_PR_SET_PDEATHSIG = 1
 _REQUIRED_TOP_LEVEL: Tuple[str, ...] = ("paths", "data", "normalization", "preprocessing", "system")
 _ALLOWED_TOP_LEVEL: Tuple[str, ...] = (
     "precision",
@@ -135,14 +158,14 @@ _REQUIRED_SECTION_KEYS: Dict[str, Tuple[str, ...]] = {
 
 
 def _validate_no_unknown_keys(mapping: Mapping[str, Any], *, allowed: Sequence[str], prefix: str = "") -> None:
-    """Reject any non-comment key not in `allowed` (whitespace-ambiguous keys also fail)."""
+    """Reject any key not in `allowed` ('_comment*' keys excepted; whitespace-ambiguous keys fail)."""
     allowed_set = set(allowed)
     for raw_key in mapping.keys():
         if not isinstance(raw_key, str):
             raise TypeError("bad key")
         if raw_key.strip() != raw_key:
             raise KeyError("ambiguous key")
-        if raw_key.startswith("_"):
+        if raw_key.startswith(_COMMENT_KEY_PREFIX):
             continue
         if raw_key not in allowed_set:
             path = f"{prefix}.{raw_key}" if prefix else raw_key
@@ -224,10 +247,12 @@ def _require_int(mapping: Dict, key: str) -> int:
 
 
 def _require_float(mapping: Dict, key: str) -> float:
-    """Return a required number as float (bools rejected), or raise TypeError."""
+    """Return a required finite number as float (bools rejected), or raise TypeError/ValueError."""
     obj = _require(mapping, key)
     if isinstance(obj, bool) or not isinstance(obj, (int, float)):
         raise TypeError(f"config.{key} must be a number")
+    if not math.isfinite(obj):
+        raise ValueError(f"config.{key} must be finite, got {obj!r}")
     return float(obj)
 
 
@@ -297,12 +322,30 @@ class PreCfg:
     num_workers: int  # number of parallel worker processes for the per-file sampling fan-out
 
 
+def _reject_duplicate_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    """json object_pairs_hook: a repeated key is an error (plain json.load keeps the last one)."""
+    out: Dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"duplicate JSON key: {key!r}")
+        out[key] = value
+    return out
+
+
+def _reject_non_finite_constant(name: str) -> Any:
+    """json parse_constant hook: NaN / Infinity / -Infinity are not valid config values."""
+    raise ValueError(f"non-finite JSON number {name} is not allowed")
+
+
 def load_json(path: Path) -> Dict:
-    """Load a JSON config file, requiring a top-level object."""
+    """Load a JSON config file strictly (no duplicate keys, no NaN/Infinity), requiring a top-level object."""
     if not path.exists():
         raise FileNotFoundError(f"Config not found: {path}")
     with open(path, "r", encoding="utf-8") as f:
-        obj = json.load(f)
+        try:
+            obj = json.load(f, object_pairs_hook=_reject_duplicate_keys, parse_constant=_reject_non_finite_constant)
+        except ValueError as e:
+            raise ValueError(f"Invalid JSON in {path}: {e}") from e
     if not isinstance(obj, dict):
         raise TypeError("Config must be a JSON object")
     return obj
@@ -325,6 +368,9 @@ def parse_precfg(cfg: Dict, *, cfg_path: Path) -> PreCfg:
     species_variables = _require_str_list(data, "species_variables")
     if global_variables != list(_REQUIRED_GLOBALS):
         raise ValueError(f"config.data.global_variables must be exactly {list(_REQUIRED_GLOBALS)}")
+    dups = sorted({sp for sp in species_variables if species_variables.count(sp) > 1})
+    if dups:
+        raise ValueError(f"config.data.species_variables has duplicate names: {dups}")
 
     norm = _require_dict(cfg, "normalization")
     epsilon = _require_float(norm, "epsilon")
@@ -407,6 +453,12 @@ def parse_precfg(cfg: Dict, *, cfg_path: Path) -> PreCfg:
         raise ValueError("normalization.epsilon must be > 0")
     if min_std <= 0.0:
         raise ValueError("normalization.min_std must be > 0")
+    # Every kept value is >= drop_below >= epsilon, so the epsilon floors in the log transforms
+    # never change a kept value.
+    if drop_below < epsilon:
+        raise ValueError(
+            f"preprocessing.drop_below ({drop_below}) must be >= normalization.epsilon ({epsilon})"
+        )
 
     return PreCfg(
         raw_dir=raw_dir,
@@ -460,24 +512,12 @@ def clean_dir(path: Path, *, overwrite: bool) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def clean_processed_outputs(processed_dir: Path, *, overwrite: bool) -> None:
-    """Remove existing split dirs and manifest/summary files (overwrite) or refuse if present."""
-    processed_dir.mkdir(parents=True, exist_ok=True)
-    for split in ("train", "validation", "test"):
-        d = processed_dir / split
-        if d.exists():
-            if not overwrite:
-                raise RuntimeError(f"Refusing to overwrite existing output split dir: {d}")
-            shutil.rmtree(d)
-    for name in ("normalization.json", "preprocessing_summary.json"):
+def refuse_existing_outputs(processed_dir: Path) -> None:
+    """Raise if processed_dir already holds a split dir or the manifest/summary (overwrite=false)."""
+    for name in ("train", "validation", "test", "normalization.json", "preprocessing_summary.json"):
         p = processed_dir / name
         if p.exists():
-            if not overwrite:
-                raise RuntimeError(f"Refusing to overwrite existing output file: {p}")
-            if p.is_dir():
-                shutil.rmtree(p)
-            else:
-                p.unlink()
+            raise RuntimeError(f"Refusing to overwrite existing output (preprocessing.overwrite=false): {p}")
 
 
 def remove_tmp_dir(path: Path) -> None:
@@ -721,8 +761,11 @@ def read_globals_vector(
 ) -> np.ndarray:
     """Read per-trajectory globals as a [G] float32 vector from group attrs or scalar datasets.
 
-    Each global must be a finite scalar and present as exactly one of attribute OR dataset
-    (both present is ambiguous and rejected).
+    Each global must be present as exactly one of attribute OR dataset (both present is
+    ambiguous and rejected), hold exactly one value (else TypeError: a schema mismatch), be
+    finite (else the 'must be a finite scalar' ValueError: a non_finite reject) and be > 0 as
+    float32 (else the 'must be > 0' ValueError: a non_positive_global reject). P and T are
+    physically positive; a tiny positive float64 P that underflows to 0 in the cast fails too.
     """
     out = np.empty((len(global_vars),), dtype=np.float64)
 
@@ -740,8 +783,12 @@ def read_globals_vector(
 
         if attr_present:
             v = np.asarray(grp.attrs[name], dtype=np.float64).reshape(-1)
-            if v.size != 1 or not np.isfinite(v[0]):
-                raise ValueError(f"Global attribute '{name}' must be a finite scalar")
+            if v.size != 1:
+                raise TypeError(f"Global attribute '{name}' must be a scalar, got {v.size} values")
+            if not np.isfinite(v[0]):
+                raise ValueError(f"Global attribute '{name}' must be a finite scalar, got {v[0]!r}")
+            if not np.float32(v[0]) > 0.0:
+                raise ValueError(f"Global '{name}' must be > 0 (as float32), got {v[0]!r}")
             out[j] = float(v[0])
             continue
 
@@ -752,8 +799,12 @@ def read_globals_vector(
             raise TypeError(f"Global '{name}' is not a dataset")
 
         arr = np.asarray(ds[...], dtype=np.float64).reshape(-1)
-        if arr.size != 1 or not np.isfinite(arr[0]):
-            raise ValueError(f"Global '{name}' must be a finite scalar dataset; got shape {ds.shape}")
+        if arr.size != 1:
+            raise TypeError(f"Global '{name}' must be a scalar dataset; got shape {ds.shape}")
+        if not np.isfinite(arr[0]):
+            raise ValueError(f"Global '{name}' must be a finite scalar dataset, got {arr[0]!r}")
+        if not np.float32(arr[0]) > 0.0:
+            raise ValueError(f"Global '{name}' must be > 0 (as float32), got {arr[0]!r}")
         out[j] = float(arr[0])
 
     return out.astype(np.float32)
@@ -762,11 +813,12 @@ def read_globals_vector(
 def _is_non_finite_raw_error(err: BaseException) -> bool:
     """True if `err` reports a non-finite raw value (a soft reject, not a schema error)."""
     msg = str(err)
-    return (
-        "contains non-finite values" in msg
-        or "must be a finite scalar" in msg
-        or "must be a finite scalar dataset" in msg
-    )
+    return "contains non-finite values" in msg or "must be a finite scalar" in msg
+
+
+def _is_non_positive_global_error(err: BaseException) -> bool:
+    """True if `err` reports a P/T value that is not > 0 as float32 (a soft reject)."""
+    return "must be > 0 (as float32)" in str(err)
 
 
 # -----------------------------------------------------------------------------
@@ -847,6 +899,7 @@ def sample_file(
         "too_few_valid": 0,
         "drop_below": 0,
         "non_finite": 0,
+        "non_positive_global": 0,
         "no_fit_chunk": 0,
         "interp_non_finite": 0,
     }
@@ -922,6 +975,15 @@ def sample_file(
                     rejects["non_finite"] += 1
                     log.debug(
                         "Reject trajectory '%s' in %s: non-finite global values (%s)",
+                        traj_name,
+                        file_path.name,
+                        e,
+                    )
+                    continue
+                if isinstance(e, ValueError) and _is_non_positive_global_error(e):
+                    rejects["non_positive_global"] += 1
+                    log.debug(
+                        "Reject trajectory '%s' in %s: non-positive global value (%s)",
                         traj_name,
                         file_path.name,
                         e,
@@ -1162,11 +1224,15 @@ def normalize_and_write(
     cfg: PreCfg,
     per_key_stats: Dict,
     methods: Dict[str, str],
+    counts_total: Dict[str, int],
 ) -> None:
     """Normalize every physical shard to z-space and write the final shards + normalization.json.
 
     Species use log-standard normalization; globals use their per-key method; dt is log10 +
-    min-max clipped to [0, 1]. Writes the normalization manifest consumed by training/inference.
+    min-max clipped to [0, 1]. Each physical shard is deleted once its final shard is written,
+    so the peak disk is about one dataset plus one shard. The rows written per split must equal
+    the sampling totals (counts_total) before the normalization manifest consumed by
+    training/inference is written.
     """
     eps = float(cfg.epsilon)
     S = len(cfg.species_variables)
@@ -1231,6 +1297,7 @@ def normalize_and_write(
     if dt_log_rng <= 0.0:
         raise ValueError("Invalid dt normalization range: dt_max must be greater than dt_min")
 
+    rows_written = {"train": 0, "validation": 0, "test": 0}
     for split in ("train", "validation", "test"):
         physical_shards = iter_shards(out_tmp, split, "_physical")
         for i, p in enumerate(tqdm(physical_shards, desc=f"Normalizing {split}")):
@@ -1277,6 +1344,16 @@ def normalize_and_write(
             dt_norm = np.clip(dt_norm, 0.0, 1.0).astype(np.float32)
 
             np.savez(out_final / split / f"shard_{i:06d}.npz", y_mat=y_z, globals=g_z, dt_norm_mat=dt_norm)
+            # After the write, so a failed write keeps its source shard.
+            p.unlink()
+            rows_written[split] += int(y_z.shape[0])
+
+    # A stray or missing physical shard (e.g. from a concurrent run) must not be published.
+    if rows_written != counts_total:
+        raise RuntimeError(
+            f"normalized row counts {rows_written} differ from the sampled counts {counts_total}; "
+            "not writing normalization.json"
+        )
 
     manifest = {
         "normalization_methods": methods,
@@ -1294,14 +1371,18 @@ def normalize_and_write(
 
 
 def write_summary(
-    out_final: Path,
+    dest_dir: Path,
     *,
+    processed_dir: Path,
     cfg: PreCfg,
     counts_total: Dict[str, int],
     rejects_total: Dict[str, int],
 ) -> None:
-    """Write preprocessing_summary.json (per-split counts, reject breakdown, resolved config)."""
-    base = out_final.resolve()
+    """Write dest_dir/preprocessing_summary.json (per-split counts, reject breakdown, resolved config).
+
+    Paths are stored relative to processed_dir, where the summary is published.
+    """
+    base = processed_dir.resolve()
     cfg_serialized: Dict[str, Any] = {}
     for k, v in cfg.__dict__.items():
         if isinstance(v, Path):
@@ -1317,9 +1398,42 @@ def write_summary(
         "rejects_total": rejects_total,
         "config": cfg_serialized,
     }
-    with open(out_final / "preprocessing_summary.json", "w", encoding="utf-8") as f:
+    with open(dest_dir / "preprocessing_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
         f.write("\n")
+
+
+def swap_in_outputs(stage: Path, processed_dir: Path, trash: Path) -> None:
+    """Replace the previous dataset's preprocessing-owned entries with the staged ones.
+
+    normalization.json is the launchers' "dataset complete" marker, so it is moved out first and
+    moved in last (after the summary): an interruption inside this function leaves no marker and
+    the next launcher run rebuilds. Entries preprocessing does not own are never touched.
+    """
+    owned = ("normalization.json", "preprocessing_summary.json", "train", "validation", "test")
+    for name in owned:
+        if (processed_dir / name).exists():
+            os.replace(processed_dir / name, trash / name)
+    for name in ("train", "validation", "test", "preprocessing_summary.json", "normalization.json"):
+        os.replace(stage / name, processed_dir / name)
+    stage.rmdir()
+    shutil.rmtree(trash)
+
+
+def _init_worker(level: str, parent_pid: int) -> None:
+    """Pool-worker initializer: die with the parent (Linux prctl PR_SET_PDEATHSIG), then set up logging.
+
+    A worker left behind by a killed parent would keep writing physical shards into the next
+    run's _tmp_physical.
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(_PR_SET_PDEATHSIG, int(signal.SIGTERM), 0, 0, 0) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, f"prctl(PR_SET_PDEATHSIG) failed: {os.strerror(err)}")
+    # The parent may have died between fork and prctl, so no signal would ever come.
+    if os.getppid() != parent_pid:
+        raise SystemExit(f"parent {parent_pid} gone (ppid={os.getppid()})")
+    _configure_logging(level)
 
 
 def main() -> None:
@@ -1351,14 +1465,66 @@ def main() -> None:
 
     out_final = cfg.processed_dir
     out_tmp = cfg.processed_dir / "_tmp_physical"
+    out_stage = cfg.processed_dir / "_tmp_final"
+    out_trash = cfg.processed_dir / "_tmp_old"
 
-    clean_dir(out_tmp, overwrite=cfg.overwrite)
-    clean_processed_outputs(out_final, overwrite=cfg.overwrite)
+    # One run per processed_dir, taken before any filesystem change. The lock is a sibling of the
+    # resolved processed_dir, so every spelling of the path (symlinks, relative components) shares
+    # it. Closing lock_file releases the lock, so it is held in this frame for all of main();
+    # forked workers inherit it.
+    resolved = out_final.resolve()
+    lock_path = resolved.parent / (resolved.name + _LOCK_SUFFIX)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(lock_path, "w")  # held open for the whole run (the lock)
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise RuntimeError(
+            f"another preprocessing run, or leftover workers of a killed run, still holds {lock_path}"
+        ) from None
 
+    # Refuse before creating or deleting anything: overwrite=false never deletes. The previous
+    # dataset is not touched until the new one is complete (swap_in_outputs).
+    if not cfg.overwrite:
+        refuse_existing_outputs(out_final)
+    for scratch in (out_tmp, out_stage, out_trash):
+        clean_dir(scratch, overwrite=cfg.overwrite)
+
+    try:
+        _build_dataset(
+            cfg,
+            raw_files=raw_files,
+            log_level=log_level,
+            out_final=out_final,
+            out_tmp=out_tmp,
+            out_stage=out_stage,
+            out_trash=out_trash,
+        )
+    except BaseException:
+        log.error(
+            "preprocessing failed; the previous dataset in %s is unchanged unless the swap had started "
+            "(then normalization.json is absent); scratch dirs %s, %s, %s are left for inspection",
+            out_final, out_tmp.name, out_stage.name, out_trash.name,
+        )
+        raise
+
+
+def _build_dataset(
+    cfg: PreCfg,
+    *,
+    raw_files: List[Path],
+    log_level: str,
+    out_final: Path,
+    out_tmp: Path,
+    out_stage: Path,
+    out_trash: Path,
+) -> None:
+    """Sample every raw file, normalize into out_stage, then swap the new dataset into out_final."""
     counts_total = {"train": 0, "validation": 0, "test": 0}
     rejects_total: Dict[str, int] = {}
 
-    n_workers = max(1, min(int(cfg.num_workers), len(raw_files)))
+    # Never more workers than files or than the cores this process may run on.
+    n_workers = min(int(cfg.num_workers), len(raw_files), len(os.sched_getaffinity(0)))
 
     log.info(
         "Starting preprocessing raw_dir=%s processed_dir=%s files=%d num_workers=%d",
@@ -1374,13 +1540,14 @@ def main() -> None:
 
     # Fan out one process per raw file. Files are independent (per-file RNG and
     # per-file shard-name prefix), so there is no shared mutable state to guard.
-    # The initializer configures logging inside each worker so per-file log lines
-    # survive spawn/forkserver start methods (a no-op under fork, which inherits
-    # the parent's handlers).
+    # fork is pinned: the initializer's parent-pid check assumes the pool's parent is this
+    # process (under forkserver every worker's parent is the server). The initializer also
+    # configures logging in each worker.
     with ProcessPoolExecutor(
         max_workers=n_workers,
-        initializer=_configure_logging,
-        initargs=(log_level,),
+        mp_context=multiprocessing.get_context("fork"),
+        initializer=_init_worker,
+        initargs=(log_level, os.getpid()),
     ) as executor:
         futures = {
             executor.submit(sample_file, fp, idx, out_tmp=out_tmp, cfg=cfg): fp
@@ -1401,13 +1568,13 @@ def main() -> None:
                         per_file_cap,
                     )
         except BaseException:
-            # Cancel queued files so a worker failure (or SIGTERM/Ctrl+C) fails
-            # fast instead of draining the whole queue. Pending futures must be
-            # cancelled directly: the context manager's exit calls
-            # shutdown(wait=True, cancel_futures=False), which resets the
-            # executor's cancel flag before the manager thread can act on it,
-            # so shutdown(cancel_futures=True) alone is racy. Exit then only
-            # joins the in-flight workers.
+            # Cancel queued files so a worker failure (or Ctrl+C) fails fast instead of
+            # draining the whole queue. Pending futures must be cancelled directly: the
+            # context manager's exit calls shutdown(wait=True, cancel_futures=False), which
+            # resets the executor's cancel flag before the manager thread can act on it, so
+            # shutdown(cancel_futures=True) alone is racy. Exit then only joins the in-flight
+            # workers. SIGTERM is not handled: it kills this process outright, and the workers
+            # then exit through PR_SET_PDEATHSIG.
             for pending_fut in futures:
                 pending_fut.cancel()
             executor.shutdown(wait=False, cancel_futures=True)
@@ -1416,6 +1583,11 @@ def main() -> None:
     total_written = counts_total["train"] + counts_total["validation"] + counts_total["test"]
     if total_written == 0:
         raise RuntimeError("No trajectories were written. Check rejects_total for the failure mode.")
+    if rejects_total.get("non_positive_global", 0):
+        log.warning(
+            "%d trajectory groups rejected: P or T not > 0 (as float32); see rejects_total",
+            rejects_total["non_positive_global"],
+        )
 
     log.info(
         "Totals written=%d (train=%d val=%d test=%d)",
@@ -1426,8 +1598,16 @@ def main() -> None:
     )
 
     per_key_stats, methods = compute_train_stats(out_tmp, cfg)
-    normalize_and_write(out_tmp=out_tmp, out_final=out_final, cfg=cfg, per_key_stats=per_key_stats, methods=methods)
-    write_summary(out_final, cfg=cfg, counts_total=counts_total, rejects_total=rejects_total)
+    normalize_and_write(
+        out_tmp=out_tmp,
+        out_final=out_stage,
+        cfg=cfg,
+        per_key_stats=per_key_stats,
+        methods=methods,
+        counts_total=counts_total,
+    )
+    write_summary(out_stage, processed_dir=out_final, cfg=cfg, counts_total=counts_total, rejects_total=rejects_total)
+    swap_in_outputs(out_stage, out_final, out_trash)
     remove_tmp_dir(out_tmp)
     log.info("Removed temporary physical shard directory: %s", out_tmp)
 

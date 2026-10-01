@@ -31,7 +31,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 import torch
 import torch.nn as nn
 
-from utils import as_bool, as_float
+from utils import as_bool, as_float, as_int
 
 ActivationFactory = Callable[[], nn.Module]
 
@@ -58,13 +58,12 @@ def normalize_dt_shape(
     """Return dt as shape [B, K]; any other shape is an error.
 
     Only [B, K] is accepted (no squeezing or broadcasting that could mask dataset /
-    collation bugs). The rank check is a plain Python raise (ndim is concrete under
-    torch.export); batch_size and seq_len can be symbolic (torch.SymInt).
+    collation bugs). The rank and K checks are plain Python raises (the trainer passes a
+    concrete K); only batch_size can be symbolic (torch.SymInt), checked with torch._check.
     """
-    if dt.ndim != 2:
-        raise ValueError(f"{context}: dt must have shape [B, K], got {tuple(dt.shape)}.")
+    if dt.ndim != 2 or dt.shape[1] != seq_len:
+        raise ValueError(f"{context}: dt must have shape [B, {seq_len}], got {tuple(dt.shape)}.")
     torch._check(dt.shape[0] == batch_size)
-    torch._check(dt.shape[1] == seq_len)
     return dt
 
 
@@ -83,12 +82,14 @@ def normalize_dt_step(dt_norm: torch.Tensor, batch_size: torch.SymInt, *, contex
 def _validate_g_shape(g: torch.Tensor, batch_size: torch.SymInt, global_dim: int, context: str) -> None:
     """Validate g shape is exactly [B, G].
 
-    Note: batch_size can be symbolic (torch.SymInt) for export compatibility.
-    global_dim is always a concrete int (model attribute).
+    The rank and G checks are plain Python raises with a message (ndim and G are concrete under
+    torch.export and torch.compile). Only the batch comparison uses a message-less torch._check:
+    batch_size can be symbolic (torch.SymInt), and a message callable breaks strict export and
+    fullgraph compile in torch 2.8.
     """
-    torch._check(g.ndim == 2)
+    if g.ndim != 2 or g.shape[1] != global_dim:
+        raise ValueError(f"{context}: g must have shape [B, {global_dim}], got {tuple(g.shape)}.")
     torch._check(g.shape[0] == batch_size)
-    torch._check(g.shape[1] == global_dim)
 
 
 def autoregressive_rollout(
@@ -125,12 +126,12 @@ def _as_int_list(value: Any, *, name: str) -> List[int]:
       - int: interpreted as a single hidden layer
       - list/tuple of ints
 
-    Any other type is an error.
+    Any other type is an error, and every width must be >= 1.
     """
     if isinstance(value, bool):
         raise TypeError(f"{name}: expected int or list[int].")
     if isinstance(value, int):
-        return [int(value)]
+        value = [value]
     if isinstance(value, (list, tuple)):
         if not value:
             raise ValueError(f"{name}: must be non-empty.")
@@ -138,6 +139,8 @@ def _as_int_list(value: Any, *, name: str) -> List[int]:
         for v in value:
             if isinstance(v, bool) or not isinstance(v, int):
                 raise TypeError(f"{name}: must contain ints.")
+            if v < 1:
+                raise ValueError(f"{name}: every width must be >= 1, got {v}.")
             out.append(int(v))
         return out
     raise TypeError(f"{name}: expected int or list[int].")
@@ -158,10 +161,11 @@ class FourierDtFeatures(nn.Module):
 
     def __init__(self, *, num_freqs: int, sigma: float, seed: int) -> None:
         super().__init__()
-        if int(num_freqs) < 1:
+        # Positive-form checks so NaN fails too.
+        if not int(num_freqs) >= 1:
             raise ValueError(f"fourier_dt.num_freqs must be >= 1, got {num_freqs}")
-        if float(sigma) <= 0.0:
-            raise ValueError(f"fourier_dt.sigma must be > 0, got {sigma}")
+        if not (math.isfinite(float(sigma)) and float(sigma) > 0.0):
+            raise ValueError(f"fourier_dt.sigma must be finite and > 0, got {sigma}")
         gen = torch.Generator().manual_seed(int(seed))
         freqs = torch.randn(int(num_freqs), generator=gen) * float(sigma)
         self.register_buffer("freqs", freqs)
@@ -171,12 +175,13 @@ class FourierDtFeatures(nn.Module):
     def forward(self, dt: torch.Tensor) -> torch.Tensor:
         """Embed dt [..., 1] -> [..., 1 + 2F] as [dt, sin(2*pi*B*dt), cos(2*pi*B*dt)]."""
         torch._check(dt.shape[-1] == 1)
-        # Compute the projection and sin/cos in float32 regardless of input dtype:
-        # under bf16 the phase 2*pi*b_f*dt loses ~8 mantissa bits, aliasing the
-        # high-frequency features to noise. Cast back to the input dtype at the end.
-        dt32 = dt.to(torch.float32)
-        proj = 2.0 * math.pi * dt32 * self.freqs.to(torch.float32)
-        feats = torch.cat([dt32, torch.sin(proj), torch.cos(proj)], dim=-1)
+        # Compute the projection and sin/cos in at least float32 (bf16 is upcast, float64 is kept):
+        # under bf16 the phase 2*pi*b_f*dt loses ~8 mantissa bits, aliasing the high-frequency
+        # features to noise. Cast back to the input dtype at the end.
+        ct = torch.promote_types(dt.dtype, torch.float32)
+        dtc = dt.to(ct)
+        proj = 2.0 * math.pi * dtc * self.freqs.to(ct)
+        feats = torch.cat([dtc, torch.sin(proj), torch.cos(proj)], dim=-1)
         return feats.to(dt.dtype)
 
 
@@ -203,9 +208,9 @@ def build_fourier_dt(fourier_cfg: Any) -> Optional[FourierDtFeatures]:
         if key not in fourier_cfg:
             raise KeyError(f"model.fourier_dt.{key} required when fourier_dt.enabled=true.")
     return FourierDtFeatures(
-        num_freqs=int(fourier_cfg["num_freqs"]),
-        sigma=float(fourier_cfg["sigma"]),
-        seed=int(fourier_cfg["seed"]),
+        num_freqs=as_int(fourier_cfg["num_freqs"], "model.fourier_dt.num_freqs"),
+        sigma=as_float(fourier_cfg["sigma"], "model.fourier_dt.sigma"),
+        seed=as_int(fourier_cfg["seed"], "model.fourier_dt.seed"),
     )
 
 
@@ -259,9 +264,10 @@ class MLP(nn.Module):
             in_d, out_d = dims[i], dims[i + 1]
             layers.append(nn.Linear(in_d, out_d))
             layers.append(nn.LayerNorm(out_d, eps=float(layer_norm_eps)) if use_ln else nn.Identity())
-            layers.append(activation_factory())
-            if float(dropout_p) > 0.0:
-                layers.append(nn.Dropout(p=float(dropout_p)))
+            # Dropout shares the activation's slot, so parameter keys do not depend on dropout (a
+            # separate Dropout entry would renumber every later Linear and break strict loading).
+            act = activation_factory()
+            layers.append(nn.Sequential(act, nn.Dropout(p=float(dropout_p))) if float(dropout_p) > 0.0 else act)
 
         layers.append(nn.Linear(dims[-2], dims[-1]))
         self.network = nn.Sequential(*layers)
@@ -343,10 +349,21 @@ class ResidualMLP(nn.Module):
         return self.out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Under autocast (bf16-mixed) the input block, which reads the raw state, dt, P and T, and the
+        # delta head run in fp32. Without autocast (fp32, bf16-true, torch.export) the plain loop runs.
+        fp32_islands = torch.is_autocast_enabled(x.device.type)
         h = x
-        for lin, act, drop, proj, norm in zip(self.linears, self.acts, self.drops, self.projs, self.norms):
+        for i, (lin, act, drop, proj, norm) in enumerate(zip(self.linears, self.acts, self.drops, self.projs, self.norms)):
+            if fp32_islands and i == 0:
+                with torch.autocast(device_type=h.device.type, enabled=False):
+                    h = h.float()
+                    h = norm(proj(h) + drop(act(lin(h))))
+                continue
             h = proj(h) + drop(act(lin(h)))
             h = norm(h)
+        if fp32_islands:
+            with torch.autocast(device_type=h.device.type, enabled=False):
+                return self.out(h.float())
         return self.out(h)
 
 
@@ -463,6 +480,11 @@ def create_model(config: Dict[str, Any]) -> nn.Module:
     predict_delta = as_bool(mcfg["predict_delta"], "model.predict_delta")
     layer_norm = as_bool(mcfg["layer_norm"], "model.layer_norm")
     layer_norm_eps = as_float(mcfg["layer_norm_eps"], "model.layer_norm_eps")
+    # Positive-form range checks (as_float already rejects NaN/Inf).
+    if not 0.0 <= dropout < 1.0:
+        raise ValueError(f"model.dropout must be in [0, 1), got {dropout}")
+    if not layer_norm_eps > 0.0:
+        raise ValueError(f"model.layer_norm_eps must be > 0, got {layer_norm_eps}")
     fourier_dt = build_fourier_dt(mcfg.get("fourier_dt"))  # optional feature block
     if fourier_dt is not None:
         log.info(

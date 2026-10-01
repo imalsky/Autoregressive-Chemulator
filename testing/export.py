@@ -47,11 +47,13 @@ Notes:
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.export import Dim
@@ -60,6 +62,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from model import _REQUIRED_GLOBALS, create_model  # noqa: E402
+from utils import load_json_config, non_finite_tensor_keys, require_same_model_block  # noqa: E402
 
 # Runtime settings (edit here; no argparse).
 RUN_DIR = (REPO_ROOT / "models" / "stage2").resolve()  # deployable model = stage-2 output
@@ -76,8 +79,13 @@ EXAMPLE_BATCH = 4
 B_MIN = 1
 B_MAX = 16384
 
-# Numerical constants for the baked normalizer (mirror processing/preprocessing.py semantics).
-_DENOM_EPS = 1e-12          # floor for normalization denominators (avoids divide-by-zero)
+# Checkpoint state-dict key prefixes (FlowMapRolloutModule): the network under "model.", the
+# training-only loss buffers under "criterion." (dropped).
+_MODEL_KEY_PREFIX = "model."
+_LOSS_KEY_PREFIX = "criterion."
+# A finished artifact is written under <dir>/.partial/<same name> and os.replace'd onto its final
+# name, so a failed or killed export never leaves a truncated file under the final name.
+_PARTIAL_DIR_NAME = ".partial"
 
 
 # =============================================================================
@@ -117,11 +125,27 @@ def _print_device_diag() -> None:
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
-    """Load a JSON file, requiring a top-level object."""
-    obj = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(obj, dict):
-        raise TypeError(f"JSON root must be an object: {path}")
-    return obj
+    """Load a JSON object strictly (no duplicate keys, no NaN/Infinity; src/utils.load_json_config)."""
+    return load_json_config(path)
+
+
+def save_artifact(final_path: Path, write: Any) -> None:
+    """Run write(staging_path) to produce the artifact, then move it onto final_path atomically.
+
+    The staging path is final_path's name under <dir>/.partial/ (same filesystem; torch requires the
+    .pt2 suffix and names the package's internal root after the file's basename, so the artifact
+    is identical to one written in place). The staging file is removed if write fails.
+    """
+    staging = final_path.parent / _PARTIAL_DIR_NAME / final_path.name
+    staging.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        write(staging)
+        os.replace(staging, final_path)
+    except BaseException:
+        staging.unlink(missing_ok=True)
+        raise
+    if not any(staging.parent.iterdir()):
+        staging.parent.rmdir()
 
 
 def _resolve_path_like(raw: str, *, base: Path) -> Path:
@@ -167,94 +191,59 @@ def _resolve_checkpoint_path(raw: str, *, cfg_path: Path) -> Path:
 
 
 # =============================================================================
-# Checkpoint loading (robust to common Lightning prefixes)
+# Checkpoint loading (strict)
 # =============================================================================
 
 
-_STRIP_PREFIXES = (
-    "state_dict.",
-    "model.",
-    "module.",
-    "_orig_mod.",
-    "model._orig_mod.",
-    "module.model.",
-    "module._orig_mod.",
-)
+def _load_weights_strict(
+    model: nn.Module, ckpt_path: Path, *, expected_model: Mapping[str, Any]
+) -> Tuple[str, Dict[str, Any]]:
+    """Load a Lightning checkpoint's network weights into `model` strictly.
 
+    - Only a Lightning checkpoint (a mapping with 'state_dict' and hyper_parameters) is accepted.
+    - Its saved model block must equal `expected_model` (comment keys ignored): shape mismatches
+      fail in load_state_dict anyway, this also catches predict_delta, activation, layer_norm_eps.
+    - 'ema_state_dict' (saved by EMACallback; the weights that produced the checkpoint's
+      val_loss) is used when present and required when the checkpoint's run had EMA enabled
+      (mirrors src/main.py:_load_weights_only).
+    - Every key must start with 'model.' (one prefix stripped) or 'criterion.' (training-only
+      loss buffers, dropped); every floating tensor must be finite.
 
-def _strip_prefixes(key: str) -> str:
-    """Strip common Lightning/compile state_dict key prefixes (model./module./_orig_mod./...)."""
-    changed = True
-    while changed:
-        changed = False
-        for p in _STRIP_PREFIXES:
-            if key.startswith(p):
-                key = key[len(p) :]
-                changed = True
-    return key
-
-
-_IGNORED_STATE_PREFIXES = (
-    "criterion.",
-)
-
-
-def _is_ignored_state_key(key: str) -> bool:
-    """True for training-only checkpoint keys (e.g. loss buffers) that the inference model omits."""
-    return any(key.startswith(p) for p in _IGNORED_STATE_PREFIXES)
-
-
-def _load_weights_strict(model: nn.Module, ckpt_path: Path) -> None:
+    Returns (weights source, the checkpoint's model block without comment keys).
     """
-    Load checkpoint weights into `model` with strict key matching.
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    if not isinstance(ckpt, Mapping) or "state_dict" not in ckpt:
+        raise TypeError(f"not a Lightning checkpoint (no 'state_dict'): {ckpt_path}")
+    hparams = ckpt.get("hyper_parameters")
+    if not isinstance(hparams, Mapping) or "training" not in hparams:
+        raise KeyError(f"checkpoint has no hyper_parameters['training'] block: {ckpt_path}")
+    model_block = require_same_model_block(hparams.get("model"), expected_model, source=str(ckpt_path))
 
-    - Prefers "ema_state_dict" when present (saved by EMACallback): the EMA weights
-      are what produced the checkpoint's monitored val_loss, so they are what the
-      exported artifact must ship (mirrors src/main.py:_load_weights_only).
-    - Otherwise accepts a Lightning checkpoint dict (with "state_dict") or a raw state_dict.
-    - Strips common module prefixes.
-    - Errors out on missing keys (strong correctness signal).
-    """
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    state = None
-    if isinstance(ckpt, Mapping):
-        ema_state = ckpt.get("ema_state_dict")
-        if isinstance(ema_state, Mapping) and ema_state:
-            print("Using ema_state_dict from checkpoint (EMA weights drove val_loss selection).")
-            state = ema_state
-    if state is None:
-        state = ckpt.get("state_dict", ckpt)
+    if "ema_state_dict" in ckpt:
+        source = "ema_state_dict"
+    elif bool(hparams["training"]["ema"]["enabled"]):
+        raise KeyError(f"checkpoint run had EMA enabled but holds no ema_state_dict: {ckpt_path}")
+    else:
+        source = "state_dict"
+    state = ckpt[source]
     if not isinstance(state, Mapping):
-        raise TypeError(f"Checkpoint state_dict must be a mapping, got {type(state).__name__}")
+        raise TypeError(f"checkpoint {source} must be a mapping, got {type(state).__name__}")
+    print(f"Using {source} from checkpoint.")
+
     cleaned: Dict[str, Any] = {}
-    ignored: List[str] = []
-    for raw_k, v in state.items():
-        k = _strip_prefixes(str(raw_k))
-        if _is_ignored_state_key(k):
-            ignored.append(k)
+    for k, v in state.items():
+        if k.startswith(_LOSS_KEY_PREFIX):
             continue
-        cleaned[k] = v
+        if not k.startswith(_MODEL_KEY_PREFIX):
+            raise KeyError(f"unexpected checkpoint key {k!r} (expected 'model.*' or 'criterion.*'): {ckpt_path}")
+        cleaned[k[len(_MODEL_KEY_PREFIX):]] = v
 
-    model_sd = model.state_dict()
-    missing = [k for k in model_sd.keys() if k not in cleaned]
-    unexpected = [k for k in cleaned.keys() if k not in model_sd]
+    bad = non_finite_tensor_keys(cleaned)
+    if bad:
+        raise ValueError(f"checkpoint {ckpt_path} has non-finite weights: {bad[:3]}")
 
-    if missing or unexpected:
-        lines: List[str] = []
-        if missing:
-            lines.append(f"missing={len(missing)}:\n  " + "\n  ".join(missing[:25]))
-        if unexpected:
-            lines.append(f"unexpected={len(unexpected)}:\n  " + "\n  ".join(unexpected[:25]))
-        msg = "\n".join(lines)
-        raise RuntimeError(f"Checkpoint/model key mismatch:\n{msg}\nckpt={ckpt_path}")
-
-    if ignored:
-        preview = ", ".join(ignored[:4])
-        suffix = " ..." if len(ignored) > 4 else ""
-        print(f"Ignored training-only checkpoint keys ({len(ignored)}): {preview}{suffix}")
-
-    ordered_state = {k: cleaned[k] for k in model_sd.keys()}
-    model.load_state_dict(ordered_state, strict=True)
+    model.load_state_dict(cleaned, strict=True)
+    return source, model_block
 
 
 def _freeze_for_inference(model: nn.Module) -> nn.Module:
@@ -358,8 +347,8 @@ class BakedNormalizer(nn.Module):
         dt_f = torch.clamp_min(dt_seconds.to(torch.float32), self.dt_eps)
         log_dt = torch.log10(dt_f)
 
-        denom = (self.dt_log_max - self.dt_log_min).clamp_min(_DENOM_EPS)
-        dt_norm = (log_dt - self.dt_log_min) / denom
+        # build_baked_normalizer checked dt_log_max > dt_log_min (as float32).
+        dt_norm = (log_dt - self.dt_log_min) / (self.dt_log_max - self.dt_log_min)
         dt_norm = torch.clamp(dt_norm, 0.0, 1.0)
         return dt_norm.to(dt_seconds.dtype)
 
@@ -394,6 +383,7 @@ class BakedNormalizer(nn.Module):
 
         preprocessing.py supports:
           standard | min-max | log-min-max | log-standard
+        build_baked_normalizer checked every denominator used here (std >= min_std, max > min).
         """
         g_f = g_phys.to(torch.float32)
         cols: List[torch.Tensor] = []
@@ -402,17 +392,15 @@ class BakedNormalizer(nn.Module):
             xj = g_f[:, j]
 
             if mj == "standard":
-                denom = self.g_std[j].clamp_min(_DENOM_EPS)
-                zj = (xj - self.g_mean[j]) / denom
+                zj = (xj - self.g_mean[j]) / self.g_std[j]
             elif mj == "min-max":
-                denom = (self.g_max[j] - self.g_min[j]).clamp_min(_DENOM_EPS)
-                zj = (xj - self.g_min[j]) / denom
+                zj = (xj - self.g_min[j]) / (self.g_max[j] - self.g_min[j])
             elif mj == "log-min-max":
-                denom = (self.g_log_max[j] - self.g_log_min[j]).clamp_min(_DENOM_EPS)
-                zj = (torch.log10(torch.clamp_min(xj, self.g_eps[j])) - self.g_log_min[j]) / denom
+                zj = (torch.log10(torch.clamp_min(xj, self.g_eps[j])) - self.g_log_min[j]) / (
+                    self.g_log_max[j] - self.g_log_min[j]
+                )
             elif mj == "log-standard":
-                denom = self.g_log_std[j].clamp_min(_DENOM_EPS)
-                zj = (torch.log10(torch.clamp_min(xj, self.g_eps[j])) - self.g_log_mean[j]) / denom
+                zj = (torch.log10(torch.clamp_min(xj, self.g_eps[j])) - self.g_log_mean[j]) / self.g_log_std[j]
             else:
                 raise RuntimeError(f"Unsupported global normalization method: {m}")
 
@@ -430,8 +418,10 @@ def build_baked_normalizer(
 ) -> BakedNormalizer:
     """Build a BakedNormalizer from normalization.json (species/global stats + dt log range).
 
-    Validates that species use log-standard and globals use a supported method, then packs the
-    per-key statistics into float32 buffers for the exported module.
+    Validates that species use log-standard and globals use a supported method, and that every
+    statistic the export uses is sane (NaN fails every check): means and ranges finite, stds
+    >= the manifest's min_std, and each min-max range hi > lo on the float32 values baked. Then
+    packs the per-key statistics into float32 buffers for the exported module.
     """
     methods_map = manifest.get("normalization_methods")
     if not isinstance(methods_map, Mapping):
@@ -441,7 +431,29 @@ def build_baked_normalizer(
     if not isinstance(stats, Mapping):
         raise TypeError("normalization.json: expected 'per_key_stats' mapping.")
 
-    eps_global = float(manifest["epsilon"])  # required; canonical preprocessing always writes it
+    def _positive(key: str) -> float:
+        v = float(manifest[key])  # required; canonical preprocessing always writes it
+        if not (math.isfinite(v) and v > 0.0):
+            raise ValueError(f"normalization.json: {key} must be finite and > 0, got {v!r}")
+        return v
+
+    eps_global = _positive("epsilon")
+    min_std = _positive("min_std")
+
+    def _finite(k: str, field: str) -> None:
+        if not math.isfinite(float(stats[k][field])):
+            raise ValueError(f"normalization.json: per_key_stats[{k!r}][{field!r}] must be finite")
+
+    def _std(k: str, field: str) -> None:
+        v = float(stats[k][field])
+        if not v >= min_std:
+            raise ValueError(f"normalization.json: per_key_stats[{k!r}][{field!r}]={v!r} must be >= min_std={min_std}")
+
+    def _range(k: str, lo: str, hi: str) -> None:
+        _finite(k, lo)
+        _finite(k, hi)
+        if not np.float32(stats[k][hi]) > np.float32(stats[k][lo]):
+            raise ValueError(f"normalization.json: per_key_stats[{k!r}] needs {hi} > {lo} (as float32)")
 
     def _method_for(k: str, *, allowed: set[str]) -> str:
         raw = methods_map.get(k)
@@ -451,10 +463,22 @@ def build_baked_normalizer(
         return m
 
     s_methods = [_method_for(k, allowed=_SUPPORTED_SPECIES_METHODS) for k in species_vars]
-    for k, m in zip(species_vars, s_methods):
-        if m != "log-standard":
-            raise ValueError(f"Species normalization must be log-standard, got '{m}' for '{k}'")
     g_methods = [_method_for(k, allowed=_SUPPORTED_GLOBAL_METHODS) for k in global_vars]
+
+    for k in species_vars:  # log-standard (+ log_min/log_max for the example inputs)
+        _finite(k, "log_mean")
+        _std(k, "log_std")
+        _range(k, "log_min", "log_max")
+    for k, m in zip(global_vars, g_methods):
+        _range(k, "min", "max")  # also used for the example inputs
+        if m == "standard":
+            _finite(k, "mean")
+            _std(k, "std")
+        elif m == "log-min-max":
+            _range(k, "log_min", "log_max")
+        elif m == "log-standard":
+            _finite(k, "log_mean")
+            _std(k, "log_std")
 
     # Species log stats (required)
     s_log_mean = torch.tensor([float(stats[k]["log_mean"]) for k in species_vars], dtype=torch.float32)
@@ -477,6 +501,9 @@ def build_baked_normalizer(
     dt = manifest.get("dt") or {}
     if not isinstance(dt, Mapping) or "log_min" not in dt or "log_max" not in dt:
         raise KeyError("normalization.json: missing dt.log_min / dt.log_max")
+    dt_lo, dt_hi = float(dt["log_min"]), float(dt["log_max"])
+    if not (math.isfinite(dt_lo) and math.isfinite(dt_hi) and np.float32(dt_hi) > np.float32(dt_lo)):
+        raise ValueError(f"normalization.json: dt needs finite log_max > log_min, got {dt_lo!r}, {dt_hi!r}")
 
     return BakedNormalizer(
         species_vars=species_vars,
@@ -610,6 +637,10 @@ def _validate_manifest_vs_config(cfg: Mapping[str, Any], manifest: Mapping[str, 
 
     if not isinstance(cfg_species, list) or not all(isinstance(x, str) for x in cfg_species) or not cfg_species:
         raise TypeError("config: bad data.species_variables")
+    for source, names in (("config data.species_variables", cfg_species), ("normalization.json species_variables", man_species)):
+        dups = sorted({x for x in names if names.count(x) > 1})
+        if dups:
+            raise ValueError(f"{source}: duplicate species names {dups}")
     if list(cfg_species) != man_species:
         raise ValueError("species_variables mismatch between config and normalization.json (order matters).")
     species = list(cfg_species)
@@ -729,9 +760,10 @@ def build_export(
 ) -> Tuple[torch.export.ExportedProgram, Dict[str, Any]]:
     """Build the verified one-step physical-space export for `device` and its metadata.
 
-    Loads <run_dir>/config.resolved.json, the checkpoint (EMA weights preferred) and
-    normalization.json, wraps base+normalizer, exports with a dynamic batch dim and
-    verifies B in (1, 7) on `device`. `cuda_visible_devices` is recorded as given.
+    Loads <run_dir>/config.resolved.json, the checkpoint (EMA weights preferred; its model
+    block must match the config's and is recorded in the metadata) and normalization.json,
+    wraps base+normalizer, exports with a dynamic batch dim and verifies B in (1, 7) on
+    `device`. `cuda_visible_devices` is recorded as given.
     """
     cfg, cfg_path = _load_resolved_config(run_dir)
     ckpt_path = _resolve_checkpoint_path(checkpoint, cfg_path=cfg_path)
@@ -743,7 +775,7 @@ def build_export(
     species_vars, global_vars = _validate_manifest_vs_config(cfg, manifest)
 
     base = create_model(cfg)
-    _load_weights_strict(base, ckpt_path)
+    _, model_block = _load_weights_strict(base, ckpt_path, expected_model=cfg["model"])
     base = _freeze_for_inference(base.to(device=device))
 
     norm = build_baked_normalizer(manifest, species_vars=species_vars, global_vars=global_vars)
@@ -780,6 +812,7 @@ def build_export(
         "export_device": str(device),
         "export_device_tag": device.type,
         "export_dtype": "float32",
+        "model": model_block,
         "species_variables": list(species_vars),
         "global_variables": list(global_vars),
         "normalization_methods": dict(manifest["normalization_methods"]),
@@ -822,7 +855,8 @@ def main() -> None:
 
         out_path = _default_out_for(run_dir, device.type)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.export.save(ep, out_path, extra_files={"metadata.json": json.dumps(meta, indent=2, sort_keys=True)})
+        extra = {"metadata.json": json.dumps(meta, indent=2, sort_keys=True)}
+        save_artifact(out_path, lambda staging: torch.export.save(ep, staging, extra_files=extra))
         print(f"Saved export ({device.type}): {out_path}")
 
 

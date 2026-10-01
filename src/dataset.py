@@ -26,7 +26,9 @@ archives with np.savez):
     globals     : [N, G]    float32  (normalized globals)
     dt_norm_mat : [N, T-1]  float32  (normalized dt per step in [0,1])
 
-Every split is preloaded into contiguous tensors on the preload device.
+Every split is preloaded into contiguous float32 tensors (the shard dtype) on the
+preload device; preload_nbytes() gives a split's preload size from the shard headers
+alone, so the caller can check a memory budget before anything is loaded.
 create_dataloader() wraps it in a vectorized single-process stream that samples
 random windows (with replacement) and yields pre-batched tensors:
     {
@@ -53,6 +55,10 @@ from numpy.lib import format as npy_format
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, IterableDataset
+
+# Preloaded tensors keep the shard dtype (float32): bf16 storage would quantize the z-space
+# states, and float64 would only double the memory.
+_STORAGE_DTYPE = torch.float32
 
 
 # -----------------------------------------------------------------------------
@@ -86,6 +92,62 @@ class ShardIndex:
     path: Path
     n: int
 
+
+def _scan_shards(split_dir: Path) -> Tuple[List[ShardIndex], int, int, int]:
+    """Index a split's shards from header-only reads: (shards, T, S, G).
+
+    The first shard fixes T, S and G; every shard must match them and be float32.
+    """
+    shard_paths = sorted(split_dir.glob("*.npz"))
+    if not shard_paths:
+        raise FileNotFoundError(f"No shard NPZ files found in {split_dir}")
+
+    shards: List[ShardIndex] = []
+    T = S = G = 0
+    for p in shard_paths:
+        y_shape, y_dtype = _npz_read_array_header(p, key="y_mat")
+        g_shape, g_dtype = _npz_read_array_header(p, key="globals")
+        dt_shape, dt_dtype = _npz_read_array_header(p, key="dt_norm_mat")
+
+        if len(y_shape) != 3:
+            raise ValueError(f"Shard {p} y_mat must be 3D [N,T,S], got {y_shape}")
+        if len(g_shape) != 2:
+            raise ValueError(f"Shard {p} globals must be 2D [N,G], got {g_shape}")
+        if len(dt_shape) != 2:
+            raise ValueError(f"Shard {p} dt_norm_mat must be 2D [N,T-1], got {dt_shape}")
+
+        n, t, s = (int(y_shape[0]), int(y_shape[1]), int(y_shape[2]))
+        if not shards:
+            T, S, G = t, s, int(g_shape[1])
+        if t != T or s != S:
+            raise ValueError(f"Shard {p} y_mat shape is {y_shape}; expected [N,{T},{S}].")
+        # Strict dtypes: avoid silent CPU copies / perf cliffs.
+        if y_dtype != np.float32:
+            raise ValueError(f"Shard {p} y_mat dtype must be float32, got {y_dtype}. Regenerate preprocessing outputs.")
+        if g_dtype != np.float32:
+            raise ValueError(f"Shard {p} globals dtype must be float32, got {g_dtype}. Regenerate preprocessing outputs.")
+        if dt_dtype != np.float32:
+            raise ValueError(f"Shard {p} dt_norm_mat dtype must be float32, got {dt_dtype}. Regenerate preprocessing outputs.")
+
+        if int(g_shape[0]) != n or int(g_shape[1]) != G:
+            raise ValueError(f"Shard {p} globals shape is {g_shape}; expected [{n},{G}].")
+        if int(dt_shape[0]) != n or int(dt_shape[1]) != T - 1:
+            raise ValueError(f"Shard {p} dt_norm_mat shape is {dt_shape}; expected [{n},{T - 1}].")
+
+        if n <= 0:
+            raise ValueError(f"Shard {p} has no trajectories.")
+        shards.append(ShardIndex(path=p, n=n))
+    return shards, T, S, G
+
+
+def preload_nbytes(processed_dir: Union[str, Path], split: str) -> Tuple[int, int]:
+    """(trajectories, bytes) that preloading `split` allocates: [N,T,S] + [N,T-1] + [N,G] float32."""
+    split_dir = Path(processed_dir).expanduser().resolve() / split
+    shards, T, S, G = _scan_shards(split_dir)
+    n = int(sum(si.n for si in shards))
+    return n, n * (T * S + (T - 1) + G) * _STORAGE_DTYPE.itemsize
+
+
 class FlowMapRolloutDataset:
     """
     One split of trajectory shards, preloaded into contiguous tensors on `device`.
@@ -103,7 +165,6 @@ class FlowMapRolloutDataset:
         windows_per_trajectory: int = 1,
         seed: int,
         device: torch.device,
-        storage_dtype: torch.dtype = torch.float32,
     ) -> None:
         """
         Args:
@@ -113,8 +174,7 @@ class FlowMapRolloutDataset:
             windows_per_trajectory: Controls *epoch size* (windows per trajectory per epoch).
                                   Sampling is still random each time.
             seed: Base seed for the batch stream RNG.
-            device: Preload device; all shards are loaded into tensors there.
-            storage_dtype: dtype of the preloaded tensors (float32 recommended).
+            device: Preload device; all shards are loaded into float32 tensors there.
         """
         processed_dir = Path(processed_dir).expanduser().resolve()
         split_dir = processed_dir / split
@@ -132,48 +192,9 @@ class FlowMapRolloutDataset:
         self.windows_per_trajectory = int(windows_per_trajectory)
         self.seed = int(seed)
         self.device = device
-        self.storage_dtype = storage_dtype
-
-        shard_paths = sorted(split_dir.glob("*.npz"))
-        if not shard_paths:
-            raise FileNotFoundError(f"No shard NPZ files found in {split_dir}")
 
         # Build the shard index (trajectory counts per shard) from header-only reads.
-        # The first shard fixes T, S and G; every shard must match them.
-        self.shards: List[ShardIndex] = []
-        for p in shard_paths:
-            y_shape, y_dtype = _npz_read_array_header(p, key="y_mat")
-            g_shape, g_dtype = _npz_read_array_header(p, key="globals")
-            dt_shape, dt_dtype = _npz_read_array_header(p, key="dt_norm_mat")
-
-            if len(y_shape) != 3:
-                raise ValueError(f"Shard {p} y_mat must be 3D [N,T,S], got {y_shape}")
-            if len(g_shape) != 2:
-                raise ValueError(f"Shard {p} globals must be 2D [N,G], got {g_shape}")
-            if len(dt_shape) != 2:
-                raise ValueError(f"Shard {p} dt_norm_mat must be 2D [N,T-1], got {dt_shape}")
-
-            n, t, s = (int(y_shape[0]), int(y_shape[1]), int(y_shape[2]))
-            if not self.shards:
-                self.T, self.S, self.G = t, s, int(g_shape[1])
-            if t != self.T or s != self.S:
-                raise ValueError(f"Shard {p} y_mat shape is {y_shape}; expected [N,{self.T},{self.S}].")
-            # Strict dtypes: avoid silent CPU copies / perf cliffs.
-            if y_dtype != np.float32:
-                raise ValueError(f"Shard {p} y_mat dtype must be float32, got {y_dtype}. Regenerate preprocessing outputs.")
-            if g_dtype != np.float32:
-                raise ValueError(f"Shard {p} globals dtype must be float32, got {g_dtype}. Regenerate preprocessing outputs.")
-            if dt_dtype != np.float32:
-                raise ValueError(f"Shard {p} dt_norm_mat dtype must be float32, got {dt_dtype}. Regenerate preprocessing outputs.")
-
-            if int(g_shape[0]) != n or int(g_shape[1]) != self.G:
-                raise ValueError(f"Shard {p} globals shape is {g_shape}; expected [{n},{self.G}].")
-            if int(dt_shape[0]) != n or int(dt_shape[1]) != self.T - 1:
-                raise ValueError(f"Shard {p} dt_norm_mat shape is {dt_shape}; expected [{n},{self.T - 1}].")
-
-            if n <= 0:
-                raise ValueError(f"Shard {p} has no trajectories.")
-            self.shards.append(ShardIndex(path=p, n=n))
+        self.shards, self.T, self.S, self.G = _scan_shards(split_dir)
 
         self.max_start = int(self.T - (self.total_steps + 1))
         if self.max_start < 0:
@@ -194,15 +215,15 @@ class FlowMapRolloutDataset:
             raise RuntimeError("no trajectories to preload")
 
         # Allocate contiguous buffers on the target device.
-        y_all = torch.empty((total, self.T, self.S), device=self.device, dtype=self.storage_dtype)
-        g_all = torch.empty((total, self.G), device=self.device, dtype=self.storage_dtype)
-        dt_all = torch.empty((total, self.T - 1), device=self.device, dtype=self.storage_dtype)
+        y_all = torch.empty((total, self.T, self.S), device=self.device, dtype=_STORAGE_DTYPE)
+        g_all = torch.empty((total, self.G), device=self.device, dtype=_STORAGE_DTYPE)
+        dt_all = torch.empty((total, self.T - 1), device=self.device, dtype=_STORAGE_DTYPE)
 
         # Read each shard and copy it into the contiguous buffers.
         cursor = 0
         for si in self.shards:
             with np.load(si.path) as z:
-                # Force float32 on CPU; dtype conversion (if any) happens during copy_ into the destination.
+                # Shards are float32 (checked from the headers); asarray does not copy them.
                 y_np = np.asarray(z["y_mat"], dtype=np.float32)
                 g_np = np.asarray(z["globals"], dtype=np.float32)
                 dt_np = np.asarray(z["dt_norm_mat"], dtype=np.float32)
@@ -237,7 +258,9 @@ class _PreloadedStochasticBatchStream(IterableDataset):
     DataLoader pinning can be used on the yielded batches for efficient host-to-device
     transfer.
 
-    Sampling is with replacement (SGD-style).
+    Sampling is with replacement (SGD-style). The window indices are drawn from a CPU
+    generator and moved to the preload device, so the window sequence does not depend
+    on where the data is preloaded.
     """
 
     def __init__(
@@ -258,7 +281,6 @@ class _PreloadedStochasticBatchStream(IterableDataset):
         self.drop_last = bool(drop_last)
 
         self.device = base.device
-        self.dtype = base.storage_dtype
 
         self.K = int(base.total_steps)
         self.S = int(base.S)
@@ -273,7 +295,7 @@ class _PreloadedStochasticBatchStream(IterableDataset):
 
         self._seed = int(seed)
 
-        self._generator = torch.Generator(device=self.device)
+        self._generator = torch.Generator(device="cpu")
         # The +1 offset is historical (it separated this stream from the removed map-style
         # loader's RNG); it is kept so the sampled windows are unchanged.
         self._generator.manual_seed(self._seed + 1)
@@ -299,15 +321,14 @@ class _PreloadedStochasticBatchStream(IterableDataset):
             if B <= 0:
                 break
 
-            traj = torch.randint(0, self.N, (B,), device=self.device, generator=self._generator, dtype=torch.long)
+            traj = torch.randint(0, self.N, (B,), generator=self._generator, dtype=torch.long).to(self.device)
             start = torch.randint(
                 0,
                 self.base.max_start + 1,
                 (B,),
-                device=self.device,
                 generator=self._generator,
                 dtype=torch.long,
-            )
+            ).to(self.device)
 
             # Gather windows without materializing [B, T, S] intermediates.
             t_y = start[:, None] + self._t_y[None, :]  # [B, K+1]
@@ -345,11 +366,6 @@ def create_dataloader(
             f"drop_last=True would yield 0 batches (dataset size {ds_len} < batch_size {batch_size})."
         )
 
-    if pin_memory and dataset.device.type != "cpu":
-        raise ValueError(
-            "pin_memory=True is incompatible with preloading the data to an accelerator device."
-        )
-
     stream = _PreloadedStochasticBatchStream(
         dataset,
         batch_size=batch_size,
@@ -357,13 +373,12 @@ def create_dataloader(
         seed=dataset.seed,
     )
 
-    stream_pin_memory = bool(pin_memory and dataset.device.type == "cpu")
-
+    # main.py rejects pin_memory=true with a CUDA preload device before any data is loaded.
     return DataLoader(
         dataset=stream,
         batch_size=None,  # stream yields already-batched tensors
         shuffle=False,
         num_workers=0,
-        pin_memory=stream_pin_memory,
+        pin_memory=bool(pin_memory),
         persistent_workers=False,
     )

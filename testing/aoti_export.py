@@ -249,15 +249,30 @@ def _write_aoti_package(
     *,
     metadata: dict[str, Any],
     out_path: Path,
+    save_artifact: Any,
 ) -> Path:
-    """Compile and save the CPU AOTI package plus embedded metadata."""
+    """Compile the CPU AOTI package and embed the metadata under a staging name, then move it onto out_path.
+
+    save_artifact is export.py's: the previous package stays in place until the new one is complete.
+    """
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.exists():
-        out_path.unlink()
+    save_artifact(out_path, lambda staging: _compile_aoti_package(exported_program, metadata=metadata, path=staging))
+    return out_path.resolve()
+
+
+def _compile_aoti_package(
+    exported_program: torch.export.ExportedProgram,
+    *,
+    metadata: dict[str, Any],
+    path: Path,
+) -> None:
+    """Compile the AOTI package to `path` and append the metadata to its archive."""
     compiled_path = Path(
-        _inductor.aoti_compile_and_package(exported_program, package_path=str(out_path))
+        _inductor.aoti_compile_and_package(exported_program, package_path=str(path))
     ).resolve()
+    if compiled_path != path.resolve():
+        raise RuntimeError(f"AOTI package written to {compiled_path}, expected {path}")
     with zipfile.ZipFile(compiled_path, "a") as archive:
         archive_names = archive.namelist()
         if not archive_names:
@@ -274,7 +289,6 @@ def _write_aoti_package(
             f"{archive_prefix}extra/metadata.json",
             json.dumps(metadata, indent=2, sort_keys=True),
         )
-    return compiled_path
 
 
 def _build_model_call_cases(
@@ -506,6 +520,7 @@ def main() -> None:
         fresh_export.exported_program,
         metadata=fresh_export.metadata,
         out_path=OUTPUT_AOTI_PACKAGE_PATH,
+        save_artifact=export_impl.save_artifact,
     )
     compiled_models = {
         run_single_threaded: _inductor.aoti_load_package(
@@ -674,6 +689,12 @@ def main() -> None:
         "validation_rows": [asdict(row) for row in validation_rows],
         "benchmark_rows": [asdict(row) for row in benchmark_rows],
     }
+    # JSON first: a formatting error in the markdown below cannot lose the results.
+    OUTPUT_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT_JSON_PATH.write_text(
+        json.dumps(report_payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
     setup_lines = [
         f"- run_dir: `{export_impl.RUN_DIR}`",
@@ -727,12 +748,7 @@ def main() -> None:
     )
 
     OUTPUT_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    OUTPUT_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT_REPORT_PATH.write_text(markdown_report, encoding="utf-8")
-    OUTPUT_JSON_PATH.write_text(
-        json.dumps(report_payload, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
 
     print(f"wrote {compiled_package_path}")
     print(f"wrote {OUTPUT_REPORT_PATH}")

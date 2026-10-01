@@ -3,6 +3,11 @@
 training_logs.py - Plot epoch-level training/validation losses from models/<run>/metrics.csv
 and export a cleaned epoch-level metrics table.
 
+A resumed run keeps each earlier segment as metrics.pre_restart[.N].csv (src/main.py); all
+segments are merged in order (unsuffixed = 0, then N, then metrics.csv), so an epoch re-run
+after a restart takes its latest values. LearningRateMonitor's epoch-less lr/* rows are
+attached to the next epoch row of the same file (the LR at that epoch's start).
+
 Assumes repo layout:
   <repo>/
     src/
@@ -18,6 +23,7 @@ Saves:
 from __future__ import annotations
 
 import csv
+import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -57,6 +63,11 @@ REQUIRED_PLOT_METRICS: tuple[str, ...] = (
     "train_loss_z_mse",
     "val_loss_z_mse",
 )
+
+# Earlier segments of a resumed run (src/main.py renames metrics.csv before each resume).
+_SEGMENT_RE = re.compile(r"^metrics\.pre_restart(?:\.(\d+))?\.csv$")
+# LearningRateMonitor columns (lr/pg1, lr/pg2, ...) are matched by this prefix.
+_LR_PREFIX = "lr"
 
 PREFERRED_METRIC_ORDER: tuple[str, ...] = (
     "step",
@@ -113,38 +124,55 @@ def _to_float(x: str) -> float | None:
 
 
 def _ordered_metric_names(metric_names: tuple[str, ...]) -> tuple[str, ...]:
-    preferred = [name for name in PREFERRED_METRIC_ORDER if name in metric_names]
-    remaining = sorted(name for name in metric_names if name not in PREFERRED_METRIC_ORDER)
+    preferred: list[str] = []
+    for want in PREFERRED_METRIC_ORDER:
+        if want == _LR_PREFIX:
+            preferred += sorted(n for n in metric_names if n.startswith(_LR_PREFIX))
+        elif want in metric_names:
+            preferred.append(want)
+    remaining = sorted(name for name in metric_names if name not in preferred)
     return tuple(preferred + remaining)
 
 
-def load_metrics_csv(path: Path) -> dict[str, np.ndarray]:
-    if not path.exists():
-        raise FileNotFoundError(f"metrics.csv not found: {path}")
+def metrics_segments(run_dir: Path) -> list[Path]:
+    """metrics.pre_restart[.N].csv by integer N (unsuffixed = 0), then metrics.csv; raise if none exist."""
+    parts = []
+    for p in run_dir.glob("metrics.pre_restart*.csv"):
+        m = _SEGMENT_RE.match(p.name)
+        if m:
+            parts.append((int(m.group(1) or 0), p))
+    files = [p for _, p in sorted(parts)]
+    current = run_dir / METRICS_FILE
+    if current.exists():
+        files.append(current)
+    if not files:
+        raise FileNotFoundError(f"no {METRICS_FILE} or metrics.pre_restart*.csv in {run_dir}")
+    return files
 
-    with path.open("r", newline="") as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
-        metric_names = tuple(name for name in (reader.fieldnames or []) if name and name != "epoch")
 
-    if not rows:
-        raise ValueError(f"No rows in: {path}")
-
-    # Merge rows per epoch because train/val metrics may be logged on separate rows.
-    by_epoch: dict[int, dict[str, float | None]] = {}
-    for r in rows:
-        e = _to_float(r.get("epoch", ""))
-        if e is None:
-            continue
-        epoch = int(e)
-        metrics = by_epoch.setdefault(epoch, {k: None for k in metric_names})
-        for k in metric_names:
-            v = _to_float(r.get(k, ""))
-            if v is not None:
-                metrics[k] = v
+def load_metrics(run_dir: Path) -> dict[str, np.ndarray]:
+    """Epoch-level metrics merged over every segment of the run (see the module docstring)."""
+    files = metrics_segments(run_dir)
+    metric_names: list[str] = []
+    by_epoch: dict[int, dict[str, float]] = {}
+    for path in files:
+        with path.open("r", newline="") as f:
+            reader = csv.DictReader(f)
+            metric_names += [n for n in (reader.fieldnames or []) if n and n != "epoch" and n not in metric_names]
+            pending_lr: dict[str, float] = {}
+            for r in reader:
+                vals = {k: v for k, v in ((k, _to_float(x)) for k, x in r.items() if k and k != "epoch") if v is not None}
+                e = _to_float(r.get("epoch", ""))
+                if e is None:
+                    pending_lr.update({k: v for k, v in vals.items() if k.startswith(_LR_PREFIX)})
+                    continue
+                row = by_epoch.setdefault(int(e), {})
+                row.update(pending_lr)
+                pending_lr = {}
+                row.update(vals)
 
     if not by_epoch:
-        raise ValueError(f"No epoch rows in: {path}")
+        raise ValueError(f"No epoch rows in: {[str(p) for p in files]}")
 
     epochs = np.array(sorted(by_epoch.keys()), dtype=np.int64)
 
@@ -152,18 +180,12 @@ def load_metrics_csv(path: Path) -> dict[str, np.ndarray]:
         name
         for name in metric_names
         if name in REQUIRED_PLOT_METRICS
-        or any(by_epoch[int(epoch)][name] is not None for epoch in epochs)
+        or any(name in by_epoch[int(epoch)] for epoch in epochs)
     )
     ordered_metric_names = _ordered_metric_names(kept_metric_names)
 
     def col(name: str) -> np.ndarray:
-        return np.array(
-            [
-                by_epoch[int(epoch)][name] if by_epoch[int(epoch)][name] is not None else np.nan
-                for epoch in epochs
-            ],
-            dtype=np.float64,
-        )
+        return np.array([by_epoch[int(epoch)].get(name, np.nan) for epoch in epochs], dtype=np.float64)
 
     data: dict[str, np.ndarray] = {"epoch": epochs}  # shape: (num_epochs,)
     for name in ordered_metric_names:
@@ -229,10 +251,6 @@ def _format_final_metric(y: np.ndarray) -> str:
 # =============================================================================
 # Plotting
 # =============================================================================
-
-def _resolve_metrics_path(run_dir: Path) -> Path:
-    return (run_dir / METRICS_FILE).resolve()
-
 
 def _resolve_clean_metrics_path(run_dir: Path) -> Path:
     return (run_dir / OUT_CLEAN_METRICS_NAME).resolve()
@@ -313,15 +331,15 @@ def plot_losses(m, out_path: Path, *, run_name: str) -> None:
 def main() -> None:
     apply_style()
     run_dir = _resolve_repo_path(RUN_DIR)
-    metrics_path = _resolve_metrics_path(run_dir)
+    segments = metrics_segments(run_dir)
     clean_metrics_path = _resolve_clean_metrics_path(run_dir)
     out_path = _resolve_output_path(run_dir)
     print(
         "[config] "
-        f"run_dir={run_dir} metrics={metrics_path} "
+        f"run_dir={run_dir} metrics={[p.name for p in segments]} "
         f"clean_csv={clean_metrics_path} out={out_path}"
     )
-    m = load_metrics_csv(metrics_path)
+    m = load_metrics(run_dir)
     save_clean_metrics_csv(m, clean_metrics_path)
     plot_losses(m, out_path, run_name=run_dir.name)
 

@@ -12,7 +12,6 @@
     "amp_mode": "true",
     "model_dtype": "float32",
     "input_dtype": "float32",
-    "preload_dtype": "float32",
     "loss_dtype": "float32"
   },
   "paths": {
@@ -27,13 +26,14 @@
   },
   "runtime": {
     "checkpoint": null,
-    "accelerator": "auto",
-    "devices": "auto",
+    "accelerator": "cuda",
+    "devices": 1,
     "strategy": "auto",
     "accumulate_grad_batches": 1,
     "deterministic": false,
     "enable_progress_bar": false,
     "gradient_clip_val": 1.0,
+    "log_grad_norm": false,
     "log_every_n_steps": 1000000,
     "checkpointing": {
       "enabled": true,
@@ -108,7 +108,7 @@
     "samples_per_source_trajectory": 4,
     "max_chunk_attempts_per_source": 200,
     "drop_below": 1e-30,
-    "num_workers": 64
+    "num_workers": 16
   },
   "dataset": {
     "windows_per_trajectory": 32
@@ -199,7 +199,7 @@
     "early_stopping": {
       "enabled": true,
       "patience": 30,
-      "min_delta": 1e-05
+      "min_delta": 0.0
     }
   }
 }

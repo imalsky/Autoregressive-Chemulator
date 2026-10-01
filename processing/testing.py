@@ -34,6 +34,7 @@ import matplotlib.pyplot as plt
 from preprocessing import (
     PreCfg,
     _is_non_finite_raw_error,
+    _is_non_positive_global_error,
     interp_loglog,
     leaf_dataset_index,
     list_raw_files,
@@ -56,8 +57,8 @@ from preprocessing import (
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # The config file comes from AUTOCHEM_CONFIG_PATH (required; no default config).
 
-# If None, selects first matching file under config.paths.raw_dir using
-# config.preprocessing.raw_file_patterns.
+# If None, rows cycle over the files matching config.preprocessing.raw_file_patterns under
+# config.paths.raw_dir (row r uses file r mod n_files); otherwise every row uses this file.
 RAW_FILE: Optional[Path] = None
 
 # Number of rows (trajectories) and layout
@@ -66,9 +67,6 @@ N_COLS = 2
 
 # Random selection seed for trajectories
 SEED = 1
-
-# Chunk start semantics (preprocessing anchors only the first chunk per trajectory)
-USE_ANCHOR_FIRST_CHUNK = True
 
 # If set, overrides dt selection.
 DT_OVERRIDE: Optional[float] = None
@@ -98,6 +96,8 @@ def build_raw_and_chunk_from_preprocessing_logic(
     raw: h5py.Group,
     cfg: PreCfg,
     rng: np.random.Generator,
+    *,
+    anchor_first: bool,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     """
     Returns:
@@ -107,8 +107,11 @@ def build_raw_and_chunk_from_preprocessing_logic(
       y_chunk : [n_steps, S] interpolated (floored at epsilon in log space)
       dt_s    : scalar dt used for the chunk
 
-    Soft rejects raise RuntimeError("Rejected...: ..."); non-finite raw values raise
-    preprocessing's ValueError; raw-schema errors raise KeyError/TypeError/ValueError.
+    anchor_first is preprocessing's per-sample choice: only the first of every
+    samples_per_source_trajectory chunks is anchored at the earliest feasible time.
+
+    Soft rejects raise RuntimeError("Rejected...: ..."); non-finite raw values and P/T that are
+    not > 0 raise preprocessing's ValueError; raw-schema errors raise KeyError/TypeError/ValueError.
     """
     leaf_index = leaf_dataset_index(raw)
 
@@ -116,7 +119,7 @@ def build_raw_and_chunk_from_preprocessing_logic(
     T = int(t_raw.shape[0])
 
     y_raw = read_species_matrix(raw, t_len=T, species_vars=cfg.species_variables, leaf_index=leaf_index)
-    # Globals are not plotted; reading them rejects non-finite P/T exactly as preprocessing does.
+    # Globals are not plotted; reading them rejects bad P/T exactly as preprocessing does.
     read_globals_vector(raw, global_vars=cfg.global_variables, leaf_index=leaf_index)
 
     # Apply preprocessing.drop_below rejection (optional; default True to match preprocessing)
@@ -143,7 +146,7 @@ def build_raw_and_chunk_from_preprocessing_logic(
         n_steps=cfg.n_steps,
         t_min=cfg.t_min,
         rng=rng,
-        anchor_first=USE_ANCHOR_FIRST_CHUNK,
+        anchor_first=anchor_first,
         max_attempts=cfg.max_chunk_attempts_per_source,
     )
     if t_start is None:
@@ -250,116 +253,130 @@ def main() -> None:
         raise ValueError(f"DT_OVERRIDE must be > 0, got {DT_OVERRIDE}")
 
     if RAW_FILE is not None:
-        raw_file = RAW_FILE if RAW_FILE.is_absolute() else (PROJECT_ROOT / RAW_FILE).resolve()
+        raw_files = [RAW_FILE if RAW_FILE.is_absolute() else (PROJECT_ROOT / RAW_FILE).resolve()]
     else:
         raw_files = list_raw_files(cfg.raw_dir, cfg.raw_file_patterns)
         if not raw_files:
             raise FileNotFoundError(f"No HDF5 files found under raw_dir={cfg.raw_dir} for patterns={cfg.raw_file_patterns}")
-        raw_file = raw_files[0]
-    if not raw_file.exists():
-        raise FileNotFoundError(f"RAW_FILE not found: {raw_file}")
+    for raw_file in raw_files:
+        if not raw_file.exists():
+            raise FileNotFoundError(f"RAW_FILE not found: {raw_file}")
 
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
 
     rng = np.random.default_rng(SEED)
 
-    with h5py.File(raw_file, "r") as f_raw:
-        group_names = list_group_names(f_raw)
-        if not group_names:
-            raise RuntimeError(f"No groups found at root of raw file: {raw_file}")
+    samples: List[Tuple[str, str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]] = []
+    used: set[Tuple[str, str]] = set()
+    reject_reasons: Dict[str, int] = {}
 
-        samples: List[Tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]] = []
-        used: set[str] = set()
-        reject_reasons: Dict[str, int] = {}
+    tries = 0
+    while len(samples) < N_ROWS and tries < MAX_GROUP_TRIES:
+        r = len(samples)
+        raw_file = raw_files[r % len(raw_files)]
+        # Row r mirrors preprocessing's mixture: one anchored chunk per samples_per_source_trajectory.
+        anchor_first = r % int(cfg.samples_per_source_trajectory) == 0
+        with h5py.File(raw_file, "r") as f_raw:
+            group_names = list_group_names(f_raw)
+            if not group_names:
+                raise RuntimeError(f"No groups found at root of raw file: {raw_file}")
+            while tries < MAX_GROUP_TRIES:
+                tries += 1
+                gname = group_names[int(rng.integers(0, len(group_names)))]
+                if (raw_file.name, gname) in used:
+                    continue
+                used.add((raw_file.name, gname))
 
-        tries = 0
-        while len(samples) < N_ROWS and tries < MAX_GROUP_TRIES:
-            tries += 1
-            gname = group_names[int(rng.integers(0, len(group_names)))]
-            if gname in used:
-                continue
-            used.add(gname)
+                raw_grp = f_raw[gname]
+                try:
+                    t_raw, y_raw, t_chunk, y_chunk, dt_s = build_raw_and_chunk_from_preprocessing_logic(
+                        raw_grp, cfg, rng, anchor_first=anchor_first
+                    )
+                except ValueError as e:
+                    # preprocessing's split: non-finite raw values and non-positive P/T are soft
+                    # rejects; any other ValueError (like KeyError/TypeError) is a raw-schema error.
+                    if _is_non_finite_raw_error(e):
+                        key = "non_finite"
+                    elif _is_non_positive_global_error(e):
+                        key = "non_positive_global"
+                    else:
+                        raise
+                    reject_reasons[key] = reject_reasons.get(key, 0) + 1
+                    continue
+                except RuntimeError as e:  # this script's own soft rejects
+                    key = str(e).split(":")[0].strip()
+                    reject_reasons[key] = reject_reasons.get(key, 0) + 1
+                    continue
 
-            raw_grp = f_raw[gname]
-            try:
-                t_raw, y_raw, t_chunk, y_chunk, dt_s = build_raw_and_chunk_from_preprocessing_logic(raw_grp, cfg, rng)
-            except ValueError as e:
-                # preprocessing's split: non-finite raw values are a soft reject; any other
-                # ValueError (like KeyError/TypeError) is a raw-schema error and propagates.
-                if not _is_non_finite_raw_error(e):
-                    raise
-                reject_reasons["non_finite"] = reject_reasons.get("non_finite", 0) + 1
-                continue
-            except RuntimeError as e:  # this script's own soft rejects
-                key = str(e).split(":")[0].strip()
-                reject_reasons[key] = reject_reasons.get(key, 0) + 1
-                continue
+                samples.append((raw_file.name, gname, t_raw, y_raw, t_chunk, y_chunk, dt_s))
+                break
 
-            samples.append((gname, t_raw, y_raw, t_chunk, y_chunk, dt_s))
-
-        if len(samples) < N_ROWS:
-            summary = ", ".join(f"{k}={v}" for k, v in sorted(reject_reasons.items(), key=lambda kv: -kv[1])[:12])
-            raise RuntimeError(
-                f"Could only find {len(samples)} valid trajectories (wanted {N_ROWS}) after {tries} tries. "
-                f"Top reject reasons: {summary}"
-            )
-
-        fig, axes = plt.subplots(
-            N_ROWS,
-            N_COLS,
-            figsize=(14.0, 4.2 * N_ROWS),
-            squeeze=False,
+    if len(samples) < N_ROWS:
+        summary = ", ".join(f"{k}={v}" for k, v in sorted(reject_reasons.items(), key=lambda kv: -kv[1])[:12])
+        raise RuntimeError(
+            f"Could only find {len(samples)} valid trajectories (wanted {N_ROWS}) after {tries} tries. "
+            f"Top reject reasons: {summary}"
         )
 
-        for r, (gname, t_raw, y_raw, t_chunk, y_chunk, dt_s) in enumerate(samples):
-            # Left: log-x (and log-y)
-            axL = axes[r][0]
-            style_axes(axL, xlog=True)
-            axL.set_title(f"{gname} (log-x)", pad=10)
-            plot_overlay_all_species(
-                axL,
-                t_raw,
-                y_raw,
-                t_chunk,
-                y_chunk,
-                legend=True,
-                species_count=len(cfg.species_variables),
-                dt_s=dt_s,
-            )
+    fig, axes = plt.subplots(
+        N_ROWS,
+        N_COLS,
+        figsize=(14.0, 4.2 * N_ROWS),
+        squeeze=False,
+    )
 
-            # Right: linear-x (log-y) BUT x-range exactly equals blue-dot extent
-            axR = axes[r][1]
-            style_axes(axR, xlog=False)
-            axR.set_title(f"{gname} (linear-x; xlim=chunk extent)", pad=10)
-            plot_overlay_all_species(
-                axR,
-                t_raw,
-                y_raw,
-                t_chunk,
-                y_chunk,
-                legend=True,
-                species_count=len(cfg.species_variables),
-                dt_s=dt_s,
-            )
-            axR.set_xlim(float(t_chunk[0]), float(t_chunk[-1]))
+    for r, (fname, gname, t_raw, y_raw, t_chunk, y_chunk, dt_s) in enumerate(samples):
+        # Raw outputs inside the window: few means the window is mostly interpolation.
+        n_inside = int(np.count_nonzero((t_raw >= t_chunk[0]) & (t_raw <= t_chunk[-1])))
+        where = f"{fname}:{gname} t_start={float(t_chunk[0]):.3g} s, {n_inside} raw outputs inside"
 
-        fig.suptitle(
-            f"Raw vs Generated Chunk Overlay (dt_sampling={cfg.dt_sampling}, n_steps={cfg.n_steps}, eps={cfg.epsilon:.1e})\n"
-            f"Raw file: {raw_file.name}",
-            fontsize=11,
-            y=0.995,
+        # Left: log-x (and log-y)
+        axL = axes[r][0]
+        style_axes(axL, xlog=True)
+        axL.set_title(f"{where} (log-x)", pad=10)
+        plot_overlay_all_species(
+            axL,
+            t_raw,
+            y_raw,
+            t_chunk,
+            y_chunk,
+            legend=True,
+            species_count=len(cfg.species_variables),
+            dt_s=dt_s,
         )
-        plt.tight_layout(rect=[0, 0, 1, 0.965])
 
-        fig.savefig(OUT_PNG, dpi=DPI)
-        plt.close(fig)
+        # Right: linear-x (log-y) BUT x-range exactly equals blue-dot extent
+        axR = axes[r][1]
+        style_axes(axR, xlog=False)
+        axR.set_title(f"{where} (linear-x; xlim=chunk extent)", pad=10)
+        plot_overlay_all_species(
+            axR,
+            t_raw,
+            y_raw,
+            t_chunk,
+            y_chunk,
+            legend=True,
+            species_count=len(cfg.species_variables),
+            dt_s=dt_s,
+        )
+        axR.set_xlim(float(t_chunk[0]), float(t_chunk[-1]))
 
-        print(f"Wrote: {OUT_PNG.resolve()}")
-        print("Rows (trajectories):", [s[0] for s in samples])
-        if reject_reasons:
-            top = ", ".join(f"{k}={v}" for k, v in sorted(reject_reasons.items(), key=lambda kv: -kv[1])[:10])
-            print("Top reject reasons:", top)
+    fig.suptitle(
+        f"Raw vs Generated Chunk Overlay (dt_sampling={cfg.dt_sampling}, n_steps={cfg.n_steps}, eps={cfg.epsilon:.1e})\n"
+        f"Raw files: {', '.join(sorted({s[0] for s in samples}))}",
+        fontsize=11,
+        y=0.995,
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.965])
 
+    fig.savefig(OUT_PNG, dpi=DPI)
+    plt.close(fig)
+
+    print(f"Wrote: {OUT_PNG.resolve()}")
+    print("Rows (file:trajectory):", [f"{s[0]}:{s[1]}" for s in samples])
+    if reject_reasons:
+        top = ", ".join(f"{k}={v}" for k, v in sorted(reject_reasons.items(), key=lambda kv: -kv[1])[:10])
+        print("Top reject reasons:", top)
 
 if __name__ == "__main__":
     main()
