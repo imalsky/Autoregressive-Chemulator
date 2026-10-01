@@ -59,6 +59,10 @@ from torch.utils.data import DataLoader, IterableDataset
 # Preloaded tensors keep the shard dtype (float32): bf16 storage would quantize the z-space
 # states, and float64 would only double the memory.
 _STORAGE_DTYPE = torch.float32
+# The training stream reseeds every epoch from SeedSequence([seed, _TRAIN_STREAM_ID, epoch]), so a
+# resumed run draws the same batches as an uninterrupted one (the id keeps it apart from any
+# other stream derived from the same seed).
+_TRAIN_STREAM_ID = 0
 
 
 # -----------------------------------------------------------------------------
@@ -261,6 +265,10 @@ class _PreloadedStochasticBatchStream(IterableDataset):
     Sampling is with replacement (SGD-style). The window indices are drawn from a CPU
     generator and moved to the preload device, so the window sequence does not depend
     on where the data is preloaded.
+
+    epoch_seeded=True (the training stream): the generator is reseeded at the start of every
+    epoch from the base seed and the epoch set by set_epoch(), so epoch e draws the same windows
+    whether or not the run was resumed. Otherwise (validation) it is seeded once and continues.
     """
 
     def __init__(
@@ -270,6 +278,7 @@ class _PreloadedStochasticBatchStream(IterableDataset):
         batch_size: int,
         drop_last: bool,
         seed: int,
+        epoch_seeded: bool,
     ) -> None:
         super().__init__()
 
@@ -294,11 +303,18 @@ class _PreloadedStochasticBatchStream(IterableDataset):
         self._t_dt = torch.arange(self.K, device=self.device, dtype=torch.long)
 
         self._seed = int(seed)
+        self._epoch_seeded = bool(epoch_seeded)
+        self._epoch = 0
 
         self._generator = torch.Generator(device="cpu")
         # The +1 offset is historical (it separated this stream from the removed map-style
-        # loader's RNG); it is kept so the sampled windows are unchanged.
+        # loader's RNG); it is kept so the validation windows are unchanged. An epoch-seeded
+        # stream is reseeded in __iter__ before its first draw.
         self._generator.manual_seed(self._seed + 1)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Select the epoch whose windows the next iteration draws (epoch-seeded streams)."""
+        self._epoch = int(epoch)
 
     def __len__(self) -> int:
         total = len(self.base)
@@ -309,6 +325,12 @@ class _PreloadedStochasticBatchStream(IterableDataset):
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         total_samples = len(self.base)
         num_batches = len(self)
+
+        # The body of this generator runs at the first next(), i.e. after Lightning's
+        # on_train_epoch_start has called set_epoch (Lightning builds the iterator earlier).
+        if self._epoch_seeded:
+            state = np.random.SeedSequence([self._seed, _TRAIN_STREAM_ID, self._epoch]).generate_state(1, dtype=np.uint64)
+            self._generator.manual_seed(int(state[0]))
 
         # Views (no allocation).
         y_flat = self._y_all.reshape(-1, self.S)  # [N*T, S]
@@ -350,12 +372,13 @@ def create_dataloader(
     batch_size: int,
     pin_memory: bool,
     drop_last: bool,
+    epoch_seeded: bool,
 ) -> DataLoader:
     """
     Wrap a preloaded FlowMapRolloutDataset in the vectorized stochastic batch stream.
 
     The stream runs in the main process (num_workers=0) and samples windows with
-    replacement; it yields already-batched tensors.
+    replacement; it yields already-batched tensors. epoch_seeded: see the stream class.
     """
     ds_len = len(dataset)
     if ds_len == 0:
@@ -371,6 +394,7 @@ def create_dataloader(
         batch_size=batch_size,
         drop_last=bool(drop_last),
         seed=dataset.seed,
+        epoch_seeded=bool(epoch_seeded),
     )
 
     # main.py rejects pin_memory=true with a CUDA preload device before any data is loaded.

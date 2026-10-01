@@ -2,8 +2,9 @@
 
 ## REVISION 2026-09-30: correctness and contract fixes (audit theme T1)
 
-Production training numerics are unchanged by these fixes: the 30-step fingerprint of both stages
-(live and EMA weights, every training loss, val_loss) is bitwise identical to the pre-audit baseline,
+Production training numerics are unchanged by these fixes except the three listed at the end of this
+entry: without those, the 30-step fingerprint of both stages (live and EMA weights, every training
+loss, val_loss) is bitwise identical to the pre-audit baseline,
 preprocessing outputs (synthetic set and a real-data subset) compare equal array by array, and exports
 of the smoke checkpoint give identical weights and outputs (the graph loses five no-op denominator
 clamps; the metadata gains the checkpoint's `model` block). What changed:
@@ -39,6 +40,21 @@ clamps; the metadata gains the checkpoint's `model` block). What changed:
   required when the run used EMA, the checkpoint's model block must equal the config's, weights must
   be finite and every normalization statistic is validated (NaN-safe; stds >= min_std, ranges hi > lo
   as float32); artifacts are written under `.partial/` and renamed into place.
+
+Three further T1 fixes change training or validation numbers slightly:
+- The training batch stream is reseeded at every epoch from (system.seed, epoch), so a resumed run
+  draws the same batches as an uninterrupted one (audit check, both stages: weights, EMA weights and
+  optimizer state after 2 + 2 resumed epochs equal those of one 4-epoch run bit for bit). Fresh-run
+  batch sequences change once. Validation windows still depend on the validation stream's history,
+  so a resumed run validates on different windows (and its ES/plateau/checkpoint decisions can
+  differ) until validation is made deterministic (audit theme T7).
+- One validation batch runs before epoch 0 (Lightning's sanity check), so a compile or shape failure
+  in the validation path surfaces in minutes instead of after the first epoch. It is not an epoch (no
+  LR step, no checkpoint, no ES count), but it consumes validation-stream draws, so val_loss values
+  are not comparable with runs made before this change.
+- The EMA averages parameters only and copies buffers (loss statistics, Fourier frequencies).
+  Averaging a constant drifted it (2.9e-5 absolute on the loss log-means after 30 steps), so the
+  EMA-evaluated val_loss moves in the 6th to 7th digit; the parameter EMA is unchanged bit for bit.
 
 ## REVISION 2026-09-30: per-step training overhead cut; stage-1 CUDA graphs (audit theme T3)
 

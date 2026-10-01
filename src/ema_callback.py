@@ -1,7 +1,8 @@
 """Exponential moving average of model weights as a Lightning callback.
 
-The shadow EMA is updated after every training batch and is swapped into
-the live module at validation time so that val_loss reflects EMA-weights
+The shadow EMA of the parameters is updated after every training batch
+(buffers are copied, not averaged) and is swapped into the live module at
+validation time so that val_loss reflects EMA-weights
 performance. Live weights are restored at the end of validation. The EMA
 state is also serialized into checkpoints under the key
 ``ema_state_dict`` so it can be loaded by stage-2 ``weights_only`` resumes
@@ -92,7 +93,10 @@ class EMACallback(pl.Callback):
                     self.ema_sd[k] = v.to(live[k].device)
             groups, other, size = [], [], 0
             for k, ema_t in self.ema_sd.items():
-                if not ema_t.dtype.is_floating_point:
+                # Only parameters are averaged. Buffers (loss statistics, Fourier frequencies, any
+                # non-float entry) are copied: averaging a constant drifts it (d*x + (1-d)*x != x
+                # in floating point).
+                if not (isinstance(live[k], torch.nn.Parameter) and ema_t.dtype.is_floating_point):
                     other.append((ema_t, live[k]))
                     continue
                 nbytes = ema_t.numel() * ema_t.element_size()

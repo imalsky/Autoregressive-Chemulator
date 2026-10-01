@@ -72,6 +72,9 @@ _VAL_STEP_GAMMA = 1.0
 _PLATEAU_THRESHOLD_MODE = "rel"
 # last.ckpt must hold the latest completed epoch (auto-resume starts from it).
 LAST_CKPT_EVERY_N_EPOCHS = 1
+# One validation batch before epoch 0 runs the validation step (and its compiled path) once, so a
+# compile or shape failure surfaces in minutes instead of after the first ~2 h epoch.
+_SANITY_VAL_BATCHES = 1
 log = logging.getLogger(__name__)
 
 # ==============================================================================
@@ -532,6 +535,8 @@ class FlowMapRolloutModule(pl.LightningModule):
     # ------------------------
 
     def on_train_epoch_start(self) -> None:
+        # The training stream draws this epoch's windows from (seed, epoch): resume-safe.
+        self.trainer.train_dataloader.dataset.set_epoch(int(self.current_epoch))
         self._epoch_t0 = time.time()
         self._train_loss_sum = None
         self._train_loss_n = 0
@@ -993,6 +998,8 @@ class FlowMapRolloutModule(pl.LightningModule):
                 f"(global_step {self.global_step}): training diverged; aborting before this "
                 "epoch's checkpoint is written."
             )
+        if self.trainer.sanity_checking:  # the pre-training sanity batch is not an epoch
+            return
         # No LR cut while the curriculum ramps: val_loss is measured at the full horizon while
         # training runs shorter rollouts (the step-based LR warmup is unaffected).
         if self.current_epoch < self._plateau_start_epoch:
@@ -1233,7 +1240,7 @@ def build_lightning_trainer(
         logger=csv_logger,
         enable_progress_bar=bool(runtime["enable_progress_bar"]),
         enable_model_summary=False,
-        num_sanity_val_steps=0,
+        num_sanity_val_steps=_SANITY_VAL_BATCHES,
         enable_checkpointing=bool(enable_ckpt),
         gradient_clip_val=gradient_clip_val,
         accumulate_grad_batches=accumulate_grad_batches,

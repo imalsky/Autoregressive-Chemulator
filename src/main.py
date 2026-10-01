@@ -905,8 +905,9 @@ def create_dataloaders(
     train_ds = FlowMapRolloutDataset(processed_dir, "train", total_steps=k_train, seed=seed, **common_ds_kwargs)
     val_ds = FlowMapRolloutDataset(processed_dir, "validation", total_steps=k_eval, seed=seed + 1, **common_ds_kwargs)
 
-    train_dl = create_dataloader(train_ds, batch_size=batch_size, pin_memory=pin_memory, drop_last=True)
-    val_dl = create_dataloader(val_ds, batch_size=batch_size, pin_memory=pin_memory, drop_last=False)
+    # The training stream is reseeded per epoch (resume-safe); validation keeps one continuing stream.
+    train_dl = create_dataloader(train_ds, batch_size=batch_size, pin_memory=pin_memory, drop_last=True, epoch_seeded=True)
+    val_dl = create_dataloader(val_ds, batch_size=batch_size, pin_memory=pin_memory, drop_last=False, epoch_seeded=False)
 
     log.info("Dataloaders: train(K=%d) val(K=%d)", k_train, k_eval)
     return train_dl, val_dl
