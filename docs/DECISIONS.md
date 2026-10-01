@@ -346,7 +346,7 @@ with `num_workers: 64` added to stage2.json for parity (superseded 2026-09-30: 1
 configs, see the per-key table; and both caps are now `null` = no cap, T5 entry). If a processed dataset was
 already built on the HPC after df2c44f, check the recorded value in the processed
 dir's `preprocessing_summary.json` and rebuild if it was made with the 1e5 cap
-(run.pbs skips preprocessing whenever the processed dir exists).
+(the launcher, now run_daw.sh, skips preprocessing whenever the processed dir's normalization.json exists).
 
 Stage-1 -> stage-2 checkpoint handoff: DECIDED 2026-09-29, stage 2 initializes from stage-1
 `checkpoints/best.ckpt` (best val_loss, EMA weights preferred), published only by a finished stage 1
@@ -554,7 +554,9 @@ Each ~20 stage-1 epochs (~5% of a full run) on one GH200, comparing val curves:
 
 - **End-to-end smoke** (`testing/run_local_smoke.sh`): synthetic raw → preprocessing → stage-1
   (2 epochs) → stage-2 default (BPTT) AND stage-2 fallback (detached+γ=0.9), with the
-  weights_only EMA handoff. PASSED on this machine.
+  weights_only EMA handoff. PASSED on this machine. (Since 2026-09-30 the smoke is the integration
+  gate and asserts its outcomes: compile on, extension and refused re-run, best.ckpt handoff, the
+  Fourier-dt fallback pair, the gated export; spec 4.4.4.)
 - **Bugs found and fixed during verification:**
   1. *Latent stage-2 crash* (pre-existing): Lightning forbids `Trainer(gradient_clip_val)`
      with manual optimization — every AR run would have died at fit start. The AR path now
@@ -580,7 +582,8 @@ Each ~20 stage-1 epochs (~5% of a full run) on one GH200, comparing val curves:
   T1) the module clips with `clip_grad_norm_` itself and that combination trains in both stages (30-step
   runs bitwise equal to the efficiency study's patched runs); production configs are fp32-true.
 - ruff/vulture clean on all changed files; all 7 configs pass the strict schema;
-  legacy configs unaffected.
+  legacy configs unaffected. (The ruff rule set was not recorded then; since 2026-09-30 it is pinned
+  in pyproject.toml `[tool.ruff.lint]`: E4, E7, E9, F, with ruff 0.16.9 from requirements.lock.)
 
 ## HPC validation protocol (acceptance gates for the trained models)
 

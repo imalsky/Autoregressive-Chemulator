@@ -39,10 +39,18 @@ the config values (values without evidence are listed there as inherited / unjus
       training_logs.py    training-curve plots (diagnostic)
       eval_rollout_error.py   rollout-error curves vs step over a seeded validation sample (per-species dex)
       bench_speedup.py    exported-model (CPU and CUDA) latency sweep vs mini-chem per-cell cost
-      run.pbs             HPC: post-training export + plots job
-      run_local_smoke.sh  end-to-end smoke on synthetic data
-    run.pbs               HPC: stage 1 (preprocess + pretrain)
-    run_stage2.pbs        HPC: stage 2 (autoregressive fine-tune)
+      run_local_smoke.sh  end-to-end smoke on synthetic data (the integration gate)
+    run_daw.sh            daw launcher: preprocess -> stage 1 -> stage 2, each with its post step
+    requirements.lock     exact package pins (the daw venv); .python-version: 3.12.14
+
+## Environment
+
+The project runs on daw from a uv venv in the repo root, installed from the lock file:
+
+    uv venv --python 3.12.14 && uv pip sync requirements.lock
+
+`python` in the commands below is `.venv/bin/python` (or activate `.venv`). For training,
+use `run_daw.sh` (below): it also pins the GPU, the CPUs and the thread counts.
 
 There is **no default config**. Every entrypoint requires the config to be named
 explicitly via the `AUTOCHEM_CONFIG_PATH` environment variable; running without it
@@ -109,9 +117,9 @@ point `runtime.checkpoint` at a checkpoint in that run's own `checkpoints/` (nor
 copied run directory cannot be resumed: start a new run from its weights with
 `checkpoint_mode="weights_only"`. A finished run (`COMPLETED`, or a checkpoint from its
 last epoch or after early stopping) is not resumed: to extend it deliberately, delete
-`COMPLETED` and raise `training.max_epochs`. (The HPC scripts resume automatically on requeue
-once at least one checkpoint exists; a work dir from a run that died before its
-first checkpoint must be removed by hand.)
+`COMPLETED` and raise `training.max_epochs`. (`run_daw.sh` resumes an interrupted stage
+automatically once its `last.ckpt` exists; a work dir from a run that died before its first
+checkpoint must be removed by hand.)
 
 ### 4. Export and inspect
 
@@ -138,19 +146,31 @@ writes its reports and exits 1); the package does no input validation, so hosts 
 it through `_check_step_inputs` or apply the same checks (spec 4.3). It is not run on daw:
 torch 2.8 extracts AOTI packages into the shared system temp dir.
 
-A fast end-to-end check on synthetic data (no real dataset needed):
+The integration gate, about two minutes on one GPU with synthetic data (no real dataset needed):
 
-    conda activate nn && bash testing/run_local_smoke.sh
+    bash run_daw.sh smoke
 
-## HPC
+It runs the production configs, shrunk, through preprocessing, both stages with compile on, a
+deliberate extension and a refused re-run of the finished stage 1, both stage-2 recipes, the
+Fourier-dt fallback pair and the gated export, and fails on the first wrong outcome (header of
+`testing/run_local_smoke.sh`). Run it before committing changes to `src/`, `processing/` or the
+export.
 
-`run.pbs` runs stage 1 (preprocess-if-needed + pretrain); `run_stage2.pbs` runs
-stage 2. Both target Grace-Hopper (GH200) nodes, auto-resume on requeue once at
-least one checkpoint exists, and read `configs/stage{1,2}.json`. Typical
-submission:
+## Running on daw
 
-    qsub run.pbs
-    qsub -W depend=afterok:<stage1_jobid> run_stage2.pbs
+    tmux new -s autochem 'bash run_daw.sh all'     # or: preprocess | stage1 | stage2 | smoke
+
+`run_daw.sh` preprocesses once (skipped while `data/processed/normalization.json` exists),
+trains stage 1 and then stage 2 from stage 1's `best.ckpt`, and after each stage runs its post
+step (`export.py`, `training_logs.py`, `predictions.py`, `eval_rollout_error.py`,
+`efficiency_summary.py`). Re-running it is safe: a finished stage (`COMPLETED`) is not
+retrained, an interrupted one resumes from `last.ckpt`, and refusals from `src/main.py` are
+reported, not retried. It takes one GPU (the first idle one, or `AUTOCHEM_GPU`; it refuses a
+second GPU for the same user), pins itself to 16 CPUs on that GPU's NUMA node
+(`AUTOCHEM_THREADS`; all child processes inherit the pin), sets the thread counts, `TMPDIR`
+and the compile caches, and stops cleanly on Ctrl-C or `kill <pid>` (training exits 143 and
+resumes on the next run). Console logs, the GPU logger CSV and the last resume config go to
+`logs/`.
 
 ## Design stance
 

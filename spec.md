@@ -1,15 +1,14 @@
 # Autoregressive Chemical Kinetics Emulator Specification
 
-Version: 1.7
-Date: 2026-06-15
+Version: 1.8
+Date: 2026-09-30
 Audience: Professional collaborators and maintainers
 
 ## 0. Execution Environment
-1. Canonical local development environment is Conda environment `nn`.
-2. All canonical local commands and local validations must run via `nn`.
-3. `run.pbs` uses an HPC-specific environment and currently defaults to `pyt2_8_gh`.
-4. The local `nn` environment and the HPC batch environment are intentionally different and are not required to match.
-5. Running local development commands outside `nn` is non-canonical and may be considered an unsupported setup.
+1. The canonical machine is daw (shared SETI Institute workstation, 2x RTX 6000 Ada); the PBS/NAS batch scripts are retired.
+2. The canonical environment is the uv venv `.venv` in the repo root: Python 3.12.14 (`.python-version`) with the exact pins of `requirements.lock` (9.1). `python` in commands and run lines means `.venv/bin/python` (or `.venv` activated).
+3. Training, preprocessing and the post-training steps run through `run_daw.sh` (one GPU via `CUDA_VISIBLE_DEVICES`, refusing a second GPU for the same user; the process pinned to 16 CPUs on that GPU's NUMA node by default; OMP/MKL/OPENBLAS/NUMEXPR threads set to that count; `TMPDIR` and the inductor/triton caches in the user's space). `bash run_daw.sh smoke` runs the smoke test (4.4.4) in the same environment.
+4. Running outside `.venv`, or training outside `run_daw.sh`, is non-canonical.
 
 ## 1. Product Goal
 1. Build and maintain an accurate, fast autoregressive chemical kinetics emulator.
@@ -104,10 +103,10 @@ Audience: Professional collaborators and maintainers
 24. The AOTI package (`testing/aoti_export.py`) does no input validation: callers pass CPU float32 C-contiguous `[B, S]`, `[B]`, `[B, G]` tensors with one `B` inside metadata `dynamic_batch` (metadata `host_input_contract`). It is native code for the build CPU (metadata `build_target`) and is installed only when it matches the fresh export.
 
 ## 4.4 Diagnostic and Testing Scripts
-1. `testing/` holds diagnostic and deployment utilities; they are not release gates.
+1. `testing/` holds diagnostic and deployment utilities; they are not release gates, except the integration gate `testing/run_local_smoke.sh` (4.4.4).
 2. `testing/export.py` and `testing/aoti_export.py` produce/validate deployment artifacts and follow the strict no-fallback contract.
 3. The plotting/inspection diagnostics (`testing/predictions.py`, `testing/bench_speedup.py`, `testing/training_logs.py`, `testing/efficiency_summary.py`, `testing/profile_training.py`) may use explicit best-effort behavior for portability and local usability.
-4. `testing/run_local_smoke.sh` exercises the full preprocess -> stage-1 -> stage-2 pipeline on synthetic data.
+4. `testing/run_local_smoke.sh` (run as `bash run_daw.sh smoke`) is the integration gate: the production configs, shrunk, on synthetic data through preprocessing (its two reject paths), both stages with the production compile settings, a deliberate extension and a refused re-run of a finished run, the `best.ckpt` handoff, both stage-2 recipes, the Fourier-dt fallback pair and the gated export with a reload check. It asserts the outcomes (finite losses, epoch counts, `COMPLETED`, `last.ckpt` at the final epoch, a ragged last validation batch, compiled-variant counts, weights that change, NaN rows out of range) and fails on the first wrong one. Run it before committing changes to `src/`, `processing/` or the export.
 
 ## 5. Data and Schema Contracts
 1. Raw input data schema is stable and assumed unchanged.
@@ -145,30 +144,23 @@ Audience: Professional collaborators and maintainers
 1. Enforcing physical constraints in-model or post-hoc.
 2. Supporting fixed-`dt` preprocessing mode.
 3. Supporting multiple runtime modes beyond training.
-4. Requiring unit tests or integration tests for this project.
+4. Requiring unit tests, or integration tests beyond the smoke gate (4.4.4).
 5. Treating VULCAN comparison or benchmark scripts as mandatory acceptance gates.
 
 ## 9. Developer Tooling Notes
 ### 9.1 Canonical Environment Installs
-1. Local developer tooling must be installed in Conda environment `nn`.
-2. HPC batch scripts may activate a separate cluster-managed environment; `run.pbs` currently defaults to `pyt2_8_gh`.
-3. The local `nn` environment and the HPC batch environment are expected to differ.
-4. Canonical local install commands:
-5. `conda activate nn`
-6. `pip install lightning`
-7. `pip install pyflakes`
-8. `pip install vulture`
-9. `pip install ruff`
-10. The codebase targets the `lightning.pytorch` namespace; direct imports from `pytorch_lightning` are non-canonical even if that package is present transitively in the environment.
+1. From the repo root: `uv venv --python 3.12.14 && uv pip sync requirements.lock`.
+2. `requirements.lock` is the reproducibility source (the daw venv freeze; torch 2.8.0+cu126 by wheel URL) and includes the developer tools (ruff 0.16.9, pyflakes, vulture); `pyproject.toml` carries only minor-series bounds.
+3. The codebase targets the `lightning.pytorch` namespace; direct imports from `pytorch_lightning` are non-canonical even if that package is present transitively in the environment.
 
 ### 9.2 Dead Code Search Workflow
-1. Run checks from project root under environment `nn`.
+1. Run checks from the project root with the venv's tools.
 2. Canonical dead/unused checks:
-3. `conda run -n nn pyflakes $(rg --files -g '*.py')`
-4. `conda run -n nn ruff check $(rg --files -g '*.py')`
-5. `conda run -n nn vulture $(rg --files -g '*.py')`
+3. `.venv/bin/pyflakes $(git ls-files '*.py')`
+4. `.venv/bin/ruff check $(git ls-files '*.py')` (rule set pinned in `pyproject.toml` `[tool.ruff.lint]`: E4, E7, E9, F)
+5. `.venv/bin/vulture $(git ls-files '*.py')`
 6. Optional high-confidence-only Vulture pass:
-7. `conda run -n nn vulture --min-confidence 100 $(rg --files -g '*.py')`
+7. `.venv/bin/vulture --min-confidence 100 $(git ls-files '*.py')`
 
 ### 9.3 Editing Rules For Dead Code Fixes
 1. Remove truly unused locals/imports/functions rather than suppressing diagnostics.
