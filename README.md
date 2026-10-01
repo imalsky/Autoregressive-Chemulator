@@ -73,17 +73,26 @@ Outputs land under `paths.work_dir` (`models/stage1`):
     train.log                   run log (appended on resume)
     config.resolved.json        portable snapshot of the config the run was started with
     config.resume[.N].json      the config of each resume (must match config.resolved.json)
+    provenance.jsonl            one line per invocation: code, environment, data and init-checkpoint identity
     checkpoints/epoch*.ckpt     top-k Lightning checkpoints by val_loss (EMA weights embedded)
     checkpoints/last.ckpt       the latest completed epoch
-    checkpoints/best.ckpt       stable-name copy of the best-val_loss checkpoint
+    checkpoints/best.ckpt       stable-name copy of the best-val_loss checkpoint (finished runs only)
+    COMPLETED                   written last, only by a finished run (max_epochs or early stopping)
+
+An epoch is `dataset.train_batches_per_epoch` random batches; validation scores the
+fixed set of `dataset.val_samples` windows (see docs/DECISIONS.md). Every checkpoint
+records the normalization fingerprint (`norm_sha256`) of the processed data it was
+trained on.
 
 ### 3. Train stage 2 (autoregressive fine-tune)
 
     AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u src/main.py
 
-`stage2.json` loads the stage-1 checkpoint via `checkpoint_mode="weights_only"`
+`stage2.json` loads stage-1 `checkpoints/best.ckpt` via `checkpoint_mode="weights_only"`
 (EMA weights are preferred automatically) and fine-tunes with a rollout
-curriculum. Outputs land under `models/stage2`.
+curriculum. The stage-1 run must have finished (`COMPLETED`) on the same processed
+data (matching `norm_sha256`). Before training, the loaded weights are scored once on
+the validation set (`init_val.json`). Outputs land under `models/stage2`.
 
 Fresh training requires an empty `work_dir` (one holding only `train.log` from a
 failed start counts as empty). Only one training process may use a `work_dir` (it
@@ -92,7 +101,9 @@ point `runtime.checkpoint` at a checkpoint in that run's own `checkpoints/` (nor
 `last.ckpt`); the config must equal `config.resolved.json` except
 `training.checkpoint_mode`, `runtime.checkpoint` and `training.max_epochs`. A moved or
 copied run directory cannot be resumed: start a new run from its weights with
-`checkpoint_mode="weights_only"`. (The HPC scripts resume automatically on requeue
+`checkpoint_mode="weights_only"`. A finished run (`COMPLETED`, or a checkpoint from its
+last epoch or after early stopping) is not resumed: to extend it deliberately, delete
+`COMPLETED` and raise `training.max_epochs`. (The HPC scripts resume automatically on requeue
 once at least one checkpoint exists; a work dir from a run that died before its
 first checkpoint must be removed by hand.)
 

@@ -1,5 +1,64 @@
 # Production config decisions — evidence and justification
 
+## REVISION 2026-09-30: run contracts, fingerprints and provenance (audit theme T7)
+
+Training side. Training numerics are unchanged: the 30-step fingerprint of both stages (live and EMA
+weights, every training loss) is bitwise identical to the T1 reference; val_loss changes (first
+item). What changed:
+- **Validation is deterministic.** The validation set is a function of the processed data and one
+  count only: the N_val x n_starts (trajectory, start) windows of the validation split are
+  enumerated (n_starts = T - K = 99 at K=1, 90 at K=10) and an even subset of
+  `dataset.val_samples` of them is scored (all when the split holds fewer), with no generator. It no
+  longer depends on system.seed, the batch size, the epoch, the sanity batch, a resume or the
+  preload device. With today's counts stage 1 scores an even stride of about 32 of the 99 starts
+  per trajectory and stage 2 (92 >= 90 starts) scores every window (about 2% fewer validation
+  batches than before, from the counts). val_loss is comparable across seeds and batch sizes on the
+  same processed data, at equal rollout_steps and skip_steps (the skip mask still differs between
+  recipes); val_loss histories from before this change are not comparable with later ones. Never
+  resume (checkpoint_mode=resume) a work_dir started before this change: its restored best/ES/plateau
+  state refers to the old windows. A resumed run's validation now equals an uninterrupted one's
+  (audit check, both stages: every epoch's val_loss, scheduler and callback state). This supersedes
+  the T1 notes below on validation windows and the sanity batch's draws.
+- **Epoch length by count.** `dataset.train_batches_per_epoch` and `dataset.val_samples` replace
+  `dataset.windows_per_trajectory` (an unknown key now). Their values reproduce today's epoch on the
+  4-file build (per-key row); the epoch no longer grows with the dataset, so warmup, patience, ramp
+  and EMA keep their length in optimizer steps when raw data is added unless these counts are edited.
+  Startup logs the batches per epoch and every epoch-counted knob in optimizer steps.
+- **Finished runs are marked.** A run writes `work_dir/COMPLETED` (atomic JSON: stop reason,
+  epochs, global step, last val_loss, best checkpoint source, val_loss and sha256) only when it
+  finished: max_epochs reached, or early stopping with patience exhausted, with a finite last
+  val_loss and best score. That decision is made before best.ckpt is copied, so an interrupted or
+  diverged run publishes neither and exits 1. A resume is refused while COMPLETED exists, and also
+  when its checkpoint is from the last epoch of max_epochs or early stopping already stopped it (a
+  run that ended before writing the marker). To extend a finished run deliberately, delete
+  COMPLETED and raise `training.max_epochs`.
+- **Stage-2 handoff (decision 2026-09-29): stage-1 `best.ckpt`.** `configs/stage2.json` loads
+  `../models/stage1/checkpoints/best.ckpt` (best val_loss, EMA weights preferred), which replaces the
+  last.ckpt handoff of the 2026-07-16 status note. weights_only also refuses a source run without
+  COMPLETED (a best.ckpt of a run being extended is not a handoff). Clear any existing stage-2
+  work_dir before the first run with this handoff.
+- **Normalization fingerprint.** `norm_sha256` = sha256 of the canonical JSON (sorted keys, compact)
+  of normalization.json's `normalization_methods`, `per_key_stats`, `epsilon`, `min_std`, `dt`,
+  `species_variables` and `global_variables` (src/utils.py). Every checkpoint carries it in its
+  hyperparameters. weights_only and resume refuse a checkpoint whose fingerprint is missing or differs
+  from the processed_dir's, and weights_only rebuilds the loss statistics (criterion buffers) from the
+  manifest instead of taking them from the checkpoint. Checkpoints made before this change have no
+  fingerprint and cannot be handed off or resumed. Alternative 3 below is rewritten accordingly.
+- **Provenance.** Each invocation appends one line to `work_dir/provenance.jsonl` before training:
+  time, config path and snapshot sha256, checkpoint_mode, the init checkpoint's path, sha256, epoch,
+  step, optimizer LR and val_loss scores, git HEAD / dirty (untracked files ignored) / diff sha256,
+  python/torch/lightning/numpy, CUDA and cuDNN, GPU name/UUID/driver, host, CUDA_VISIBLE_DEVICES,
+  CPU affinity, thread settings, effective TF32, processed_dir and norm_sha256. Every field is
+  best-effort (an error string, never a failed run).
+- **Handoff baseline.** A weights_only run scores the loaded weights once on the validation set
+  before training, on a separate logger-free Trainer, and writes `work_dir/init_val.json` (not in
+  metrics.csv, not seen by early stopping or checkpointing).
+- **TF32 is a config key** (`precision.allow_tf32`, per-key row); production behaviour unchanged.
+- **Environment.** `requirements.lock` (the daw venv freeze; torch 2.8.0+cu126 by wheel URL) and
+  `.python-version` (3.12.14) are the reproducibility source: `uv venv --python 3.12.14 && uv pip
+  sync requirements.lock`. pyproject pins torch 2.8.* and lightning 2.6.* and is not installable as
+  a package (no modules are built).
+
 ## REVISION 2026-09-30: correctness and contract fixes (audit theme T1)
 
 Production training numerics are unchanged by these fixes except the three listed at the end of this
@@ -122,11 +181,9 @@ already built on the HPC after df2c44f, check the recorded value in the processe
 dir's `preprocessing_summary.json` and rebuild if it was made with the 1e5 cap
 (run.pbs skips preprocessing whenever the processed dir exists).
 
-Stage-1 -> stage-2 checkpoint handoff (status note): stage 2 initializes from
-`../models/stage1/checkpoints/last.ckpt`, i.e. the final-epoch EMA weights, not the
-best-val_loss checkpoint. Whether the handoff should use last or best val_loss is an
-OPEN decision to settle before launch; the config's checkpoint path stays unchanged
-until it is. `testing/export.py` exports `checkpoints/best.ckpt`, matching the
+Stage-1 -> stage-2 checkpoint handoff: DECIDED 2026-09-29, stage 2 initializes from stage-1
+`checkpoints/best.ckpt` (best val_loss, EMA weights preferred), published only by a finished stage 1
+(see the T7 entry above). `testing/export.py` also exports `checkpoints/best.ckpt`, matching the
 val_loss selection contract (spec 1.3 / 6.2). Correction 2026-09-30 (audit T1): with Lightning 2.6
 the top-k callback's `save_last` refreshes `last.ckpt` only in epochs that enter the top-k
 (`lightning/pytorch/callbacks/model_checkpoint.py` 494-498), so `last.ckpt` could lag the final
@@ -225,7 +282,9 @@ no inversion of any adopted finding.
 | `preprocessing.samples_per_source_trajectory` | 4 (was 1) | E2 mechanism: per-state dt diversity is the robustness lever; 4 independent (dt, t_start) draws per source trajectory maximize (state, dt) coverage from the same raws. | medium |
 | `preprocessing.output_trajectories_per_file`, `pool_size` | 1e6 (consume all) | "Use the full dataset" (user decision); ~62M samples across ~160 raw files. | decision |
 | `training.batch_size` | 2048 | Paper finding: >2048 degraded generalization; v2_bigger_batch (8192) plateaued at val ~9e-3. | high (production-scale evidence) |
-| stage-1 `lr` / `wd` / scheduler / EMA 0.9995 / early-stop | template values | v3-lineage except the scheduler (v3 used `cosine_with_warmup`, see REVISION 2026-09-30; the shipped plateau schedule is not v3-lineage); converged to val ~7e-4 historically. EMA window rule (1/(1−d) ≈ 1–10% of updates, ACE uses 0.9999) — with full-dataset epochs, consider 0.9999; not locally discriminable. | inherited |
+| stage-1 `lr` / `wd` / scheduler / EMA 0.9995 / early-stop | template values | v3-lineage except the scheduler (v3 used `cosine_with_warmup`, see REVISION 2026-09-30; the shipped plateau schedule is not v3-lineage); converged to val ~7e-4 historically. EMA window rule (1/(1−d) ≈ 1–10% of updates, ACE uses 0.9999): 0.9995 is a 2,000-step horizon, 0.06 of a 32,475-step stage-1 epoch and 0.015% of the 400-epoch budget (0.999 in stage 2: 1,000 steps, 0.011 of a 93,367-step epoch); 0.9999 would be 10,000 steps; not locally discriminable. | inherited |
+| `dataset.train_batches_per_epoch` / `dataset.val_samples` | stage 1 32,475 / 8,246,528; stage 2 93,367 / 23,708,768 (since 2026-09-30, replacing `windows_per_trajectory` 32 / 92) | The epoch is a count of optimizer steps (one per batch of 2048 windows drawn with replacement) plus a fixed validation set, not a function of the dataset size. The values reproduce the old epoch on the 4-file build (N_train 2,078,448 and N_val 257,704 windows): floor(N_train x 32 / 2048), N_val x 32 and floor(N_train x 92 / 2048), N_val x 92. In optimizer steps: stage 1 LR warmup 30 epochs = 974,250, plateau patience 15 = 487,125, ES patience 30 = 974,250, 400 epochs = 12,990,000; stage 2 warmup 5 = 466,835, plateau patience 10 = 933,670, ES patience 20 = 1,867,340, curriculum ramp 30 = 2,801,010, 200 epochs = 18,673,400. The 32 / 92 windows per trajectory behind them are inherited with no recorded rationale. When raw data is added these counts stay fixed unless edited (re-derive them from the new N if the epoch should scale). Stage-2 validation (val_samples >= its 23,193,360 enumerated windows) scores every window. | inherited (32 / 92) |
+| `precision.allow_tf32` | true (since 2026-09-30) | TF32 matmuls (cuBLAS through `set_float32_matmul_precision("high")`, cuDNN mirrored), as before. `runtime.deterministic=true` forces TF32 off whatever this key says, the coupling the code always had (deterministic runs are the full-fp32 reproducibility mode). The effective setting is logged at startup and recorded in provenance.jsonl. | inherited |
 | **stage-2 model block = stage-1 model block** | 10×2048 (fourier_dt OFF) | Fixes the historical inconsistency: the now-removed `configs/stage2_dt_bands/` declared 8×1536 but strict-load 10×2048 checkpoints from wrong paths — would hard-fail at startup. | high (correctness fix) |
 | `training.rollout_steps` (stage 2) | 10 | **E3 K_MAX sweep**: inverted-U on geometric — K=1: 6.5e-3–1.9e-2, K=5: 4.4e-3, K=10: 2.4e-3 (±3%, 3 seeds), K=20: 1.2–3.3e-2 + one 1.0-dex fixed-dt blow-up. Matches List et al. 2024 (detached unrolling counterproductive beyond ~6; BPTT helps further but K=10 is inside every published envelope — GraphCast 12 max). Training horizon ≪ deployment horizon is universal practice. | medium-high |
 | `curriculum` 2→10, linear, 30 epochs | enabled | All multi-step SOTA use staged/ramped horizons (GraphCast +1/1k-updates 1→12; Stormer 1→4→8; NeuralGCM "critical"); sandbox used the equivalent ramp in every successful run. | high (literature + used throughout locally) |
@@ -260,9 +319,13 @@ no inversion of any adopted finding.
    `configs/stage2.json` set `detach_between_steps=true`, `backward_per_step=true`,
    `loss_discount_gamma=0.9`. Do NOT run detached with γ=1.0 (E3: 4–14× worse).
 3. **Deployment-specialized fine-tune** (if production rollout at dt≈6.4 s underperforms):
-   rather than banding, run a second stage-2 pass with preprocessing dt_min/dt_max
-   narrowed to ~[2, 20] s from the *same* stage-1 checkpoint (FuXi-style). Keeps one
-   model family, no band-boundary discontinuity.
+   rather than banding, a second stage-2 pass concentrated near dt≈6.4 s (FuXi-style). Since
+   2026-09-30 it cannot reuse the *same* stage-1 checkpoint on a re-preprocessed dataset with
+   dt_min/dt_max narrowed to ~[2, 20] s: that rebuild changes the normalization (the dt range and
+   every statistic), and weights_only refuses a checkpoint trained in another normalization
+   (norm_sha256). It needs either a fresh stage 1 on the narrowed data or a preprocessing mode that
+   reuses the stage-1 normalization (not implemented). Keeps one model family, no band-boundary
+   discontinuity.
 4. **Autoencoder trunk** — removed from src on 2026-09-30; recover from git history (tag
    `pre-audit-2026-09-29`). Rationale kept: Fourier-Flow-map was worse + 5.5× seed spread at
    sandbox scale (E1) but small-scale bottleneck behavior may not transfer; documented, not pursued.

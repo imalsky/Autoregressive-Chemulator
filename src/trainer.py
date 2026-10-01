@@ -53,7 +53,7 @@ import torch.nn as nn
 
 from model import autoregressive_rollout, normalize_dt_shape
 
-from utils import PrecisionConfig
+from utils import PrecisionConfig, normalization_sha256
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 
@@ -500,8 +500,23 @@ class FlowMapRolloutModule(pl.LightningModule):
         self._grad_stats_n = 0
 
         # Preserve for checkpoint reproducibility. Deep-copy so later config mutations
-        # (or Lightning internals) can't alias the live training config.
-        self.save_hyperparameters({"training": copy.deepcopy(dict(tcfg)), "model": copy.deepcopy(dict(mcfg))})
+        # (or Lightning internals) can't alias the live training config. norm_sha256 ties every
+        # checkpoint to the normalization it was trained in (checked on resume, weights_only and export).
+        self.save_hyperparameters({
+            "training": copy.deepcopy(dict(tcfg)),
+            "model": copy.deepcopy(dict(mcfg)),
+            "norm_sha256": normalization_sha256(self.normalization_manifest),
+        })
+
+    def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        """Resume: refuse a checkpoint trained in a different normalization (z-space) than this run's."""
+        hparams = checkpoint.get("hyper_parameters")
+        saved = hparams.get("norm_sha256") if isinstance(hparams, Mapping) else None
+        if saved != self.hparams["norm_sha256"]:
+            raise ValueError(
+                f"resume checkpoint norm_sha256={saved!r} does not match this processed_dir's normalization.json "
+                f"({self.hparams['norm_sha256']}); the checkpoint was trained on other normalization statistics"
+            )
 
     # ------------------------
     # Fit-time note about metric comparability

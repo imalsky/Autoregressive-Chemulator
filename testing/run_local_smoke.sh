@@ -36,13 +36,14 @@ def smoke_ify(cfg, stage):
     c["preprocessing"]["output_trajectories_per_file"] = 200
     c["preprocessing"]["pool_size"] = 1000
     c["model"]["mlp"]["hidden_dims"] = [64, 64]
-    c["dataset"]["windows_per_trajectory"] = 4
+    c["dataset"]["train_batches_per_epoch"] = 12
+    c["dataset"]["val_samples"] = 64
     c["training"]["batch_size"] = 64
     c["training"]["max_epochs"] = 2
     c["training"]["scheduler"]["warmup_epochs"] = 1
     c["training"]["early_stopping"]["enabled"] = False
     if stage.startswith("stage2"):
-        c["runtime"]["checkpoint"] = "stage1_work/checkpoints/last.ckpt"
+        c["runtime"]["checkpoint"] = "stage1_work/checkpoints/best.ckpt"
         c["training"]["curriculum"]["ramp_epochs"] = 1
     if stage == "stage2_detached":
         # The documented fallback recipe (DECISIONS.md): detached + gamma=0.9.

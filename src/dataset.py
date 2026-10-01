@@ -29,13 +29,20 @@ archives with np.savez):
 Every split is preloaded into contiguous float32 tensors (the shard dtype) on the
 preload device; preload_nbytes() gives a split's preload size from the shard headers
 alone, so the caller can check a memory budget before anything is loaded.
-create_dataloader() wraps it in a vectorized single-process stream that samples
-random windows (with replacement) and yields pre-batched tensors:
+Two vectorized single-process streams wrap it and yield pre-batched tensors:
     {
         "y":  [B, K+1, S],   # includes the initial state at index 0
         "dt": [B, K],
         "g":  [B, G],
     }
+- create_train_dataloader(): a fixed number of batches per epoch, each B windows drawn
+  uniformly at random WITH replacement (a window is a trajectory and a start index), from a
+  generator reseeded per epoch.
+- create_val_dataloader(): a fixed window set, defined by the data and one count only: the
+  N_val * n_starts (trajectory, start) windows are enumerated by index and an even subset of
+  n_windows of them (all when n_windows >= N_val * n_starts) is scored in index order. No
+  generator is involved, so the scored windows do not depend on the seed, the batch size, the
+  epoch, a resume or the preload device.
 
 There is no loading path for data larger than RAM. np.load cannot memory-map
 .npz members, but because the members are stored uncompressed they can be opened
@@ -63,6 +70,8 @@ _STORAGE_DTYPE = torch.float32
 # resumed run draws the same batches as an uninterrupted one (the id keeps it apart from any
 # other stream derived from the same seed).
 _TRAIN_STREAM_ID = 0
+# Largest int64 + 1: the validation window index k * total must stay below it.
+_INT64_LIMIT = 2**63
 
 
 # -----------------------------------------------------------------------------
@@ -156,8 +165,9 @@ class FlowMapRolloutDataset:
     """
     One split of trajectory shards, preloaded into contiguous tensors on `device`.
 
-    create_dataloader() wraps it in the vectorized stochastic batch stream, which samples
-    random windows of K+1 states (K transitions) with replacement.
+    create_train_dataloader() / create_val_dataloader() wrap it in the batch streams; a window is
+    K+1 consecutive states (K transitions) of one trajectory, starting at any index in
+    [0, max_start].
     """
 
     def __init__(
@@ -166,8 +176,6 @@ class FlowMapRolloutDataset:
         split: str,
         *,
         total_steps: int,
-        windows_per_trajectory: int = 1,
-        seed: int,
         device: torch.device,
     ) -> None:
         """
@@ -175,9 +183,6 @@ class FlowMapRolloutDataset:
             processed_dir: Root processed data directory containing the split subdirs.
             split: "train" | "validation" | "test" (or any subdir name under processed_dir).
             total_steps: K. Windows hold K+1 states (y) and K dt values.
-            windows_per_trajectory: Controls *epoch size* (windows per trajectory per epoch).
-                                  Sampling is still random each time.
-            seed: Base seed for the batch stream RNG.
             device: Preload device; all shards are loaded into float32 tensors there.
         """
         processed_dir = Path(processed_dir).expanduser().resolve()
@@ -187,14 +192,10 @@ class FlowMapRolloutDataset:
 
         if total_steps <= 0:
             raise ValueError(f"total_steps must be positive, got {total_steps}")
-        if windows_per_trajectory <= 0:
-            raise ValueError(f"windows_per_trajectory must be positive, got {windows_per_trajectory}")
 
         self.processed_dir = processed_dir
         self.split = str(split)
         self.total_steps = int(total_steps)
-        self.windows_per_trajectory = int(windows_per_trajectory)
-        self.seed = int(seed)
         self.device = device
 
         # Build the shard index (trajectory counts per shard) from header-only reads.
@@ -248,38 +249,16 @@ class FlowMapRolloutDataset:
 
         self._preloaded_all = (y_all, g_all, dt_all)
 
-    def __len__(self) -> int:
-        # windows_per_trajectory controls how many samples you get per trajectory per epoch.
-        return self._total_traj * self.windows_per_trajectory
 
+class _PreloadedWindowStream(IterableDataset):
+    """Shared part of the two batch streams: views of the preload buffers and the window gather.
 
-class _PreloadedStochasticBatchStream(IterableDataset):
-    """
-    Vectorized stochastic batch stream over a preloaded FlowMapRolloutDataset.
-
-    Yields already-batched tensors sampled from the contiguous preload buffers (one
-    gather per batch instead of B per-sample calls). When the preload device is CPU,
-    DataLoader pinning can be used on the yielded batches for efficient host-to-device
-    transfer.
-
-    Sampling is with replacement (SGD-style). The window indices are drawn from a CPU
-    generator and moved to the preload device, so the window sequence does not depend
-    on where the data is preloaded.
-
-    epoch_seeded=True (the training stream): the generator is reseeded at the start of every
-    epoch from the base seed and the epoch set by set_epoch(), so epoch e draws the same windows
-    whether or not the run was resumed. Otherwise (validation) it is seeded once and continues.
+    The window indices are computed on the CPU and moved to the preload device, so the windows
+    do not depend on where the data is preloaded. When the preload device is CPU, DataLoader
+    pinning can be used on the yielded batches for efficient host-to-device transfer.
     """
 
-    def __init__(
-        self,
-        base: FlowMapRolloutDataset,
-        *,
-        batch_size: int,
-        drop_last: bool,
-        seed: int,
-        epoch_seeded: bool,
-    ) -> None:
+    def __init__(self, base: FlowMapRolloutDataset, *, batch_size: int) -> None:
         super().__init__()
 
         if batch_size <= 0:
@@ -287,7 +266,6 @@ class _PreloadedStochasticBatchStream(IterableDataset):
 
         self.base = base
         self.batch_size = int(batch_size)
-        self.drop_last = bool(drop_last)
 
         self.device = base.device
 
@@ -302,47 +280,65 @@ class _PreloadedStochasticBatchStream(IterableDataset):
         self._t_y = torch.arange(self.K + 1, device=self.device, dtype=torch.long)
         self._t_dt = torch.arange(self.K, device=self.device, dtype=torch.long)
 
-        self._seed = int(seed)
-        self._epoch_seeded = bool(epoch_seeded)
-        self._epoch = 0
+    def _gather(self, traj: torch.Tensor, start: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Batch of the windows (traj[b], start[b]) without materializing [B, T, S] intermediates."""
+        B = int(traj.shape[0])
+        y_flat = self._y_all.reshape(-1, self.S)  # [N*T, S] (view)
+        dt_flat = self._dt_all.reshape(-1)        # [N*(T-1)] (view)
 
+        t_y = start[:, None] + self._t_y[None, :]  # [B, K+1]
+        lin_y = (traj[:, None] * self.T + t_y).reshape(-1)
+        y_win = y_flat.index_select(0, lin_y).reshape(B, self.K + 1, self.S)
+
+        t_dt = start[:, None] + self._t_dt[None, :]  # [B, K]
+        lin_dt = (traj[:, None] * self.T_dt + t_dt).reshape(-1)
+        dt_win = dt_flat.index_select(0, lin_dt).reshape(B, self.K)
+
+        g = self._g_all.index_select(0, traj)
+
+        return {"y": y_win, "dt": dt_win, "g": g}
+
+
+class _PreloadedStochasticBatchStream(_PreloadedWindowStream):
+    """
+    Training stream: `batches_per_epoch` full batches per epoch, windows drawn uniformly at
+    random with replacement (SGD-style) from a CPU generator.
+
+    The generator is reseeded at the start of every epoch from the base seed and the epoch set by
+    set_epoch(), so epoch e draws the same windows whether or not the run was resumed.
+    """
+
+    def __init__(
+        self,
+        base: FlowMapRolloutDataset,
+        *,
+        batch_size: int,
+        batches_per_epoch: int,
+        seed: int,
+    ) -> None:
+        super().__init__(base, batch_size=batch_size)
+        if batches_per_epoch <= 0:
+            raise ValueError(f"batches_per_epoch must be positive, got {batches_per_epoch}")
+        self.batches_per_epoch = int(batches_per_epoch)
+        self._seed = int(seed)
+        self._epoch = 0
         self._generator = torch.Generator(device="cpu")
-        # The +1 offset is historical (it separated this stream from the removed map-style
-        # loader's RNG); it is kept so the validation windows are unchanged. An epoch-seeded
-        # stream is reseeded in __iter__ before its first draw.
-        self._generator.manual_seed(self._seed + 1)
 
     def set_epoch(self, epoch: int) -> None:
-        """Select the epoch whose windows the next iteration draws (epoch-seeded streams)."""
+        """Select the epoch whose windows the next iteration draws."""
         self._epoch = int(epoch)
 
     def __len__(self) -> int:
-        total = len(self.base)
-        if self.drop_last:
-            return total // self.batch_size
-        return (total + self.batch_size - 1) // self.batch_size
+        return self.batches_per_epoch
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
-        total_samples = len(self.base)
-        num_batches = len(self)
-
         # The body of this generator runs at the first next(), i.e. after Lightning's
         # on_train_epoch_start has called set_epoch (Lightning builds the iterator earlier).
-        if self._epoch_seeded:
-            state = np.random.SeedSequence([self._seed, _TRAIN_STREAM_ID, self._epoch]).generate_state(1, dtype=np.uint64)
-            self._generator.manual_seed(int(state[0]))
+        state = np.random.SeedSequence([self._seed, _TRAIN_STREAM_ID, self._epoch]).generate_state(1, dtype=np.uint64)
+        self._generator.manual_seed(int(state[0]))
 
-        # Views (no allocation).
-        y_flat = self._y_all.reshape(-1, self.S)  # [N*T, S]
-        dt_flat = self._dt_all.reshape(-1)        # [N*(T-1)]
-        g_mat = self._g_all                       # [N, G]
-
-        for b in range(num_batches):
-            remaining = total_samples - b * self.batch_size
-            B = self.batch_size if (self.drop_last or remaining >= self.batch_size) else remaining
-            if B <= 0:
-                break
-
+        B = self.batch_size
+        for _ in range(self.batches_per_epoch):
             traj = torch.randint(0, self.N, (B,), generator=self._generator, dtype=torch.long).to(self.device)
             start = torch.randint(
                 0,
@@ -351,52 +347,47 @@ class _PreloadedStochasticBatchStream(IterableDataset):
                 generator=self._generator,
                 dtype=torch.long,
             ).to(self.device)
-
-            # Gather windows without materializing [B, T, S] intermediates.
-            t_y = start[:, None] + self._t_y[None, :]  # [B, K+1]
-            lin_y = (traj[:, None] * self.T + t_y).reshape(-1)
-            y_win = y_flat.index_select(0, lin_y).reshape(B, self.K + 1, self.S)
-
-            t_dt = start[:, None] + self._t_dt[None, :]  # [B, K]
-            lin_dt = (traj[:, None] * self.T_dt + t_dt).reshape(-1)
-            dt_win = dt_flat.index_select(0, lin_dt).reshape(B, self.K)
-
-            g = g_mat.index_select(0, traj)
-
-            yield {"y": y_win, "dt": dt_win, "g": g}
+            yield self._gather(traj, start)
 
 
-def create_dataloader(
-    dataset: FlowMapRolloutDataset,
-    *,
-    batch_size: int,
-    pin_memory: bool,
-    drop_last: bool,
-    epoch_seeded: bool,
-) -> DataLoader:
+class _PreloadedValidationStream(_PreloadedWindowStream):
     """
-    Wrap a preloaded FlowMapRolloutDataset in the vectorized stochastic batch stream.
+    Validation stream: a fixed, evenly spaced subset of the enumerated windows.
 
-    The stream runs in the main process (num_workers=0) and samples windows with
-    replacement; it yields already-batched tensors. epoch_seeded: see the stream class.
+    Window i of the N * n_starts enumerated windows (n_starts = max_start + 1) is trajectory
+    i // n_starts at start i % n_starts. The scored set is i_k = (k * total) // count for
+    k in [0, count), count = min(n_windows, total): every window when n_windows >= total, an even
+    stride otherwise. Batches are consecutive B-sized slices of k (the last one ragged), computed
+    per batch, so no index table is materialized.
     """
-    ds_len = len(dataset)
-    if ds_len == 0:
-        raise ValueError("Dataset is empty - check preprocessing outputs.")
 
-    if drop_last and ds_len < batch_size:
-        raise ValueError(
-            f"drop_last=True would yield 0 batches (dataset size {ds_len} < batch_size {batch_size})."
-        )
+    def __init__(self, base: FlowMapRolloutDataset, *, batch_size: int, n_windows: int) -> None:
+        super().__init__(base, batch_size=batch_size)
+        if n_windows <= 0:
+            raise ValueError(f"n_windows must be positive, got {n_windows}")
+        self.n_starts = int(base.max_start + 1)
+        self.total = int(self.N * self.n_starts)
+        self.count = int(min(n_windows, self.total))
+        # k * total is formed in int64 for k < count.
+        if (self.count - 1) * self.total >= _INT64_LIMIT:
+            raise ValueError(
+                f"validation window index overflows int64 (count={self.count}, total={self.total})"
+            )
 
-    stream = _PreloadedStochasticBatchStream(
-        dataset,
-        batch_size=batch_size,
-        drop_last=bool(drop_last),
-        seed=dataset.seed,
-        epoch_seeded=bool(epoch_seeded),
-    )
+    def __len__(self) -> int:
+        return (self.count + self.batch_size - 1) // self.batch_size
 
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        for b in range(len(self)):
+            k = torch.arange(b * self.batch_size, min((b + 1) * self.batch_size, self.count), dtype=torch.long)
+            i = (k * self.total) // self.count
+            traj = i // self.n_starts
+            start = i % self.n_starts
+            yield self._gather(traj.to(self.device), start.to(self.device))
+
+
+def _wrap_stream(stream: IterableDataset, *, pin_memory: bool) -> DataLoader:
+    """DataLoader over an already-batching stream, in the main process (num_workers=0)."""
     # main.py rejects pin_memory=true with a CUDA preload device before any data is loaded.
     return DataLoader(
         dataset=stream,
@@ -406,3 +397,30 @@ def create_dataloader(
         pin_memory=bool(pin_memory),
         persistent_workers=False,
     )
+
+
+def create_train_dataloader(
+    dataset: FlowMapRolloutDataset,
+    *,
+    batch_size: int,
+    batches_per_epoch: int,
+    seed: int,
+    pin_memory: bool,
+) -> DataLoader:
+    """Training loader: `batches_per_epoch` full random batches per epoch (see the stream class)."""
+    stream = _PreloadedStochasticBatchStream(
+        dataset, batch_size=batch_size, batches_per_epoch=batches_per_epoch, seed=seed
+    )
+    return _wrap_stream(stream, pin_memory=pin_memory)
+
+
+def create_val_dataloader(
+    dataset: FlowMapRolloutDataset,
+    *,
+    batch_size: int,
+    n_windows: int,
+    pin_memory: bool,
+) -> DataLoader:
+    """Validation loader: the fixed window set of size min(n_windows, N * n_starts)."""
+    stream = _PreloadedValidationStream(dataset, batch_size=batch_size, n_windows=n_windows)
+    return _wrap_stream(stream, pin_memory=pin_memory)

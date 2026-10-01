@@ -1,7 +1,8 @@
 {
   "_comment": [
-    "PRODUCTION stage 2 (autoregressive fine-tune) - loads the stage-1 checkpoint",
-    "(EMA weights preferred automatically by the weights_only loader).",
+    "PRODUCTION stage 2 (autoregressive fine-tune) - loads stage-1 best.ckpt (best val_loss,",
+    "published by src/main.py only when stage 1 finished, i.e. wrote COMPLETED; EMA weights",
+    "preferred automatically by the weights_only loader).",
     "Model block is IDENTICAL to stage 1.",
     "Default rollout-gradient mode is full BPTT with uniform per-step weighting",
     "(GraphCast/Stormer/Kelp-2020-aligned; locally tied with detach in E4).",
@@ -18,7 +19,8 @@
     "amp_mode": "true",
     "model_dtype": "float32",
     "input_dtype": "float32",
-    "loss_dtype": "float32"
+    "loss_dtype": "float32",
+    "allow_tf32": true
   },
   "paths": {
     "raw_dir": "../data/raw",
@@ -31,7 +33,7 @@
     "seed": 1234
   },
   "runtime": {
-    "checkpoint": "../models/stage1/checkpoints/last.ckpt",
+    "checkpoint": "../models/stage1/checkpoints/best.ckpt",
     "accelerator": "cuda",
     "devices": 1,
     "strategy": "auto",
@@ -115,7 +117,9 @@
     "num_workers": 16
   },
   "dataset": {
-    "windows_per_trajectory": 92
+    "_comment": "Epoch by count (docs/DECISIONS.md): 93367 = floor(N_train * 92 / 2048) and 23708768 = N_val * 92 for the 4-file build (N_train 2078448, N_val 257704); 92 windows per trajectory inherited.",
+    "train_batches_per_epoch": 93367,
+    "val_samples": 23708768
   },
   "model": {
     "type": "mlp",

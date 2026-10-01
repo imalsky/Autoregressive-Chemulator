@@ -12,7 +12,8 @@
     "amp_mode": "true",
     "model_dtype": "float32",
     "input_dtype": "float32",
-    "loss_dtype": "float32"
+    "loss_dtype": "float32",
+    "allow_tf32": true
   },
   "paths": {
     "raw_dir": "../data/raw",
@@ -111,7 +112,9 @@
     "num_workers": 16
   },
   "dataset": {
-    "windows_per_trajectory": 32
+    "_comment": "Epoch by count (docs/DECISIONS.md): 32475 = floor(N_train * 32 / 2048) and 8246528 = N_val * 32 for the 4-file build (N_train 2078448, N_val 257704); 32 windows per trajectory inherited.",
+    "train_batches_per_epoch": 32475,
+    "val_samples": 8246528
   },
   "model": {
     "type": "mlp",

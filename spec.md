@@ -127,8 +127,8 @@ Audience: Professional collaborators and maintainers
 3. No additional hard acceptance thresholds by species/horizon are required.
 4. No physical-constraint enforcement metrics are required.
 5. Benchmark and VULCAN scripts are diagnostic, not release gates.
-6. For fully synthetic/randomly generated data workflows, stochastic validation window sampling is acceptable.
-7. In that stochastic-validation setting, compare `val_loss` only within the same code/config/seed setup.
+6. Validation scores a fixed window set defined by the processed data and `dataset.val_samples` only (an even subset of the enumerated (trajectory, start) windows, no random draws), so it does not change across epochs, resumes, seeds, batch sizes or preload devices.
+7. `val_loss` is comparable across seeds and batch sizes on the same processed data at equal `rollout_steps` and `skip_steps`; it is not comparable across processed datasets or across those recipe settings.
 
 ## 7. Logging and Outputs
 1. Maintain high-quality operational logging.

@@ -10,17 +10,9 @@ plots/
 logs/*
 logs/
 
-# Exclude older code that I want to keep just in case
-old_code/
-
-old/*
-old/
-
 models/*
 models/
 
-tuning_results/
-test/models/
 *.pt
 *.pt2
 *.ckpt

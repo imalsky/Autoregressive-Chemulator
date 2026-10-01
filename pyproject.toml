@@ -4,9 +4,11 @@ version = "1.7.0"
 description = "Autoregressive flow-map neural emulator for stiff chemical kinetics in exoplanet atmospheres."
 readme = "README.md"
 requires-python = ">=3.12"
+# Minor-series bounds only: requirements.lock (the daw venv freeze, torch 2.8.0+cu126 by wheel URL)
+# is the reproducibility source: uv venv --python 3.12.14 && uv pip sync requirements.lock
 dependencies = [
-    "torch>=2.8.0,<3.0",
-    "lightning>=2.2,<3.0",
+    "torch==2.8.*",
+    "lightning==2.6.*",
     "numpy>=1.26",
     "h5py>=3.10",
     "tqdm>=4.66",
@@ -19,3 +21,9 @@ dev = [
     "pyflakes",
     "vulture",
 ]
+
+# Not an installable package: the code runs from the checkout (src/, processing/, testing/).
+# Without this, a pip/uv build would install src/*.py as bare top-level modules (utils, model, ...).
+[tool.setuptools]
+py-modules = []
+packages = []

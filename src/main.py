@@ -26,6 +26,7 @@ Notes:
 from __future__ import annotations
 
 import fcntl
+import json
 import logging
 import logging.handlers
 import math
@@ -40,19 +41,24 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import torch
 
+import lightning.pytorch as pl
 from lightning.pytorch import seed_everything
+from lightning.pytorch.callbacks.early_stopping import EarlyStoppingReason
 from lightning.pytorch.utilities.exceptions import SIGTERMException
 
-from dataset import FlowMapRolloutDataset, create_dataloader, preload_nbytes
+from dataset import FlowMapRolloutDataset, create_train_dataloader, create_val_dataloader, preload_nbytes
 from model import _REQUIRED_GLOBALS, create_model
-from trainer import FlowMapRolloutModule, build_lightning_trainer
+from trainer import FlowMapRolloutModule, build_lightning_trainer, build_loss_buffers
 from utils import (
     as_bool,
     as_int,
     as_str,
     atomic_write_json,
+    best_effort,
+    collect_provenance,
     dotted_differences,
     ensure_dir,
+    file_sha256,
     is_comment_key,
     load_json_config,
     non_finite_tensor_keys,
@@ -99,6 +105,18 @@ _work_dir_lock_fd: Optional[int] = None
 _CKPT_BYTES_PER_PARAM = 16
 _BYTES_PER_MB = 1e6
 
+# Written (atomically, JSON) only by a run that finished: max_epochs reached, or early stopping
+# with patience exhausted, with a finite last val_loss and best score. run_daw.sh gates on it; a
+# resume refuses a run that has it, and weights_only refuses a source run without it.
+_COMPLETED_NAME = "COMPLETED"
+# One JSON line per invocation (append-only): environment, code, data and init-checkpoint identity.
+_PROVENANCE_NAME = "provenance.jsonl"
+# weights_only: the loaded weights' validation scores before any training (separate Trainer).
+_INIT_VAL_NAME = "init_val.json"
+_VAL_METRICS = ("val_loss", "val_loss_log10_mae", "val_loss_z_mse")
+# The repository checkout that holds this file (git provenance).
+_CODE_DIR = Path(__file__).resolve().parent
+
 def _resolve_config_path() -> Path:
     """Resolve the training config path from the AUTOCHEM_CONFIG_PATH env var.
 
@@ -121,6 +139,7 @@ _REQUIRED_CONFIG_KEYS: Tuple[str, ...] = (
     "precision.model_dtype",
     "precision.input_dtype",
     "precision.loss_dtype",
+    "precision.allow_tf32",
     "paths.raw_dir",
     "paths.processed_dir",
     "paths.work_dir",
@@ -172,7 +191,8 @@ _REQUIRED_CONFIG_KEYS: Tuple[str, ...] = (
     "runtime.torch_compile.compile_open_loop_unroll",
     "data.global_variables",
     "data.species_variables",
-    "dataset.windows_per_trajectory",
+    "dataset.train_batches_per_epoch",
+    "dataset.val_samples",
     "model.type",
     "model.activation",
     "model.dropout",
@@ -249,6 +269,9 @@ _OPEN_MAP_CONFIG_KEYS: Tuple[str, ...] = (
 # opt_float may be null; float_pair is a 2-list of floats. Optional keys are checked when present.
 # (runtime.devices / strategy / accumulate_grad_batches / accelerator: _validate_runtime_constraints.)
 _CONFIG_KEY_KINDS: Dict[str, str] = {
+    "precision.allow_tf32": "bool",
+    "dataset.train_batches_per_epoch": "int",
+    "dataset.val_samples": "int",
     "training.max_epochs": "int",
     "training.rollout_steps": "int",
     "training.autoregressive_training.enabled": "bool",
@@ -453,6 +476,11 @@ def _validate_value_ranges(cfg: Mapping[str, Any]) -> None:
     Each Lightning sentinel has one meaning here: gradient_clip_val null is the only "no clipping";
     max_epochs -1 ("no limit") is unsupported.
     """
+    for key in ("train_batches_per_epoch", "val_samples"):
+        v = require_dict(cfg, "dataset")[key]
+        if v < 1:
+            raise ValueError(f"dataset.{key} must be >= 1, got {v}")
+
     tcfg = require_dict(cfg, "training")
     max_epochs = tcfg["max_epochs"]
     if max_epochs < 1:
@@ -533,22 +561,23 @@ def _validate_cross_key_constraints(cfg: Mapping[str, Any]) -> None:
             )
 
 
-def _apply_compute_globals(cfg: Mapping[str, Any]) -> None:
-    """Set process-wide matmul/TF32 precision flags consistent with runtime.deterministic.
+def _apply_compute_globals(cfg: Mapping[str, Any]) -> bool:
+    """Set the process-wide TF32 flags from precision.allow_tf32; return whether TF32 is on.
 
-    TF32 is forced off under deterministic=True; otherwise the reproducibility contract would
-    be silently broken regardless of Lightning's own deterministic flag.
+    runtime.deterministic=true forces TF32 off whatever allow_tf32 says (a deterministic run is
+    the full-fp32 reproducibility mode). set_float32_matmul_precision also sets cuBLAS's
+    allow_tf32; cuDNN's flag mirrors it.
     """
-    runtime = require_dict(cfg, "runtime")
-    deterministic = as_bool(require(runtime, "deterministic"), "runtime.deterministic")
-    if deterministic:
-        torch.set_float32_matmul_precision("highest")
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
-    else:
-        torch.set_float32_matmul_precision("high")
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+    allow_tf32 = as_bool(require(require_dict(cfg, "precision"), "allow_tf32"), "precision.allow_tf32")
+    deterministic = as_bool(require(require_dict(cfg, "runtime"), "deterministic"), "runtime.deterministic")
+    tf32 = allow_tf32 and not deterministic
+    torch.set_float32_matmul_precision("high" if tf32 else "highest")
+    torch.backends.cudnn.allow_tf32 = tf32
+    log.info(
+        "TF32 %s (precision.allow_tf32=%s, runtime.deterministic=%s): float32 matmul precision %r",
+        "on" if tf32 else "off", allow_tf32, deterministic, torch.get_float32_matmul_precision(),
+    )
+    return tf32
 
 
 def _config_dir(cfg_path: Path) -> Path:
@@ -877,12 +906,18 @@ def create_dataloaders(
     preload_device: torch.device,
     seed: int,
 ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
-    """Build train/val dataloaders (strict), after the preload memory budget check."""
+    """Build train/val dataloaders (strict), after the preload memory budget check.
+
+    The epoch is defined by counts, not by the data size: dataset.train_batches_per_epoch random
+    training batches, and validation on the fixed set of dataset.val_samples windows (all windows
+    when the split holds fewer).
+    """
     paths = require_dict(cfg, "paths")
     processed_dir = Path(as_str(require(paths, "processed_dir"), "paths.processed_dir")).expanduser().resolve()
 
     ds_cfg = require_dict(cfg, "dataset")
-    windows_per_traj = as_int(require(ds_cfg, "windows_per_trajectory"), "dataset.windows_per_trajectory")
+    train_batches = as_int(require(ds_cfg, "train_batches_per_epoch"), "dataset.train_batches_per_epoch")
+    val_samples = as_int(require(ds_cfg, "val_samples"), "dataset.val_samples")
 
     batch_size = as_int(require(tcfg, "batch_size"), "training.batch_size")
     pin_memory = as_bool(require(tcfg, "pin_memory"), "training.pin_memory")
@@ -897,20 +932,45 @@ def create_dataloaders(
 
     # Every split is preloaded (single-process batch stream) as float32 tensors (the shard
     # dtype) on the preload device.
-    common_ds_kwargs = dict(
-        windows_per_trajectory=windows_per_traj,
-        device=preload_device,
+    train_ds = FlowMapRolloutDataset(processed_dir, "train", total_steps=k_train, device=preload_device)
+    val_ds = FlowMapRolloutDataset(processed_dir, "validation", total_steps=k_eval, device=preload_device)
+
+    # The training stream is reseeded per epoch (resume-safe); validation uses no generator.
+    train_dl = create_train_dataloader(
+        train_ds, batch_size=batch_size, batches_per_epoch=train_batches, seed=seed, pin_memory=pin_memory
     )
+    val_dl = create_val_dataloader(val_ds, batch_size=batch_size, n_windows=val_samples, pin_memory=pin_memory)
 
-    train_ds = FlowMapRolloutDataset(processed_dir, "train", total_steps=k_train, seed=seed, **common_ds_kwargs)
-    val_ds = FlowMapRolloutDataset(processed_dir, "validation", total_steps=k_eval, seed=seed + 1, **common_ds_kwargs)
-
-    # The training stream is reseeded per epoch (resume-safe); validation keeps one continuing stream.
-    train_dl = create_dataloader(train_ds, batch_size=batch_size, pin_memory=pin_memory, drop_last=True, epoch_seeded=True)
-    val_dl = create_dataloader(val_ds, batch_size=batch_size, pin_memory=pin_memory, drop_last=False, epoch_seeded=False)
-
-    log.info("Dataloaders: train(K=%d) val(K=%d)", k_train, k_eval)
+    val_stream = val_dl.dataset
+    log.info(
+        "Dataloaders: train(K=%d) %d trajectories, %d batches of %d per epoch (windows drawn with "
+        "replacement); val(K=%d) %d of %d enumerated windows (%d trajectories x %d starts), %d batches",
+        k_train, train_ds._total_traj, train_batches, batch_size,
+        k_eval, val_stream.count, val_stream.total, val_ds._total_traj, val_stream.n_starts, len(val_dl),
+    )
     return train_dl, val_dl
+
+
+def _log_schedule_in_steps(cfg: Mapping[str, Any], *, steps_per_epoch: int) -> None:
+    """Log the epoch-denominated schedule lengths in optimizer steps (one step per training batch)."""
+    t = cfg["training"]
+    run_steps = steps_per_epoch * int(t["max_epochs"])
+    parts = [f"{steps_per_epoch} optimizer steps per epoch, up to {run_steps} per run"]
+    sched = t["scheduler"]
+    if sched["enabled"]:
+        parts.append(f"LR warmup {int(sched['warmup_epochs']) * steps_per_epoch}")
+        parts.append(f"plateau patience {int(sched['patience']) * steps_per_epoch}")
+    if t["early_stopping"]["enabled"]:
+        parts.append(f"early-stopping patience {int(t['early_stopping']['patience']) * steps_per_epoch}")
+    if t["curriculum"]["enabled"]:
+        parts.append(f"curriculum ramp {int(t['curriculum']['ramp_epochs']) * steps_per_epoch}")
+    if t["ema"]["enabled"]:
+        horizon = 1.0 / (1.0 - float(t["ema"]["decay"]))
+        parts.append(
+            f"EMA horizon 1/(1-decay) = {horizon:.0f} steps ({horizon / steps_per_epoch:.3g} epochs, "
+            f"{horizon / run_steps:.3g} of the run)"
+        )
+    log.info("schedule in optimizer steps: %s", "; ".join(parts))
 
 
 # ==============================================================================
@@ -921,14 +981,23 @@ def create_dataloaders(
 def _load_weights_only(module: FlowMapRolloutModule, ckpt_path: Path) -> None:
     """Load Lightning checkpoint weights only (no optimizer/scheduler state), strictly.
 
-    Uses ``ema_state_dict`` (saved by EMACallback), which holds the smoothed weights that
-    produced the checkpoint's val_loss; it is required when the checkpoint's own run had EMA
-    enabled. The checkpoint's saved model block must equal this run's (comment keys ignored),
-    every floating tensor must be finite, and any missing or unexpected key makes
-    load_state_dict raise.
+    The source run must be finished (its work_dir holds COMPLETED: best.ckpt of a run that is
+    still being extended is not a handoff), and the checkpoint must have been trained in this
+    processed_dir's normalization (norm_sha256). Uses ``ema_state_dict`` (saved by EMACallback),
+    which holds the smoothed weights that produced the checkpoint's val_loss; it is required when
+    the checkpoint's own run had EMA enabled. The checkpoint's saved model block must equal this
+    run's (comment keys ignored), every floating tensor must be finite, and any missing or
+    unexpected key makes load_state_dict raise. The loss statistics (criterion buffers) are then
+    rebuilt from this run's manifest, never taken from the checkpoint.
     """
     if not ckpt_path.exists():
         raise FileNotFoundError("ckpt not found")
+    source_run = ckpt_path.resolve().parent.parent
+    if not (source_run / _COMPLETED_NAME).is_file():
+        raise FileNotFoundError(
+            f"weights_only source run {source_run} has no {_COMPLETED_NAME} marker: it did not finish "
+            f"(or is being extended), so {ckpt_path.name} is not a final handoff checkpoint"
+        )
 
     obj = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
     if not isinstance(obj, dict) or "state_dict" not in obj:
@@ -936,6 +1005,12 @@ def _load_weights_only(module: FlowMapRolloutModule, ckpt_path: Path) -> None:
     hparams = obj.get("hyper_parameters")
     if not isinstance(hparams, Mapping) or "training" not in hparams:
         raise KeyError(f"checkpoint has no hyper_parameters['training'] block: {ckpt_path}")
+    if hparams.get("norm_sha256") != module.hparams["norm_sha256"]:
+        raise ValueError(
+            f"checkpoint {ckpt_path} norm_sha256={hparams.get('norm_sha256')!r} does not match this "
+            f"processed_dir's normalization.json ({module.hparams['norm_sha256']}): it was trained on other "
+            "normalization statistics (or before the fingerprint existed)"
+        )
     require_same_model_block(hparams.get("model"), module.hparams["model"], source=str(ckpt_path))
 
     if "ema_state_dict" in obj:
@@ -953,7 +1028,49 @@ def _load_weights_only(module: FlowMapRolloutModule, ckpt_path: Path) -> None:
         raise ValueError(f"checkpoint {ckpt_path} has non-finite weights: {bad[:3]}")
 
     module.load_state_dict(state_dict, strict=True)
-    log.info("weights_only: loaded %s from %s", source, ckpt_path)
+    log_means, log_stds = build_loss_buffers(
+        module.normalization_manifest, module.species_variables, device=torch.device("cpu"), dtype=module.loss_dtype
+    )
+    with torch.no_grad():
+        module.criterion.log_means.copy_(log_means)
+        module.criterion.log_stds.copy_(log_stds)
+    log.info("weights_only: loaded %s from %s (loss statistics from this run's manifest)", source, ckpt_path)
+
+
+def _validate_init_weights(
+    module: FlowMapRolloutModule,
+    val_dl: torch.utils.data.DataLoader,
+    *,
+    cfg: Mapping[str, Any],
+    lightning_precision: str,
+    work_dir: Path,
+    ckpt_path: Path,
+) -> None:
+    """weights_only: score the loaded weights once on the validation set before training.
+
+    A separate logger-free Trainer, so the value stays out of metrics.csv and the ES/checkpoint
+    state; inference_mode=False keeps fit-time validation's no_grad mode, so a compiled step
+    reuses the validation graph. Written to work_dir/init_val.json.
+    """
+    runtime = cfg["runtime"]
+    val_trainer = pl.Trainer(
+        accelerator=runtime["accelerator"],
+        devices=1,
+        precision=lightning_precision,
+        deterministic=bool(runtime["deterministic"]),
+        logger=False,
+        callbacks=[],
+        enable_checkpointing=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+        inference_mode=False,
+        default_root_dir=str(work_dir),
+    )
+    out = val_trainer.validate(module, dataloaders=val_dl, verbose=False)
+    metrics = {k: float(out[0][k]) for k in _VAL_METRICS}
+    atomic_write_json(work_dir / _INIT_VAL_NAME, {"checkpoint": str(ckpt_path), **metrics})
+    log.info("weights_only: loaded weights before training: %s (%s)",
+             ", ".join(f"{k}={v:.6g}" for k, v in metrics.items()), _INIT_VAL_NAME)
 
 
 def _log_keep_all_checkpoints_estimate(cfg: Mapping[str, Any], total_params: int) -> None:
@@ -1001,6 +1118,37 @@ def _check_resume_checkpoint(ckpt_path: Path, work_dir: Path, *, checkpointing: 
             )
 
 
+def _check_resume_not_finished(ckpt_path: Path, work_dir: Path, *, max_epochs: int) -> None:
+    """A resume must not extend a finished run by accident (it would rewrite its checkpoints).
+
+    Refuses when work_dir holds COMPLETED, or when the checkpoint itself is from a finished run
+    (last epoch of max_epochs, or early stopping already stopped it): the second case covers a
+    run that ended before COMPLETED was written.
+    """
+    marker = work_dir / _COMPLETED_NAME
+    if marker.exists():
+        raise RuntimeError(
+            f"this run finished ({marker} exists); a resume would extend it and rewrite its checkpoints. "
+            f"To extend it deliberately, delete {marker} and raise training.max_epochs"
+        )
+    obj = torch.load(str(ckpt_path), map_location="cpu", weights_only=True, mmap=True)
+    epoch = obj.get("epoch") if isinstance(obj, dict) else None
+    if isinstance(epoch, int) and epoch + 1 >= max_epochs:
+        raise RuntimeError(
+            f"resume checkpoint {ckpt_path} is from epoch {epoch}, the last of training.max_epochs={max_epochs}: "
+            "the run already finished; raise training.max_epochs to extend it deliberately"
+        )
+    for key, state in ((obj.get("callbacks") or {}) if isinstance(obj, dict) else {}).items():
+        if "EarlyStopping" in str(key) and isinstance(state, Mapping):
+            reason = state.get("stopping_reason", EarlyStoppingReason.NOT_STOPPED.value)
+            if reason != EarlyStoppingReason.NOT_STOPPED.value:
+                raise RuntimeError(
+                    f"resume checkpoint {ckpt_path}: early stopping already stopped this run "
+                    f"({state.get('stopping_reason_message')!r}); start a new run with "
+                    "training.checkpoint_mode='weights_only' instead"
+                )
+
+
 def _check_resume_config(cfg: Mapping[str, Any], work_dir: Path) -> None:
     """A resume must use the run's own config: compare with config.resolved.json (comment keys ignored)."""
     snapshot = work_dir / "config.resolved.json"
@@ -1028,6 +1176,71 @@ def _next_free_path(work_dir: Path, stem: str, suffix: str) -> Path:
     return dst
 
 
+def _init_checkpoint_record(ckpt_path: Optional[Path]) -> Any:
+    """Identity of the checkpoint a run starts from: path, sha256, epoch/step, optimizer LR, val_loss scores."""
+    if ckpt_path is None:
+        return None
+    rec: Dict[str, Any] = {"path": str(ckpt_path), "sha256": file_sha256(ckpt_path)}
+    obj = torch.load(str(ckpt_path), map_location="cpu", weights_only=True, mmap=True)
+    rec["epoch"] = obj.get("epoch")
+    rec["global_step"] = obj.get("global_step")
+    opt_states = obj.get("optimizer_states") or []
+    rec["optimizer_lr"] = [float(g["lr"]) for g in opt_states[0]["param_groups"]] if opt_states else None
+    for key, state in (obj.get("callbacks") or {}).items():
+        if str(key).startswith("ModelCheckpoint") and "'monitor': 'val_loss'" in str(key):
+            for name in ("current_score", "best_model_score"):
+                v = state.get(name)
+                rec[f"val_loss_{name}"] = float(v) if v is not None else None
+    del obj
+    return rec
+
+
+def _append_provenance(work_dir: Path, record: Mapping[str, Any]) -> None:
+    """Append one JSON line to work_dir/provenance.jsonl (fsynced)."""
+    with open(work_dir / _PROVENANCE_NAME, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _completion(trainer: pl.Trainer, *, ckpt_enabled: bool) -> Dict[str, Any]:
+    """The COMPLETED record of a run that finished, or raise (no best.ckpt, no marker, exit 1).
+
+    Finished = max_epochs reached, or early stopping with patience exhausted (stopping_reason is
+    restored from the checkpoint and never reset, so it counts only with trainer.should_stop),
+    with a finite last val_loss and a finite best score.
+    """
+    es = [c for c in trainer.callbacks if isinstance(c, pl.callbacks.EarlyStopping)]
+    if trainer.should_stop and es and es[0].stopping_reason == EarlyStoppingReason.PATIENCE_EXHAUSTED:
+        stop_reason = "early_stopping"
+    elif trainer.current_epoch >= trainer.max_epochs:
+        stop_reason = "max_epochs"
+    else:
+        raise RuntimeError(
+            f"training stopped at epoch {trainer.current_epoch} of max_epochs={trainer.max_epochs} without "
+            "early stopping (interrupted?); not publishing best.ckpt or COMPLETED; resume from last.ckpt"
+        )
+    last = trainer.callback_metrics.get("val_loss")
+    if last is None or not math.isfinite(float(last)):
+        raise RuntimeError(f"last val_loss is {last!r}; not publishing best.ckpt or COMPLETED")
+    rec: Dict[str, Any] = {
+        "stop_reason": stop_reason,
+        "epochs": int(trainer.current_epoch),
+        "global_step": int(trainer.global_step),
+        "last_val_loss": float(last),
+        "best": None,
+    }
+    if ckpt_enabled:
+        top_k = [c for c in trainer.checkpoint_callbacks if getattr(c, "monitor", None) == "val_loss"]
+        if len(top_k) != 1:
+            raise RuntimeError(f"expected exactly one val_loss ModelCheckpoint callback, found {len(top_k)}")
+        score = top_k[0].best_model_score
+        if score is None or not math.isfinite(float(score)):
+            raise RuntimeError(f"best val_loss score is {score!r}; not publishing best.ckpt or COMPLETED")
+        rec["best"] = {"source": str(top_k[0].best_model_path or ""), "val_loss": float(score)}
+    return rec
+
+
 def main() -> None:
     """Entry point: load + validate the config, build datasets/model, and run Lightning training.
 
@@ -1047,7 +1260,7 @@ def main() -> None:
 
     cfg = resolve_paths(cfg, cfg_path)
     configure_logging(cfg)
-    _apply_compute_globals(cfg)
+    tf32 = _apply_compute_globals(cfg)
 
     # Required top-level sections (strict).
     tcfg = require_dict(cfg, "training")
@@ -1140,6 +1353,7 @@ def main() -> None:
             )
     else:
         # A resume continues this run: its own checkpoint, its own ModelCheckpoint state, its own config.
+        _check_resume_not_finished(ckpt_path, work_dir, max_epochs=as_int(tcfg["max_epochs"], "training.max_epochs"))
         _check_resume_checkpoint(ckpt_path, work_dir, checkpointing=ckpt_enabled)
         _check_resume_config(cfg, work_dir)
     _attach_run_log(work_dir)
@@ -1155,10 +1369,8 @@ def main() -> None:
         preload_device=preload_device,
         seed=seed,
     )
-    try:
-        train_batches_per_epoch: Optional[int] = len(train_dl)
-    except TypeError:
-        train_batches_per_epoch = None
+    train_batches_per_epoch = len(train_dl)
+    _log_schedule_in_steps(cfg, steps_per_epoch=train_batches_per_epoch)
 
     # On resume runs, preserve any existing metrics.csv before Lightning touches it.
     # (Non-resume modes require an empty work_dir, so nothing can exist yet.)
@@ -1183,6 +1395,25 @@ def main() -> None:
         snapshot_path = work_dir / "config.resolved.json"
     atomic_write_json(snapshot_path, _portable_config_snapshot(cfg, save_dir=work_dir))
 
+    # One provenance line per invocation, before fit (a resume rewrites last.ckpt during fit).
+    _append_provenance(work_dir, collect_provenance(
+        _CODE_DIR,
+        autochem_config_path=os.environ.get("AUTOCHEM_CONFIG_PATH"),
+        config_snapshot=snapshot_path.name,
+        config_snapshot_sha256=file_sha256(snapshot_path),
+        checkpoint_mode=ckpt_mode,
+        init_checkpoint=best_effort(lambda: _init_checkpoint_record(ckpt_path)),
+        processed_dir=str(processed_dir),
+        norm_sha256=lit_module.hparams["norm_sha256"],
+        tf32=tf32,
+    ))
+
+    if ckpt_mode == "weights_only":
+        _validate_init_weights(
+            lit_module, val_dl, cfg=cfg, lightning_precision=prec.lightning_precision,
+            work_dir=work_dir, ckpt_path=ckpt_path,
+        )
+
     trainer.fit(
         lit_module,
         train_dataloaders=train_dl,
@@ -1194,13 +1425,13 @@ def main() -> None:
     if metrics_part is not None and not (work_dir / "metrics.csv").exists():
         metrics_part.replace(work_dir / "metrics.csv")
 
+    # Only a finished run publishes best.ckpt and COMPLETED (decided first; otherwise exit 1).
+    completed = _completion(trainer, ckpt_enabled=ckpt_enabled)
+
     # Publish the best-val_loss checkpoint under a stable name for export tooling
     # (testing/export.py, testing/aoti_export.py consume checkpoints/best.ckpt).
     if ckpt_enabled and trainer.is_global_zero:
-        top_k = [c for c in trainer.checkpoint_callbacks if getattr(c, "monitor", None) == "val_loss"]
-        if len(top_k) != 1:
-            raise RuntimeError(f"expected exactly one val_loss ModelCheckpoint callback, found {len(top_k)}")
-        best_src = str(top_k[0].best_model_path or "").strip()
+        best_src = completed["best"]["source"].strip()
         if not best_src:
             raise RuntimeError(
                 "checkpointing enabled but ModelCheckpoint.best_model_path is empty; "
@@ -1219,7 +1450,10 @@ def main() -> None:
         tmp = dst.parent / (dst.name + ".tmp")
         shutil.copy2(best_path, tmp)
         tmp.replace(dst)
+        completed["best"]["sha256"] = file_sha256(dst)
         log.info("best checkpoint (val_loss): %s -> %s", best_path, dst)
+    atomic_write_json(work_dir / _COMPLETED_NAME, completed)
+    log.info("run finished (%s after %d epochs): wrote %s", completed["stop_reason"], completed["epochs"], _COMPLETED_NAME)
 
 
 if __name__ == "__main__":

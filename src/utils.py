@@ -9,6 +9,8 @@ Included helpers:
   - load_json_config: strict JSON load (no duplicate keys, no NaN/Infinity) with helpful errors
   - atomic_write_json: write JSON safely (write temp + atomic rename)
   - comment keys, dotted flattening and the model-block check shared by main.py and export.py
+  - normalization_sha256: the fingerprint that ties a checkpoint or export to its normalization
+  - file_sha256, git_state, collect_provenance: best-effort run and export provenance
   - PrecisionConfig / parse_precision_config: central dtype configuration for training
 
 Note:
@@ -17,12 +19,19 @@ Note:
 
 from __future__ import annotations
 
+import datetime
+import hashlib
+import importlib.metadata
 import json
 import math
 import os
+import platform
+import socket
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Union
 
 import torch
 
@@ -30,6 +39,23 @@ import torch
 # '_'-prefixed key is an unknown key, so a commented-out option cannot silently fall back
 # to its default.
 COMMENT_KEY_PREFIX = "_comment"
+
+# The normalization.json keys that define the z-space a model is trained in (the transforms and
+# their statistics). Their canonical-JSON sha256 is the normalization fingerprint; additive
+# descriptive manifest keys (units, coverage, ...) do not change it.
+NORM_FINGERPRINT_KEYS = (
+    "normalization_methods",
+    "per_key_stats",
+    "epsilon",
+    "min_std",
+    "dt",
+    "species_variables",
+    "global_variables",
+)
+# Streamed hashing of checkpoints / artifacts (bytes per read).
+_HASH_CHUNK_BYTES = 1 << 20
+# A provenance subprocess (git, nvidia-smi) that takes longer than this is recorded as an error.
+_PROVENANCE_SUBPROCESS_TIMEOUT_S = 10.0
 
 
 def ensure_dir(path: Union[str, os.PathLike]) -> Path:
@@ -131,6 +157,107 @@ def require_same_model_block(saved: Any, expected: Mapping[str, Any], *, source:
     return strip_comment_keys(saved)
 
 
+def normalization_sha256(manifest: Mapping[str, Any]) -> str:
+    """sha256 of the canonical JSON (sorted keys, compact) of the manifest's NORM_FINGERPRINT_KEYS."""
+    missing = [k for k in NORM_FINGERPRINT_KEYS if k not in manifest]
+    if missing:
+        raise KeyError(f"normalization manifest missing {missing}")
+    sub = {k: manifest[k] for k in NORM_FINGERPRINT_KEYS}
+    blob = json.dumps(sub, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def file_sha256(path: Union[str, os.PathLike]) -> str:
+    """Streamed sha256 of a file's bytes."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(_HASH_CHUNK_BYTES), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def best_effort(fn: Callable[[], Any]) -> Any:
+    """fn(), or an 'error: ...' string: provenance must never stop a run."""
+    try:
+        return fn()
+    except Exception as e:  # noqa: BLE001 - recorded, not raised
+        return f"error: {type(e).__name__}: {e}"
+
+
+def _run(cmd: List[str], *, cwd: Optional[Path] = None) -> bytes:
+    """stdout of a read-only subprocess (raises on failure or after the provenance timeout)."""
+    return subprocess.run(
+        cmd, cwd=cwd, check=True, capture_output=True, timeout=_PROVENANCE_SUBPROCESS_TIMEOUT_S
+    ).stdout
+
+
+def git_state(code_dir: Path) -> Dict[str, Any]:
+    """Best-effort git HEAD, dirty flag and sha256 of `git diff HEAD` for the checkout holding code_dir.
+
+    Untracked files do not count as dirty (--untracked-files=no). --no-optional-locks keeps the
+    status read-only (no index.lock). Outside a checkout every field is an error string.
+    """
+    def head() -> str:
+        return _run(["git", "-C", str(code_dir), "rev-parse", "HEAD"]).decode().strip()
+
+    def dirty() -> bool:
+        out = _run(["git", "-C", str(code_dir), "--no-optional-locks", "status", "--porcelain", "--untracked-files=no"])
+        return bool(out.strip())
+
+    def diff_sha() -> str:
+        return hashlib.sha256(_run(["git", "-C", str(code_dir), "--no-optional-locks", "diff", "HEAD"])).hexdigest()
+
+    return {"head": best_effort(head), "dirty": best_effort(dirty), "diff_sha256": best_effort(diff_sha)}
+
+
+def _package_versions() -> Dict[str, Any]:
+    """Installed versions of the packages training depends on."""
+    return {
+        name: best_effort(lambda name=name: importlib.metadata.version(name))
+        for name in ("torch", "lightning", "numpy")
+    }
+
+
+def _gpu_info() -> Any:
+    """Name, UUID and driver of the visible CUDA device 0 (None without CUDA)."""
+    if not torch.cuda.is_available():
+        return None
+    props = torch.cuda.get_device_properties(0)
+    uuid = str(props.uuid)
+    driver = best_effort(lambda: _run(
+        ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader", f"--id=GPU-{uuid}"]
+    ).decode().strip())
+    return {"name": props.name, "uuid": f"GPU-{uuid}", "driver": driver}
+
+
+def collect_provenance(code_dir: Path, **fields: Any) -> Dict[str, Any]:
+    """One best-effort environment record (every field an error string on failure), plus `fields`.
+
+    Records time, git state of code_dir's checkout, python/package versions, CUDA/cuDNN, the GPU,
+    host, CUDA_VISIBLE_DEVICES, CPU affinity, thread settings and the effective float32 matmul
+    precision of this process.
+    """
+    rec: Dict[str, Any] = {
+        "utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "git": git_state(code_dir),
+        "python": sys.version.split()[0],
+        "packages": _package_versions(),
+        "torch_cuda": torch.version.cuda,
+        "cudnn": best_effort(lambda: torch.backends.cudnn.version()),
+        "gpu": best_effort(_gpu_info),
+        "hostname": best_effort(socket.gethostname),
+        "platform_machine": platform.machine(),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "cpu_affinity": best_effort(lambda: sorted(os.sched_getaffinity(0))),
+        "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
+        "torch_num_threads": torch.get_num_threads(),
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
+    }
+    rec.update(fields)
+    return rec
+
+
 def non_finite_tensor_keys(state: Mapping[str, Any]) -> List[str]:
     """Keys of floating tensors in a state dict that hold NaN or Inf."""
     return [
@@ -139,7 +266,7 @@ def non_finite_tensor_keys(state: Mapping[str, Any]) -> List[str]:
     ]
 
 
-def _fsync_dir_best_effort(directory: Path) -> None:
+def _fsync_dirbest_effort(directory: Path) -> None:
     """Best-effort fsync of a directory entry (helps durability after rename)."""
     flags = getattr(os, "O_DIRECTORY", 0)
     try:
@@ -173,7 +300,7 @@ def atomic_write_json(path: Union[str, os.PathLike], obj: Any, *, indent: int = 
 
         # Atomic on POSIX when src/dst are on same filesystem.
         os.replace(tmp, out_path)
-        _fsync_dir_best_effort(out_path.parent)
+        _fsync_dirbest_effort(out_path.parent)
 
     finally:
         # If anything failed before os.replace, clean up the temp file.
