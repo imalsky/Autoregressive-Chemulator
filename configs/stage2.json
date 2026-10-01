@@ -54,8 +54,7 @@
       "mode": "default",
       "dynamic": false,
       "fullgraph": true,
-      "compile_forward_step": true,
-      "compile_open_loop_unroll": false
+      "compile_forward_step": true
     }
   },
   "data": {

@@ -631,8 +631,8 @@ def flush_shard(
 ) -> Tuple[int, int]:
     """Stack the buffered samples and write one NPZ shard; return (next_idx, n_written).
 
-    The `_physical` suffix selects the physical schema (y_mat/globals/dt_mat); otherwise
-    the normalized schema (y_mat/globals/dt_norm_mat) is written. Empty buffers no-op.
+    Always the physical schema (y_mat/globals/dt_mat): both callers pass suffix="_physical", and
+    the normalized shards are written by the normalization pass. Empty buffers no-op.
 
     `name_prefix` namespaces the shard filename so that the parallel per-file workers
     write non-colliding paths (e.g. ``shard_f0007_000003_physical.npz``). Downstream
@@ -651,10 +651,7 @@ def flush_shard(
 
     shard_path = split_dir / f"{name_prefix}_{shard_idx:06d}{suffix}.npz"
 
-    if suffix.endswith("_physical"):
-        np.savez(shard_path, y_mat=y_mat, globals=g_mat, dt_mat=dt_mat)
-    else:
-        np.savez(shard_path, y_mat=y_mat, globals=g_mat, dt_norm_mat=dt_mat)
+    np.savez(shard_path, y_mat=y_mat, globals=g_mat, dt_mat=dt_mat)
 
     return shard_idx + 1, int(y_mat.shape[0])
 
@@ -726,11 +723,11 @@ def pick_t_start(
     With t_min = 0 (both production configs) the valid window spans every positive raw time,
     so the anchor and any draw in [t_lo, t_hi) fit on the first try: the retry budget
     (preprocessing.max_chunk_attempts_per_source) only matters when t_min > 0.
+
+    Both callers (sample_file, processing/testing.py) reject groups with fewer than 2 positive
+    times first, so t_raw has a positive entry here.
     """
     pos = t_raw > 0
-    if not np.any(pos):
-        return None
-
     first_pos_time = float(t_raw[pos][0])
     t_lo = max(float(t_min), first_pos_time)
 
@@ -1300,9 +1297,7 @@ class RunningMeanVar:
     def update(self, x: np.ndarray) -> None:
         """Fold a batch of rows into the running mean/M2 via the parallel Welford merge."""
         x2 = x.reshape(-1, self.dim).astype(np.float64, copy=False)
-        m = int(x2.shape[0])
-        if m == 0:
-            return
+        m = int(x2.shape[0])  # >= 1: flush_shard never writes an empty shard
 
         b_mean = np.mean(x2, axis=0)
         b_M2 = np.sum((x2 - b_mean) ** 2, axis=0)
@@ -1692,10 +1687,7 @@ def write_summary(
     cfg_serialized: Dict[str, Any] = {}
     for k, v in cfg.__dict__.items():
         if isinstance(v, Path):
-            try:
-                cfg_serialized[k] = os.path.relpath(str(v.resolve()), str(base))
-            except Exception:
-                cfg_serialized[k] = str(v)
+            cfg_serialized[k] = os.path.relpath(str(v.resolve()), str(base))
         else:
             cfg_serialized[k] = v
 

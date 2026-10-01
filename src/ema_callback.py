@@ -41,7 +41,7 @@ class EMACallback(pl.Callback):
     """Maintain EMA-of-weights and swap them into the module for validation/checkpointing."""
 
     def __init__(self, *, decay: float) -> None:
-        """Store the EMA decay (must be in (0, 1)); the shadow is initialized lazily."""
+        """Store the EMA decay (must be in (0, 1)); the shadow is created in setup()."""
         super().__init__()
         if not (0.0 < decay < 1.0):
             raise ValueError(f"EMA decay must be in (0,1), got {decay}")
@@ -56,7 +56,10 @@ class EMACallback(pl.Callback):
         self._cache = None
 
     def setup(self, trainer: pl.Trainer, pl_module: pl.LightningModule, stage: str) -> None:
-        """Create the EMA shadow at fit setup if it was not restored from a checkpoint."""
+        """Create the EMA shadow from the module.
+
+        A resume replaces it in on_load_checkpoint, which Lightning runs after setup().
+        """
         if self.ema_sd is None:
             self._init_ema_from_module(pl_module)
 
@@ -65,8 +68,6 @@ class EMACallback(pl.Callback):
         # Lightning's strategy moves the module to the accelerator AFTER Callback.setup()
         # runs, so the shadow cloned in setup() can live on CPU while the live module is
         # on GPU. Migrate the shadow now that the module is on its final device.
-        if self.ema_sd is None:
-            return
         target = next(pl_module.parameters()).device
         for k, v in list(self.ema_sd.items()):
             if v.device != target:
@@ -83,14 +84,8 @@ class EMACallback(pl.Callback):
         _batch_idx: int,
     ) -> None:
         """Update the EMA shadow weights after every training batch."""
-        if self.ema_sd is None:
-            self._init_ema_from_module(pl_module)
-            return
         if self._cache is None:
             live = pl_module.state_dict(keep_vars=True)  # live Parameter/buffer objects
-            for k, v in list(self.ema_sd.items()):
-                if v.device != live[k].device:
-                    self.ema_sd[k] = v.to(live[k].device)
             groups, other, size = [], [], 0
             for k, ema_t in self.ema_sd.items():
                 # Only parameters are averaged. Buffers (loss statistics, Fourier frequencies, any
@@ -116,15 +111,11 @@ class EMACallback(pl.Callback):
 
     def on_validation_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         """Stash live weights and load the EMA weights so val_loss reflects EMA performance."""
-        if self.ema_sd is None:
-            return
         self._stash = {k: v.detach().clone() for k, v in pl_module.state_dict().items()}
         pl_module.load_state_dict(self.ema_sd, strict=True)
 
     def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         """Restore the stashed live weights after validation."""
-        if self._stash is None:
-            return
         pl_module.load_state_dict(self._stash, strict=True)
         self._stash = None
 
@@ -135,8 +126,7 @@ class EMACallback(pl.Callback):
         checkpoint: Dict[str, Any],
     ) -> None:
         """Serialize the EMA shadow into the checkpoint under 'ema_state_dict'."""
-        if self.ema_sd is not None:
-            checkpoint["ema_state_dict"] = {k: v.detach().clone() for k, v in self.ema_sd.items()}
+        checkpoint["ema_state_dict"] = {k: v.detach().clone() for k, v in self.ema_sd.items()}
 
     def on_load_checkpoint(
         self,

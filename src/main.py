@@ -203,7 +203,6 @@ _REQUIRED_CONFIG_KEYS: Tuple[str, ...] = (
     "runtime.torch_compile.dynamic",
     "runtime.torch_compile.fullgraph",
     "runtime.torch_compile.compile_forward_step",
-    "runtime.torch_compile.compile_open_loop_unroll",
     "data.global_variables",
     "data.species_variables",
     "dataset.train_batches_per_epoch",
@@ -331,7 +330,6 @@ _CONFIG_KEY_KINDS: Dict[str, str] = {
     "runtime.torch_compile.dynamic": "bool",
     "runtime.torch_compile.fullgraph": "bool",
     "runtime.torch_compile.compile_forward_step": "bool",
-    "runtime.torch_compile.compile_open_loop_unroll": "bool",
 }
 
 # Explicit devices only: Lightning's "gpu" alias tries MPS first and "auto" falls back to CPU
@@ -605,15 +603,11 @@ def _resolve_path(root: Path, p: str) -> str:
 def _to_relative_path_str(p: str, *, start: Path) -> str:
     """
     Persist path-like config fields as relative to `start` for portability.
+
+    Called only on resolve_paths output, so `p` is absolute.
     """
     pth = Path(str(p).strip()).expanduser()
-    if not pth.is_absolute():
-        return str(pth)
-    try:
-        return os.path.relpath(str(pth.resolve()), str(start.resolve()))
-    except ValueError:
-        # os.path.relpath raises ValueError only for cross-drive paths on Windows.
-        return str(pth)
+    return os.path.relpath(str(pth.resolve()), str(start.resolve()))
 
 
 def _portable_config_snapshot(cfg: Mapping[str, Any], *, save_dir: Path) -> Dict[str, Any]:

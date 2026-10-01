@@ -47,8 +47,7 @@
       "mode": "reduce-overhead",
       "dynamic": false,
       "fullgraph": true,
-      "compile_forward_step": true,
-      "compile_open_loop_unroll": true
+      "compile_forward_step": true
     }
   },
   "data": {

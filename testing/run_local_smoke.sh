@@ -33,9 +33,9 @@ esac
 [ -n "${OMP_NUM_THREADS:-}" ] || { echo "ERROR: OMP_NUM_THREADS is not set; run: bash run_daw.sh smoke" >&2; exit 1; }
 
 SCRATCH="smoke_scratch"
-# Stage-2 forward_step graph variants recorded by the latest compile gate (audit T7, 2026-09-30:
-# train/no-grad x full/ragged batch, incl. the weights_only init validation); a fullgraph compile
-# hard-fails at the 9th variant (recompile limit 8).
+# Stage-2 forward_step graph variants recorded by the latest compile gate (audit T7, 2026-09-30;
+# unchanged in the T9 re-run, 2026-10-01: train/no-grad x full/ragged batch, incl. the weights_only
+# init validation); a fullgraph compile hard-fails at the 9th variant (recompile limit 8).
 GATE_S2_FORWARD_STEP_VARIANTS=4
 SMOKE_TORCH_LOGS="recompiles,dynamo"  # dynamo: one "start tracing <fn>" line per compiled variant
 

@@ -205,11 +205,8 @@ def _resolve_path_like(raw: str, *, base: Path) -> Path:
 
 
 def _to_repo_relative_str(path: Path) -> str:
-    """Return `path` relative to the repo root for portable metadata (absolute on failure)."""
-    try:
-        return os.path.relpath(str(path.resolve()), str(REPO_ROOT.resolve()))
-    except Exception:
-        return str(path)
+    """Return `path` relative to the repo root for portable metadata."""
+    return os.path.relpath(str(path.resolve()), str(REPO_ROOT.resolve()))
 
 
 def _load_resolved_config(run_dir: Path) -> Tuple[Dict[str, Any], Path]:
