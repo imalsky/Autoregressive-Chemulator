@@ -18,6 +18,11 @@ forward):
   (the floor hides trace-species error; the share of scored truth below 1e-12 and 1e-20 is printed);
 - n_finite. Percentiles keep a fixed population: a diverged (non-finite) entry ranks as +inf error,
   so an inf percentile means more than that tail fraction diverged.
+Strata: a window is steady state when its truth stays within STEADY_STATE_MAX_DEX of its start
+state at every step and species (persistence is nearly exact there); the others are evolving. The
+headline rows, the pooled dex p90 at the report steps and the loss against persistence are also
+reported for each stratum, the evolving rows being the recommended headline, so steady states do
+not dominate it; the curve CSVs and gate 1 pool all windows.
 Loss against persistence: the run's val_loss definition (training.rollout_steps from the rollout
 start, steps >= skip_steps for an AR run, the run's loss weights), recomputed in float64 from the
 export's physical outputs (values clipped at epsilon), for the model and for persistence, as a ratio
@@ -97,6 +102,10 @@ DATA_LABEL = "random-dt, K <= 98 (processed shards; no fixed-dt evaluation set y
 GATE1_MAX_LOSS_RATIO = 0.5
 GATE1_MAX_DECADE_RATIO = 1.0
 GATE1_LATE_START_S = 1e3
+# Steady-state stratum: a window whose truth stays within this of its start state (|dlog10|, at every
+# step and species) is steady state, where persistence is (nearly) exact; it is reported apart from
+# the evolving windows. The same threshold preprocessing cuts frozen raw tails at.
+STEADY_STATE_MAX_DEX = PP._FROZEN_TAIL_MAX_PRECHANGE_DEX
 # Window-start replay: a shard row matches a raw group by (P, T) and a replayed draw by dt within
 # this relative tolerance (float32 z and dt_norm storage moves them by ~1e-6), and the replayed
 # window must re-normalize to the shard row within NORM_ROUNDTRIP_TOL_Z.
@@ -181,10 +190,16 @@ def _window_start_times(pcfg, summary, manifest, *, g_phys, dt_s, y_z) -> np.nda
 
     The shards hold no time. Each window's source group is found by its (P, T) among the EVAL_SPLIT
     groups of the build's raw files, its draws are replayed with preprocessing's own per-trajectory
-    generator (seed, group name) and functions as in sample_file (valid = t_raw > 0), the draw is
-    matched by dt, and the replayed window must re-normalize to the shard row (z) within
-    NORM_ROUNDTRIP_TOL_Z. Any miss raises. g_phys [N, G], dt_s [N] and y_z [N, T, S] are the rows'.
+    generator (seed, group name) and functions as in sample_file (valid = t_raw > 0, cut at a frozen
+    raw tail by preprocessing.frozen_tail_cut), the draw is matched by dt, and the replayed window
+    must re-normalize to the shard row (z) within NORM_ROUNDTRIP_TOL_Z. Any miss raises, as does a
+    build whose recorded frozen-tail threshold is not this code's. g_phys [N, G], dt_s [N] and
+    y_z [N, T, S] are the rows'.
     """
+    recorded = (summary.get("frozen_tail") or {}).get("max_prechange_dex")
+    if recorded != PP._FROZEN_TAIL_MAX_PRECHANGE_DEX:
+        raise ValueError(f"the build records frozen_tail.max_prechange_dex={recorded!r}, not this code's "
+                         f"{PP._FROZEN_TAIL_MAX_PRECHANGE_DEX!r}: its windows cannot be replayed; rebuild it")
     names, files, gs = [], [], []
     for r in summary["raw_files"]:
         path = pcfg.raw_dir / r["name"]
@@ -227,6 +242,9 @@ def _window_start_times(pcfg, summary, manifest, *, g_phys, dt_s, y_z) -> np.nda
                 t_raw = PP.read_time(grp, time_key=pcfg.time_key, leaf_index=li)
                 y_raw = PP.read_species_matrix(grp, t_len=t_raw.shape[0], species_vars=pcfg.species_variables, leaf_index=li)
                 valid = t_raw > 0
+                cut = PP.frozen_tail_cut(y_raw, epsilon=pcfg.epsilon)
+                if cut is not None:
+                    valid &= np.arange(t_raw.shape[0]) <= cut
                 t_valid, y_valid = t_raw[valid], y_raw[valid, :]
                 rng = np.random.default_rng([int(pcfg.seed), PP._seed_word(str(name))])
                 draws = []
@@ -431,6 +449,11 @@ def main() -> None:
     pstats = _rollout_stats(lambda y, _dt, _g: y, y0_phys, g_phys, dt_seconds, y_true, eps=eps, b_max=b_max,
                             report_idx=[s - 1 for s in report], loss_def=loss_def)
     n_kept = int(keep.sum())
+    # Steady state: persistence's error stays within STEADY_STATE_MAX_DEX at every step and species.
+    pers_dex = np.abs(np.log10(np.clip(y_true, eps, None)) - np.log10(np.clip(y0_phys, eps, None))[:, None, :])
+    steady = pers_dex.max(axis=(1, 2)) <= STEADY_STATE_MAX_DEX
+    strata = {"evolving": np.logical_not(steady), "steady_state": steady}
+    n_steady = int(steady.sum())
     print(f"non-finite (diverged) sources at the last step: {n_kept - stats['n_finite'][-1]}/{n_kept}")
     print(f"definitions: values clipped at epsilon={eps:g}; dex = |log10(yp) - log10(yt)|; "
           f"frac = |yp - yt| / (|yt| + {FRAC_ERR_FLOOR:g}) (legacy, for continuity)")
@@ -447,13 +470,43 @@ def main() -> None:
     dt_w = dt_seconds[:, 0]
     dt_rule = (f"each window's own constant dt (log-uniform in [{pcfg.dt_min:g}, {pcfg.dt_max:g}] s; no fixed-dt set yet); "
                f"this selection: min {dt_w.min():.4g} s, median {np.median(dt_w):.4g} s, max {dt_w.max():.4g} s")
-    print("\n=== per-species dex p90 at the headline steps (recommended headline; random-dt windows) ===")
+    # Per-stratum percentiles at the report steps (every headline step is a report step).
+    def stratum_rows(mask: np.ndarray) -> Dict[str, Any] | None:
+        if not mask.any():
+            return None
+        return {
+            "n": int(mask.sum()),
+            "headline_species_dex_p90": {
+                str(s): {w: _pctl_fixed_pool(st["dex_at_report"][report.index(s)][mask], 90, axis=0).tolist()
+                         for w, st in (("model", stats), ("persistence", pstats))}
+                for s in headline
+            },
+            "pooled_dex_p90_at_report_steps": {
+                w: [float(_pctl_fixed_pool(st["dex_at_report"][r][mask].ravel(), 90)) for r in range(len(report))]
+                for w, st in (("model", stats), ("persistence", pstats))
+            },
+        }
+
+    by_stratum = {k: stratum_rows(m) for k, m in strata.items()}
+    print(f"\n[strata] {n_steady} of {n_kept} windows are steady state (truth within {STEADY_STATE_MAX_DEX:g} dex of "
+          f"the start state at every step and species, so persistence is nearly exact); {n_kept - n_steady} evolving")
+    print("\n=== per-species dex p90 at the headline steps by stratum (evolving: the recommended headline; "
+          "random-dt windows) ===")
     print(f"step s = the s-th rollout step from start index {ROLLOUT_START_INDEX}; dt = {dt_rule}")
-    for s in headline:
-        row = stats["species_dex"][s - 1][i90]
-        prow = pstats["species_dex"][s - 1][i90]
-        print(f"@ step {s}: " + ", ".join(f"{n}={v:.3f}" for n, v in zip(names, row, strict=True)))
-        print(f"@ step {s} persistence: " + ", ".join(f"{n}={v:.3f}" for n, v in zip(names, prow, strict=True)))
+    def print_headline(label: str, n_w: int, rows_by_step: Dict[str, Any]) -> None:
+        print(f"--- {label} ({n_w} windows) ---")
+        for s in headline:
+            row, prow = rows_by_step[str(s)]["model"], rows_by_step[str(s)]["persistence"]
+            print(f"@ step {s}: " + ", ".join(f"{n}={v:.3f}" for n, v in zip(names, row, strict=True)))
+            print(f"@ step {s} persistence: " + ", ".join(f"{n}={v:.3f}" for n, v in zip(names, prow, strict=True)))
+
+    for key, label in (("evolving", "evolving"), ("steady_state", "steady state")):
+        if by_stratum[key] is None:
+            print(f"--- {label} (0 windows) ---")
+        else:
+            print_headline(label, by_stratum[key]["n"], by_stratum[key]["headline_species_dex_p90"])
+    print_headline("all windows", n_kept, {str(s): {"model": stats["species_dex"][s - 1][i90],
+                                                     "persistence": pstats["species_dex"][s - 1][i90]} for s in headline})
 
     # Loss against persistence, overall and by window-start decade (ratio of means; skill = 1 - ratio).
     m_wl, p_wl = stats["window_loss"], pstats["window_loss"]
@@ -465,18 +518,27 @@ def main() -> None:
         return {"n": int(mask.sum()), "model_loss": m, "persistence_loss": p, "ratio": r, "skill": 1.0 - r}
 
     decade = np.floor(np.log10(t_window)).astype(int)
-    by_decade = [{"t_lo_s": 10.0 ** d, "t_hi_s": 10.0 ** (d + 1), **vs_persistence(decade == d)} for d in sorted(set(decade.tolist()))]
+    by_decade = [{"t_lo_s": 10.0 ** d, "t_hi_s": 10.0 ** (d + 1), **vs_persistence(decade == d),
+                  "n_steady_state": int((steady & (decade == d)).sum())} for d in sorted(set(decade.tolist()))]
     overall = vs_persistence(np.ones_like(m_wl, dtype=bool))
+    for key, m in strata.items():
+        if by_stratum[key] is not None:
+            by_stratum[key]["loss_vs_persistence"] = vs_persistence(m)
     loss_label = (f"the run's val_loss definition: {loss_def['k']} step(s) from start index {ROLLOUT_START_INDEX}, "
                   f"steps >= {loss_def['skip']} weighted equally, lambda_log10_mae={loss_def['lambda_log10_mae']:g}, "
                   f"lambda_z_mse={loss_def['lambda_z_mse']:g}; float64 from the export's outputs, clipped at "
                   f"epsilon (not training's val_loss); window start = t_start + {ROLLOUT_START_INDEX} x dt")
     print(f"\n=== loss vs persistence ({loss_label}) ===")
-    print(f"{'window start (s)':<20} {'n':>6} {'model_loss':>12} {'persistence':>12} {'ratio':>8} {'skill':>8}")
-    for row in by_decade + [dict(overall, t_lo_s=None)]:
+    print(f"{'window start (s)':<20} {'n':>6} {'steady':>6} {'model_loss':>12} {'persistence':>12} {'ratio':>8} {'skill':>8}")
+    for row in by_decade + [dict(overall, t_lo_s=None, n_steady_state=n_steady)]:
         span = "all" if row["t_lo_s"] is None else f"[{row['t_lo_s']:.0e}, {row['t_hi_s']:.0e})"
-        print(f"{span:<20} {row['n']:>6} {row['model_loss']:12.4e} {row['persistence_loss']:12.4e} "
-              f"{row['ratio']:8.4f} {row['skill']:8.4f}")
+        print(f"{span:<20} {row['n']:>6} {row['n_steady_state']:>6} {row['model_loss']:12.4e} "
+              f"{row['persistence_loss']:12.4e} {row['ratio']:8.4f} {row['skill']:8.4f}")
+    for key, label in (("evolving", "evolving only"), ("steady_state", "steady state only")):
+        if by_stratum[key] is not None:
+            row = by_stratum[key]["loss_vs_persistence"]
+            print(f"{label:<20} {row['n']:>6} {'':>6} {row['model_loss']:12.4e} {row['persistence_loss']:12.4e} "
+                  f"{row['ratio']:8.4f} {row['skill']:8.4f}")
     late = [r for r in by_decade if r["t_lo_s"] >= GATE1_LATE_START_S]
     gate1 = {
         "provisional": True, "enforced": False,
@@ -498,6 +560,8 @@ def main() -> None:
         print(f"gate 1: ratio < {GATE1_MAX_DECADE_RATIO:g} in the decades from {GATE1_LATE_START_S:g} s on "
               f"({len(late)} decades): {pf[gate1['late_decades_pass']]}")
         print(f"GATE 1: {pf[gate1['pass']]}")
+        print("gate 1 is scored on all windows, steady state included (its definition); the evolving-only and "
+              "steady-state-only rows above are diagnostics")
     else:
         print("gate 1 is the stage-1 (one-jump) gate; for this autoregressive run the table is a diagnostic")
 
@@ -525,7 +589,7 @@ def main() -> None:
     per_source = run_dir / f"rollout_error_{split}_per_source.npz"
     np.savez(per_source, dex_at_report=dex_at_report, report_steps=np.asarray(report),
              rows=np.asarray(kept_rows), selection_sha256=np.asarray(selection_sha),
-             window_start_s=t_window, window_loss=m_wl, persistence_window_loss=p_wl)
+             window_start_s=t_window, window_loss=m_wl, persistence_window_loss=p_wl, steady_state=steady)
     shards_by_file = []
     cum = 0
     for r in summary["raw_files"]:
@@ -562,6 +626,14 @@ def main() -> None:
         "T": T, "K": K, "start_index": ROLLOUT_START_INDEX, "report_steps": report, "headline_steps": headline,
         "headline_dt": dt_rule,
         "loss_vs_persistence": {"definition": loss_label, "overall": overall, "by_window_start_decade": by_decade},
+        "strata": {
+            "definition": ("steady_state: the window's truth stays within max_dex of its start state, "
+                           "max over the K steps and species of |log10 y_true - log10 y_start| (clipped at "
+                           "epsilon) <= max_dex, so persistence is nearly exact; evolving: the other windows "
+                           "(the recommended headline); the curve CSVs and gate 1 pool all windows"),
+            "max_dex": STEADY_STATE_MAX_DEX,
+            **by_stratum,
+        },
         "gate1": gate1,
         "clip_eps": eps, "frac_err_floor": FRAC_ERR_FLOOR,
         "truth_share_below": stats["truth_share_below"],

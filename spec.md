@@ -1,6 +1,6 @@
 # Autoregressive Chemical Kinetics Emulator Specification
 
-Version: 1.10
+Version: 1.11
 Date: 2026-10-01
 Audience: Professional collaborators and maintainers
 
@@ -45,6 +45,8 @@ Audience: Professional collaborators and maintainers
 8. Raw schema is considered stable and non-evolving.
 9. Species datasets must be scalar-per-time and only use shapes `[T]` or `[T, 1]`.
 10. Multi-column or higher-rank species datasets are unsupported and must hard-fail.
+11. Frozen raw tails are cut, not rejected (`frozen_tail_cut`): when a trajectory ends in a run of raw rows bitwise identical to its last row and the raw step into the run's first row f changes some species by more than `_FROZEN_TAIL_MAX_PRECHANGE_DEX` = 1e-3 dex (max over species of |Δlog10 y|, floored at `epsilon`), only rows up to f are valid, so windows come from the evolving part only. Converged repeated tails (that step at or below the threshold) are kept. A cut trajectory with no window that fits is rejected as `frozen_tail_no_window`; the `drop_below` and non-finite rejects are unchanged and still test the whole raw trajectory.
+12. `preprocessing_summary.json` records the threshold and, per split, the cut trajectories, their draws that found no placement and the trajectories lost (`frozen_tail`); training refuses a processed dir whose build record lacks it.
 
 ## 4.2 Training
 1. Training entrypoint is `src/main.py`, selected by `AUTOCHEM_CONFIG_PATH` (required; there is no default config file).
@@ -108,7 +110,7 @@ Audience: Professional collaborators and maintainers
 2. `testing/export.py` and `testing/aoti_export.py` produce/validate deployment artifacts and follow the strict no-fallback contract.
 3. The plotting/inspection diagnostics (`testing/predictions.py`, `testing/bench_speedup.py`, `testing/training_logs.py`, `testing/efficiency_summary.py`, `testing/profile_training.py`) may use explicit best-effort behavior for portability and local usability.
 4. `testing/run_local_smoke.sh` (run as `bash run_daw.sh smoke`) is the integration gate: the production configs, shrunk, on synthetic data through preprocessing (its two reject paths), both stages with the production compile settings, a deliberate extension, a refused re-run of a finished run and its publish-only resume once `best.ckpt` and `COMPLETED` are deleted, the `best.ckpt` handoff, both stage-2 recipes, the Fourier-dt fallback pair and the gated export with a reload check. It asserts the outcomes (finite losses, epoch counts, `COMPLETED`, `last.ckpt` at the final epoch, a ragged last validation batch, compiled-variant counts, weights that change, NaN rows out of range) and fails on the first wrong one. Run it before committing changes to `src/`, `processing/` or the export.
-5. `testing/eval_rollout_error.py` (rollout error vs step, against persistence) and the planned fixed-dt evaluation-set generator are diagnostics under 6.3: the stage-2 rollout target in `docs/DECISIONS.md` is a reported target (per-species p90 in dex at a stated step and dt; its threshold is an open author decision), not a hard gate, and the provisional stage-1 gate (skill against persistence) is printed as pass/fail lines that do not change the exit status. The script reads the build's raw files to recover window-start times. If the author makes either a gate, both move under the strict contract of 4.4.2: a non-zero exit on NaN percentiles, a K below the requested K, non-finite trajectories, truncated rows or a missed target.
+5. `testing/eval_rollout_error.py` (rollout error vs step, against persistence) and the planned fixed-dt evaluation-set generator are diagnostics under 6.3: the stage-2 rollout target in `docs/DECISIONS.md` is a reported target (per-species p90 in dex at a stated step and dt; its threshold is an open author decision), not a hard gate, and the provisional stage-1 gate (skill against persistence) is printed as pass/fail lines that do not change the exit status. Steady-state windows (truth within `_FROZEN_TAIL_MAX_PRECHANGE_DEX` of the start state at every step and species, where persistence is nearly exact) are reported as a separate stratum, and the evolving windows are the recommended headline; gate 1 and the curve CSVs pool all windows. The script reads the build's raw files to recover window-start times (with the same frozen-tail cut). If the author makes either a gate, both move under the strict contract of 4.4.2: a non-zero exit on NaN percentiles, a K below the requested K, non-finite trajectories, truncated rows or a missed target.
 
 ## 5. Data and Schema Contracts
 1. Raw input data schema is stable and assumed unchanged.

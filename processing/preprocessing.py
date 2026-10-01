@@ -45,6 +45,12 @@ Shard schema:
     globals     : [N, G]          float32  (normalized globals)
     dt_norm_mat : [N, n_steps-1]  float32  (normalized dt in [0, 1])
 
+Frozen raw tails: a trajectory whose raw state stopped changing in mid-evolution and was then
+repeated row for row (frozen_tail_cut) is cut after its last changing row, so its windows come
+only from the evolving part; the group is kept, or rejected as frozen_tail_no_window if no window
+fits before the cut. Converged repeated tails are kept. preprocessing_summary.json frozen_tail
+records the threshold and the per-split counts.
+
 Randomness: split membership is a hash of (SPLIT_SEED, file basename, group name), independent of
 preprocessing.seed. Window draws (dt, start time) use one generator per trajectory, seeded with
 [preprocessing.seed, a hash of the group name], so they do not depend on the file's position in
@@ -172,6 +178,10 @@ _SPECIES_SUM_HIST_BINS = 10_000
 _SPECIES_SUM_QUANTILE_LEVELS: Tuple[float, ...] = (0.001, 0.01, 0.05, 0.5)
 # Best-effort git provenance in the summary: a git call slower than this is recorded as null.
 _GIT_TIMEOUT_S = 10.0
+# Frozen raw tails (frozen_tail_cut; docs/DECISIONS.md open item 17): a repeated-state tail is cut when
+# the step into it still moves a species by more than this (dex). Species >= 1e-12 never exceed
+# 7.2e-4 dex there on the 4 raw files (audit R2-006); recheck on new data.
+_FROZEN_TAIL_MAX_PRECHANGE_DEX = 1e-3
 _SPLITS: Tuple[str, str, str] = ("train", "validation", "test")
 # The manifest keys that define the z-space; their canonical-JSON sha256 is the normalization
 # fingerprint (norm_sha256). Same definition as src/utils.py (this script imports nothing from
@@ -724,12 +734,14 @@ def pick_t_start(
     The first attempt may anchor at the earliest feasible time (anchor_first); otherwise
     candidates are drawn log-uniformly in [t_lo, t_hi]. Returns None if no placement fits.
 
-    With t_min = 0 (both production configs) the valid window spans every positive raw time,
-    so the anchor and any draw in [t_lo, t_hi) fit on the first try: the retry budget
-    (preprocessing.max_chunk_attempts_per_source) only matters when t_min > 0.
+    Candidates end at the valid window's last time (t_hi = t_valid[-1] - duration), which is the
+    last raw time unless frozen_tail_cut shortened the window. t_lo is at or after t_valid[0], so
+    a candidate fits unless float rounding puts it just past t_hi, and a window longer than the
+    valid span returns None without a draw.
 
-    Both callers (sample_file, processing/testing.py) reject groups with fewer than 2 positive
-    times first, so t_raw has a positive entry here.
+    Callers pass groups with at least 2 positive times (sample_file and processing/testing.py
+    reject the others first; testing/eval_rollout_error.py replays only kept groups), so t_raw
+    has a positive entry here.
     """
     pos = t_raw > 0
     first_pos_time = float(t_raw[pos][0])
@@ -738,7 +750,7 @@ def pick_t_start(
     chunk_offsets = np.arange(n_steps, dtype=np.float64) * float(dt_s)
     chunk_duration = float(chunk_offsets[-1])
 
-    t_end = float(t_raw[-1])
+    t_end = float(t_valid[-1])
     t_hi = t_end - chunk_duration
     if t_hi <= t_lo:
         return None
@@ -759,6 +771,29 @@ def pick_t_start(
             return cand
 
     return None
+
+
+def frozen_tail_cut(y_raw: np.ndarray, *, epsilon: float) -> Optional[int]:
+    """The raw row f at which a trajectory's frozen tail is cut (keep rows <= f), or None.
+
+    f is the first row of the trailing run of rows whose species are all bitwise identical to the
+    last row (the generator stopped and repeated its state). The tail is cut only when the state
+    froze in mid-evolution: f >= 1 and the raw step into row f, max over species of
+    |log10 max(y[f], epsilon) - log10 max(y[f-1], epsilon)|, exceeds _FROZEN_TAIL_MAX_PRECHANGE_DEX.
+    Row f, the last raw point at which a species still changed by more than that, is kept; rows
+    after it are dropped. None (nothing cut) for a converged tail (the step into f at or below the
+    threshold), for a trajectory whose last two rows differ, and for one constant from row 0.
+    Run detection is bitwise; a 1e-12 dex tolerance selects the same groups on the 4 raw files.
+    """
+    same = np.all(y_raw == y_raw[-1], axis=1)
+    differ = np.flatnonzero(np.logical_not(same))
+    if differ.size == 0:
+        return None
+    f = int(differ[-1]) + 1
+    if f == y_raw.shape[0] - 1:
+        return None
+    step = np.abs(np.log10(np.maximum(y_raw[f], epsilon)) - np.log10(np.maximum(y_raw[f - 1], epsilon)))
+    return f if float(np.max(step)) > _FROZEN_TAIL_MAX_PRECHANGE_DEX else None
 
 
 # -----------------------------------------------------------------------------
@@ -973,7 +1008,8 @@ def _coverage_cell(g_vec: np.ndarray) -> Tuple[int, int]:
 
 
 def _new_cell() -> Dict[str, Any]:
-    return {"too_few_valid": 0, "reached_drop_test": 0, "drop_below": 0, "windows": {sp: 0 for sp in _SPLITS}}
+    return {"too_few_valid": 0, "reached_drop_test": 0, "drop_below": 0, "frozen_tail_no_window": 0,
+            "windows": {sp: 0 for sp in _SPLITS}}
 
 
 def _hist_add(hist: Dict[int, int], value: float, width: float) -> None:
@@ -997,14 +1033,18 @@ def sample_file(
     start time), so a window does not depend on the file's position in the list or on which other
     groups were kept. ``file_idx`` only namespaces this file's shard names.
 
+    A kept group whose raw tail froze in mid-evolution (frozen_tail_cut) is sampled only up to the
+    cut; if none of its draws fits there it is rejected as frozen_tail_no_window instead of kept.
+
     Returns ``(row, agg)``. ``row`` is this file's preprocessing_summary.json entry: name, size,
     group counts (groups_seen = sum(group_rejects) + groups_kept), group- and chunk-level rejects,
-    windows written per split, ``truncated`` (the per-file output cap stopped sampling while
-    candidate draws remained), shards per split and the raw time grid of the first group with a
-    finite time vector. ``agg`` holds the counters the parent sums over files: the (T, log10 P)
-    coverage cells, drop_below trigger counts, window start-time / dt histograms, anchored windows,
-    per-split window start-time range, and the 64-bit digests of every group name in the file (the
-    cross-file duplicate check).
+    windows written per split, ``frozen_tail`` (per split: groups cut, their draws that found no
+    placement, counted in no_fit_chunk too, and cut groups left with no window), ``truncated``
+    (the per-file output cap stopped sampling while candidate draws remained), shards per split
+    and the raw time grid of the first group with a finite time vector. ``agg`` holds the counters
+    the parent sums over files: the (T, log10 P) coverage cells, drop_below trigger counts, window
+    start-time / dt histograms, anchored windows, per-split window start-time range, and the 64-bit
+    digests of every group name in the file (the cross-file duplicate check).
     """
     rng = np.random.default_rng([int(cfg.seed), _seed_word(file_path.name)])
     shard_idx: Dict[str, int] = {sp: 0 for sp in _SPLITS}
@@ -1015,8 +1055,13 @@ def sample_file(
     dt_buf: Dict[str, List[np.ndarray]] = {sp: [] for sp in _SPLITS}
 
     # Group-level rejects (a whole source group) and chunk-level rejects (one window attempt).
-    group_rejects: Dict[str, int] = {"non_finite": 0, "non_positive_global": 0, "too_few_valid": 0, "drop_below": 0}
+    group_rejects: Dict[str, int] = {
+        "non_finite": 0, "non_positive_global": 0, "too_few_valid": 0, "drop_below": 0, "frozen_tail_no_window": 0,
+    }
     chunk_rejects: Dict[str, int] = {"no_fit_chunk": 0, "interp_non_finite": 0}
+    frozen_tail: Dict[str, Dict[str, int]] = {
+        k: {sp: 0 for sp in _SPLITS} for k in ("truncated_groups", "removed_windows", "lost_groups")
+    }
     windows_by_split = {sp: 0 for sp in _SPLITS}
     groups_seen = 0
     groups_kept = 0
@@ -1153,7 +1198,11 @@ def sample_file(
                     drop_exact_zero += 1
                 continue
 
-            groups_kept += 1
+            # A raw tail that froze in mid-evolution is dropped: windows come only from rows <= cut.
+            cut = frozen_tail_cut(y_raw, epsilon=cfg.epsilon)
+            if cut is not None:
+                valid &= np.arange(T) <= cut
+
             t_valid = t_raw[valid]
             log_t_valid = np.log10(t_valid)
             y_valid = y_raw[valid, :]
@@ -1169,6 +1218,7 @@ def sample_file(
             traj_rng = np.random.default_rng([int(cfg.seed), _seed_word(str(traj_name))])
             # The anchor of draw 0 (pick_t_start's t_lo).
             t_anchor = max(float(cfg.t_min), float(t_valid[0]))
+            written_before = written
 
             for sidx in range(int(cfg.samples_per_source_trajectory)):
                 if target is not None and written >= target:
@@ -1188,6 +1238,8 @@ def sample_file(
                 )
                 if t_start is None:
                     chunk_rejects["no_fit_chunk"] += 1
+                    if cut is not None:
+                        frozen_tail["removed_windows"][split] += 1
                     continue
 
                 t_chunk = float(t_start) + step_offsets * float(dt_s)
@@ -1230,6 +1282,16 @@ def sample_file(
                     g_buf[split].clear()
                     dt_buf[split].clear()
 
+            if cut is not None:
+                frozen_tail["truncated_groups"][split] += 1
+                # No window written means every draw was tried (the output cap is reached only by writing).
+                if written == written_before:
+                    frozen_tail["lost_groups"][split] += 1
+                    group_rejects["frozen_tail_no_window"] += 1
+                    cell["frozen_tail_no_window"] += 1
+                    continue
+            groups_kept += 1
+
         for sp in _SPLITS:
             shard_idx[sp], _ = flush_shard(
                 out_tmp,
@@ -1243,12 +1305,14 @@ def sample_file(
             )
 
     log.info(
-        "file=%s groups seen=%d kept=%d group_rejects=%s chunk_rejects=%s windows=%d (train=%d val=%d test=%d) truncated=%s",
+        "file=%s groups seen=%d kept=%d group_rejects=%s chunk_rejects=%s frozen_tail=%s windows=%d "
+        "(train=%d val=%d test=%d) truncated=%s",
         file_path.name,
         groups_seen,
         groups_kept,
         group_rejects,
         chunk_rejects,
+        frozen_tail,
         written,
         windows_by_split["train"],
         windows_by_split["validation"],
@@ -1266,6 +1330,7 @@ def sample_file(
         "groups_kept": groups_kept,
         "group_rejects": group_rejects,
         "chunk_rejects": chunk_rejects,
+        "frozen_tail": frozen_tail,
         "windows_written_by_split": windows_by_split,
         "truncated": truncated,
         "shards_by_split": dict(shard_idx),
@@ -1678,11 +1743,14 @@ def write_summary(
     norm_sha256 is the normalization fingerprint of the normalization.json written with it.
 
     Keys: windows_written_by_split, groups_seen / groups_kept, group_rejects (whole source groups:
-    non_finite, non_positive_global, too_few_valid, drop_below) and chunk_rejects (window attempts:
-    no_fit_chunk, interp_non_finite), files_truncated; raw_files (one row per file, by file_idx);
-    split (seed, fractions, key definition, raw basenames); coverage ((T, log10 P) cells: groups
-    that reached the drop_below test, drop_below rejects, too_few_valid, windows per split; plus
-    drop_below trigger counts); windows (log10 start-time and dt histograms per split, anchored
+    non_finite, non_positive_global, too_few_valid, drop_below, frozen_tail_no_window) and
+    chunk_rejects (window attempts: no_fit_chunk, interp_non_finite), files_truncated; frozen_tail
+    (the frozen_tail_cut threshold and rule, and per split the groups cut, their draws that found
+    no placement and the cut groups left with no window; src/main.py refuses a build without it);
+    raw_files (one row per file, by file_idx); split (seed, fractions, key definition, raw
+    basenames); coverage ((T, log10 P) cells: groups that reached the drop_below test, drop_below
+    and frozen_tail_no_window rejects, too_few_valid, windows per split; plus drop_below trigger
+    counts); windows (log10 start-time and dt histograms per split, anchored
     windows, start-time range); config (the parsed PreCfg, paths relative to processed_dir) and
     config_blocks (the raw preprocessing / normalization / data blocks, comment keys removed, which
     src/main.py compares with the training config); run (time, git, code hash, versions: volatile).
@@ -1704,6 +1772,17 @@ def write_summary(
         "group_rejects": totals["group_rejects"],
         "chunk_rejects": totals["chunk_rejects"],
         "files_truncated": sum(1 for r in rows if r["truncated"]),
+        "frozen_tail": {
+            "max_prechange_dex": _FROZEN_TAIL_MAX_PRECHANGE_DEX,
+            "rule": (
+                "f = first row of the trailing run of raw rows whose species are all bitwise identical to "
+                "the last row; if f >= 1 and max over species |log10 y[f] - log10 y[f-1]| (floored at "
+                "epsilon) > max_prechange_dex, only rows <= f are valid (rows after f are dropped)"
+            ),
+            "truncated_groups": totals["frozen_tail"]["truncated_groups"],
+            "removed_windows": totals["frozen_tail"]["removed_windows"],
+            "lost_groups": totals["frozen_tail"]["lost_groups"],
+        },
         "raw_files": rows,
         "split": {
             "split_seed": SPLIT_SEED,
@@ -1880,6 +1959,10 @@ def _merge_totals(rows: List[Dict[str, Any]], aggs: List[Dict[str, Any]]) -> Dic
         "groups_kept": sum(r["groups_kept"] for r in rows),
         "group_rejects": {},
         "chunk_rejects": {},
+        "frozen_tail": {
+            k: {sp: sum(r["frozen_tail"][k][sp] for r in rows) for sp in _SPLITS}
+            for k in ("truncated_groups", "removed_windows", "lost_groups")
+        },
         "coverage": {},
         "drop_triggers": {},
         "drop_exact_zero": sum(a["drop_exact_zero"] for a in aggs),
@@ -1895,7 +1978,7 @@ def _merge_totals(rows: List[Dict[str, Any]], aggs: List[Dict[str, Any]]) -> Dic
     for a in aggs:
         for cell, c in a["coverage"].items():
             t = tot["coverage"].setdefault(cell, _new_cell())
-            for k in ("too_few_valid", "reached_drop_test", "drop_below"):
+            for k in ("too_few_valid", "reached_drop_test", "drop_below", "frozen_tail_no_window"):
                 t[k] += c[k]
             for sp in _SPLITS:
                 t["windows"][sp] += c["windows"][sp]
@@ -1918,7 +2001,7 @@ def _manifest_coverage(totals: Mapping[str, Any]) -> Dict[str, Any]:
     for (ti, pi), c in cells:
         if c["reached_drop_test"] == 0:
             continue
-        kept = c["reached_drop_test"] - c["drop_below"]
+        kept = c["reached_drop_test"] - c["drop_below"] - c["frozen_tail_no_window"]
         ret = kept / c["reached_drop_test"]
         if worst is None or ret < worst["retention"]:
             worst = {"T_lo_K": ti * _COVERAGE_T_BIN_K, "log10P_lo": pi * _COVERAGE_LOG10P_BIN_DEX,
@@ -1926,7 +2009,8 @@ def _manifest_coverage(totals: Mapping[str, Any]) -> Dict[str, Any]:
     return {
         "definition": (
             "train-split windows per floor-based (T, log10 P) cell (all splits' group counts are in "
-            "preprocessing_summary.json); retention = groups kept / groups that reached the drop_below test"
+            "preprocessing_summary.json); retention = groups kept / groups that reached the drop_below test "
+            "(kept: not rejected as drop_below or frozen_tail_no_window)"
         ),
         "units": {"T": UNITS["T"], "P": UNITS["P"]},
         "T_bin_K": _COVERAGE_T_BIN_K,
@@ -2031,11 +2115,13 @@ def _build_dataset(
         )
 
     log.info(
-        "Totals: groups seen=%d kept=%d group_rejects=%s chunk_rejects=%s windows=%d (train=%d val=%d test=%d)",
+        "Totals: groups seen=%d kept=%d group_rejects=%s chunk_rejects=%s frozen_tail=%s windows=%d "
+        "(train=%d val=%d test=%d)",
         totals["groups_seen"],
         totals["groups_kept"],
         totals["group_rejects"],
         totals["chunk_rejects"],
+        totals["frozen_tail"],
         total_written,
         counts_total["train"],
         counts_total["validation"],

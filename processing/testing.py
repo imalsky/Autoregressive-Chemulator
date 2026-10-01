@@ -32,6 +32,7 @@ from preprocessing import (
     PreCfg,
     _is_non_finite_raw_error,
     _is_non_positive_global_error,
+    frozen_tail_cut,
     interp_loglog,
     leaf_dataset_index,
     list_raw_files,
@@ -156,10 +157,14 @@ def build_raw_and_chunk_from_preprocessing_logic(
         if np.any(y_raw < float(cfg.drop_below)):
             raise RuntimeError(f"Rejected by drop_below: min(y_raw)={float(np.min(y_raw)):.3e} < {cfg.drop_below:.3e}")
 
-    # Valid mask (mirrors preprocessing.sample_file): positive times, at least 2 of them.
+    # Valid mask (mirrors preprocessing.sample_file): positive times, at least 2 of them, cut at a
+    # frozen raw tail (frozen_tail_cut).
     valid = t_raw > 0
     if int(np.count_nonzero(valid)) < 2:
         raise RuntimeError("Rejected: fewer than 2 positive times (too_few_valid)")
+    cut = frozen_tail_cut(y_raw, epsilon=cfg.epsilon)
+    if cut is not None:
+        valid &= np.arange(T) <= cut
 
     t_valid = t_raw[valid]
     y_valid = y_raw[valid, :]

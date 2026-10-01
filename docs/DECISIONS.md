@@ -1,5 +1,58 @@
 # Production config decisions — evidence and justification
 
+## REVISION 2026-10-01: frozen raw tails cut before windowing; steady states as an evaluation stratum (author decision, theme D2)
+
+Author decision of 2026-10-01 (open item 17). It changes the training data (rebuild required;
+training refuses an older build) but no training numerics: the 30-step fingerprints of both
+stages are bitwise identical to `ref_after_D1_s1` / `_s2` on the synthetic parity set, which has
+nothing to cut (its rebuilt shards and norm_sha256 are bitwise unchanged); they are recorded as
+`ref_after_D2_s1` / `_s2`. What changed:
+- **The cut** (`processing/preprocessing.py` `frozen_tail_cut`). f is the first row of the
+  trailing run of raw rows whose 12 species are bitwise identical to the last row. If f ≥ 1 and
+  the raw step into row f, max over species of |log10 y[f] − log10 y[f−1]| (floored at epsilon),
+  exceeds `_FROZEN_TAIL_MAX_PRECHANGE_DEX` = 1e-3 dex, only rows ≤ f are valid: row f, the last
+  raw point at which a species still changed by more than 1e-3 dex, is kept, and the repeated rows
+  after it are dropped. Converged repeated tails (step into f at or below 1e-3 dex, about 95% of
+  the constant tails) are kept: their zero-change labels are physically right. The cut runs after
+  the drop_below test, which still tests the whole raw trajectory; drop_below and the non-finite
+  rejects are unchanged. `pick_t_start` now draws start times up to the valid window's end
+  (t_valid[−1], was t_raw[−1]): identical for uncut trajectories; for a cut one a draw fits on its
+  first candidate or returns None at once. A cut trajectory with no placeable window is a new
+  group reject, `frozen_tail_no_window` (not in groups_kept); its draws count in no_fit_chunk.
+- **Measured on the 4 raw files** (the D2 rebuild; every count equal to an independent count made
+  from the raw files before it), next to the audit's estimate: 16,311 trajectories cut (audit
+  16,311; train 13,007 / validation 1,638 / test 1,666); 10,146 window draws lost (audit expected
+  10,106; train 8,118 / 970 / 1,058), so 84.4% of the cut trajectories' windows are kept (audit
+  ~84%) and 0.39% of all windows are lost (audit 0.39%); 986 trajectories lose every window
+  (797 / 89 / 100), against the audit's 429. The audit counted only those cut too early for any
+  window (cut time within 99 × dt_min = 9.9 s of the first raw time): 429 here, 388 of them at
+  T ≥ 2400 K, as the audit found; the other 557 lost all four random dt draws. Lost by 300 K bin
+  from 300 K: 27, 77, 4, 0, 0, 30, 176, 377, 295. Windows: 2,070,330 / 256,734 / 259,126 (were
+  2,078,448 / 257,704 / 260,184); kept trajectories 648,098 (was 649,084). The largest step into
+  a cut row is 2.19 dex. A 1e-12 dex tolerance run detector cuts the identical set. New
+  norm_sha256 ee4a7834e834… (was e25e24ff…; the old build is deleted).
+- **Build record.** preprocessing_summary.json gains `frozen_tail` (the threshold, the rule, and
+  per split `truncated_groups`, `removed_windows`, `lost_groups`; also in each raw-file row),
+  group_rejects gains `frozen_tail_no_window`, the coverage cells count it, and the manifest's
+  lowest-retention cell counts it as not kept. src/main.py refuses a processed dir whose record
+  has no `frozen_tail` ("built before the frozen-tail truncation"); checked on the pre-D2 build.
+- **Epoch definitions unchanged** (fixed counts). Stage 1: 32,475 steps; val_samples 8,246,528
+  of the 256,734 × 99 = 25,416,666 enumerated one-step windows (an even-stride subset, as before;
+  4,027 batches, the last ragged at 1,280, as before). Stage 2: 20,000 steps; val_samples
+  2,621,440 of 256,734 × 90 = 23,106,060 (1,280 full batches, no ragged batch; 10 or 11 starts
+  per validation trajectory). Nothing forced a change; the config comments quote both builds.
+  The validation window set follows the data, so val_loss is not comparable across the rebuild.
+- **Steady-state stratum** (`testing/eval_rollout_error.py`). A window is steady state when its
+  truth stays within `STEADY_STATE_MAX_DEX` (= the same 1e-3 dex) of its start state at every step
+  and species, so persistence is nearly exact there. The headline rows (per-species dex p90 at the
+  headline steps), the pooled dex p90 at the report steps and the loss against persistence are
+  reported for the evolving windows (the recommended headline), the steady-state windows and all
+  windows; the decade table gains a steady count, the JSON `strata`, the per-source npz
+  `steady_state`. Gate 1 and the curve CSVs still pool all windows (gate 1's definition is the
+  author's). The window-start replay applies the same cut (checked on 300 cut and 300 uncut real
+  validation trajectories; without the cut it raises) and refuses a build recording another or no
+  threshold. `processing/testing.py` (the window figure) applies the cut too.
+
 ## REVISION 2026-10-01: four run-contract fixes from an independent review (theme D1b)
 
 Training numerics are unchanged (30-step fingerprints of both stages bitwise identical to
@@ -576,7 +629,8 @@ Fourier/non-residual fallback; corrected 2026-10-01, was "~100M"), 12 species co
 (P, T), trained on the processed windows counted in the processed dir's
 `preprocessing_summary.json` (`windows_written_by_split`; the raw-file count is the preprocessing
 log's `files=N` line). The earlier "~62M samples" is dropped: it fits no reading of the local
-yield (the 4-file build has 2,078,448 train and 257,704 validation windows) and cannot be checked
+yield (the 4-file build has 2,078,448 train and 257,704 validation windows; 2,070,330 and
+256,734 after the 2026-10-01 frozen-tail cut) and cannot be checked
 on daw. The sandbox is none of those. Per the agreed policy, local wins were adopted only when replicated across seeds, mechanistically
 sensible, AND cheap to disable; close calls ship both options. Sandbox models also bake
 a per-step simplex projection into the rollout (production does not) — sandbox
@@ -631,7 +685,7 @@ Rows whose own text does not support their label carry a bracketed "[rubric: ...
 | `preprocessing.output_trajectories_per_file`, `pool_size` | null = no cap (REVISED 2026-09-30, was 1e6) | "Use the full dataset" (user decision); the full-set counts are in the processed dir's preprocessing_summary.json (the earlier "~62M samples across ~160 raw files" is dropped, 2026-10-01: unverifiable on daw and inconsistent with the local yield). The 1e6 values meant "consume all" but were caps: the output cap counts written windows (4 per kept group), so it would bind at 250,000 kept groups per file: 1.1x today's 224,000 groups per file with no rejects, about 1.4-1.6x at the measured keep rates (audit). An integer is a deliberate, logged and recorded subsample. | decision |
 | `training.batch_size` | 2048 | Inherited from the dt-band templates (2048 since 960e467, 2026-03-24). "Paper finding: >2048 degraded generalization" is unverified (the paper is not on daw). Both recorded prior runs (v3 and v2_bigger_batch, "Where the evidence is") trained at 8192 and neither isolates batch size; v2_bigger_batch was near 9e-3 only during its warmup and reached a minimum of 4.11e-4, so the earlier "v2_bigger_batch (8192) plateaued at val ~9e-3" is deleted (corrected 2026-10-01). No Auto-Chem batch-2048 run has metrics in the repo. | inherited (dt-band templates); no in-repo run evidence (was "high (production-scale evidence)") |
 | stage-1 `lr` / `wd` / scheduler / EMA 0.9995 / early-stop | template values | lr 3e-4, wd 1e-5, warmup 30 epochs and the loss weights are v3 run-config values (v3 ran them under `cosine_with_warmup`, see REVISION 2026-09-30). Plateau patience 15, min_lr 1e-7, EMA 0.9995, early stopping 30 (then with min_delta 1e-5) and clip 1.0 come from the dt-band templates at 0bcdffc (2026-05-09), 32 windows per trajectory from d92d930 (2026-05-10), threshold 1e-3 and max_epochs 400 from 9738917 (2026-05-14). No in-repo run record uses this scheduler/EMA/early-stop/clip combination (corrected 2026-10-01; was "v3-lineage ... converged to val ~7e-4 historically"). weight_decay 1e-5 is exactly inactive in float32: AdamW decays a weight by lr·wd per step (3e-9 at the stage-1 peak, 3e-10 in stage 2), below float32's relative half-step 2^-25 ≈ 3e-8, so every decay step rounds back (audit: 300 real-model steps bitwise identical to wd = 0 on CPU; CUDA fused inferred from the kernel source); the 3.9% / 0.56% whole-run shrinkage bounds hold only in float64 (choice open, see open items). EMA window rule (1/(1−d) ≈ 1–10% of updates; whether per epoch or per run was never stated, and the two readings disagree, as the shares that follow show; ACE uses 0.9999): 0.9995 is a 2,000-step horizon, 0.06 of a 32,475-step stage-1 epoch and 0.015% of the 400-epoch budget (0.999 in stage 2: 1,000 steps, 0.05 of a 20,000-step epoch); 0.9999 would be 10,000 steps; not locally discriminable. | inherited [no spot-check; waiver pending the author] |
-| `dataset.train_batches_per_epoch` / `dataset.val_samples` | stage 1 32,475 / 8,246,528 (since 2026-09-30, replacing `windows_per_trajectory` 32); stage 2 20,000 / 2,621,440 (recipe R, 2026-10-01; was 93,367 / 23,708,768, from 92 windows per trajectory) | The epoch is a count of optimizer steps (one per batch of 2048 windows drawn with replacement) plus a fixed validation set, not a function of the dataset size. Stage 1's values reproduce the old epoch on the 4-file build (N_train 2,078,448 and N_val 257,704 windows): floor(N_train x 32 / 2048) and N_val x 32; the 32 windows per trajectory behind them are inherited with no recorded rationale. In optimizer steps: stage 1 LR warmup 30 epochs = 974,250, plateau patience 15 = 487,125, ES patience 30 = 974,250, 400 epochs = 12,990,000. Stage 2 (recipe R, author 2026-10-01) is a fixed step budget of 20,000 steps per epoch: warmup 1 = 20,000, plateau patience 5 = 100,000, ES patience 12 = 240,000, curriculum ramp 16 = 320,000, 120 epochs = 2,400,000. Its validation set is 1,280 full batches (no ragged last batch) and gives each of the 257,704 validation trajectories 10 or 11 even-stride starts: 11.3% of the 23,193,360 enumerated windows. Its val_loss is not comparable with full-set values, and the selection noise this adds is unmeasured. When raw data is added these counts stay fixed unless edited; if the stage-2 epoch length changes, re-derive every epoch-counted knob from its step target. | inherited (32); stage 2: recipe R, structure-derived, untested |
+| `dataset.train_batches_per_epoch` / `dataset.val_samples` | stage 1 32,475 / 8,246,528 (since 2026-09-30, replacing `windows_per_trajectory` 32); stage 2 20,000 / 2,621,440 (recipe R, 2026-10-01; was 93,367 / 23,708,768, from 92 windows per trajectory) | The epoch is a count of optimizer steps (one per batch of 2048 windows drawn with replacement) plus a fixed validation set, not a function of the dataset size. Stage 1's values reproduce the old epoch on the 4-file build (N_train 2,078,448 and N_val 257,704 windows): floor(N_train x 32 / 2048) and N_val x 32; the 32 windows per trajectory behind them are inherited with no recorded rationale. In optimizer steps: stage 1 LR warmup 30 epochs = 974,250, plateau patience 15 = 487,125, ES patience 30 = 974,250, 400 epochs = 12,990,000. Stage 2 (recipe R, author 2026-10-01) is a fixed step budget of 20,000 steps per epoch: warmup 1 = 20,000, plateau patience 5 = 100,000, ES patience 12 = 240,000, curriculum ramp 16 = 320,000, 120 epochs = 2,400,000. Its validation set is 1,280 full batches (no ragged last batch) and gives each of the 257,704 validation trajectories 10 or 11 even-stride starts: 11.3% of the 23,193,360 enumerated windows. Its val_loss is not comparable with full-set values, and the selection noise this adds is unmeasured. When raw data is added these counts stay fixed unless edited; if the stage-2 epoch length changes, re-derive every epoch-counted knob from its step target. The frozen-tail cut (D2, 2026-10-01; N_train 2,070,330, N_val 256,734) kept all four counts: both validation sets still fit (8,246,528 of 25,416,666 and 2,621,440 of 23,106,060 enumerated windows) with the same batch structure. | inherited (32); stage 2: recipe R, structure-derived, untested |
 | `precision.allow_tf32` | true (since 2026-09-30) | TF32 matmuls (cuBLAS through `set_float32_matmul_precision("high")`, cuDNN mirrored), as before. `runtime.deterministic=true` forces TF32 off whatever this key says, the coupling the code always had (deterministic runs are the full-fp32 reproducibility mode). The effective setting is logged at startup and recorded in provenance.jsonl. | inherited |
 | **stage-2 model block = stage-1 model block** | 10×2048 (fourier_dt OFF) | Fixes the historical inconsistency: the now-removed `configs/stage2_dt_bands/` declared 8×1536 but strict-load 10×2048 checkpoints from wrong paths — would hard-fail at startup. | high (correctness fix) [rubric: correctness fix, not evidence] |
 | `training.rollout_steps` (stage 2) | 10 | **E3 K_MAX sweep** (detached; ranked on the geometric, growing-dt metric): inverted-U — K=1: 6.5e-3–1.9e-2, K=5: 4.4e-3, K=10: 2.4e-3 (±3%, 3 seeds), K=20: 1.2–3.3e-2 + one 1.0-dex fixed-dt blow-up. List et al. (arXiv v1 and v2): detached training of a Kuramoto–Sivashinsky correction CNN diverged beyond ~6 unrolled steps (v2 relates this to t_c/2); our detached E3 optimum among the tested values was K=10, so only the inverted-U shape transfers, not the number (corrected 2026-10-01). K=10 is inside every published envelope (GraphCast 12 max). Training horizon ≪ deployment horizon is universal practice. | medium-high |
@@ -915,7 +969,8 @@ far worse below 1e-25, leave-one-out p99 0.54 dex). So:
 - val_loss is comparable only while the raw cadence and the interpolation are unchanged: check the
   time grid of new raw files (preprocessing_summary.json records it per file).
 Trace levels enter log10-MAE at full weight (epsilon = drop_below = 1e-30); points below 1e-20 carry
-about 14% of the interpolation error. Constant raw tails (open items) biased these estimates low
+about 14% of the interpolation error. Constant raw tails (open item 17; the converged ones, about
+95%, stay in the data after the D2 cut) biased these estimates low
 (leave-one-out p90 at 1e7 s: 1.4e-3 dex with them, 3.8e-3 without). Measuring the true floor needs
 dense-output VULCAN reruns for a few (T, P) (recommendation).
 
@@ -1073,7 +1128,14 @@ exists, the audit's recommendation. Items already recorded in a row above are po
     _FROZEN_TAIL_MAX_PRECHANGE_DEX = 1e-3; keeps ~84% of the affected chunks, loses 0.39% of all
     chunks; 429 groups lose all chunks), then rebuild and retrain; report steady-state rows as a
     separate evaluation stratum. The audit's float32 and leave-one-out numbers were biased by these
-    rows.
+    rows. **Decided 2026-10-01 (author), implemented (D2; see the revision entry)**: the
+    mid-evolution freezes are cut after their last changing row and converged tails kept. Measured:
+    16,311 cut, 84.4% of their windows kept, 0.39% of all windows lost; 986 trajectories lose every
+    window (429 too short for any window, as the audit counted, plus 557 whose four random dt draws
+    all failed); steady-state windows are a separate stratum in eval_rollout_error.py. Retraining
+    on the rebuilt data is the author's. Not re-measured (audit estimate): 3,894 cut trajectories
+    would have fallen below drop_below within their tail had the last rate continued, a part of the
+    drop_below bias (item 19).
 18. Sub-1e-20 labels (R2-014): the generator's solver tolerances and stop criterion are unrecorded,
     and epsilon = drop_below = 1e-30 is inherited against a measured ~1e-20 solver-control floor.
     Below ~1e-20 the raw series are much rougher: isolated > 0.3 dex excursions at 2.5e-3 per point

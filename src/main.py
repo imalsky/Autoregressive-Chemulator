@@ -857,7 +857,8 @@ def _check_raw_files(cfg: Mapping[str, Any], recorded: List[Any], *, fresh: bool
 def _check_build_matches_config(
     cfg: Mapping[str, Any], processed_dir: Path, *, manifest_sha256: str, fresh: bool
 ) -> None:
-    """The processed_dir must have been built, with this normalization.json, from this config's blocks."""
+    """The processed_dir must have been built, with this normalization.json, from this config's blocks,
+    by a preprocessing that records the frozen-tail truncation (frozen_tail)."""
     spath = processed_dir / _SUMMARY_NAME
     if not spath.is_file():
         raise FileNotFoundError(f"missing {spath}: every processed_dir needs its build record; rebuild it")
@@ -865,6 +866,12 @@ def _check_build_matches_config(
     blocks, raw_files = summary.get("config_blocks"), summary.get("raw_files")
     if not isinstance(blocks, Mapping) or not isinstance(raw_files, list):
         raise ValueError(f"{spath} records no config_blocks/raw_files (built before 2026-09-30): rebuild required")
+    frozen_tail = summary.get("frozen_tail")
+    if not isinstance(frozen_tail, Mapping) or "max_prechange_dex" not in frozen_tail:
+        raise ValueError(
+            f"{spath} records no frozen_tail (built before the frozen-tail truncation of 2026-10-01, "
+            "docs/DECISIONS.md open item 17): rebuild required"
+        )
     if summary.get("norm_sha256") != manifest_sha256:
         raise ValueError(
             f"{processed_dir}/normalization.json (norm_sha256 {manifest_sha256}) is not the one its build "

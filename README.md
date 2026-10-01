@@ -38,7 +38,8 @@ the config values (values without evidence are listed there as inherited / unjus
       predictions.py      autoregressive rollout plots (diagnostic)
       training_logs.py    training-curve plots (diagnostic)
       eval_rollout_error.py   rollout-error curves vs step over a seeded validation sample (per-species dex),
-                              with persistence, loss vs persistence by window-start decade, gate-1 lines
+                              with persistence, loss vs persistence by window-start decade, gate-1 lines,
+                              steady-state windows reported apart from the evolving ones (the headline)
       bench_speedup.py    exported-model (CPU and CUDA) latency sweep vs mini-chem per-cell cost
       run_local_smoke.sh  end-to-end smoke on synthetic data (the integration gate)
     run_daw.sh            daw launcher: preprocess -> stage 1 -> stage 2, each with its post step
@@ -76,11 +77,18 @@ Training holds the same lock shared from reading `normalization.json` until both
 preloaded (`eval_rollout_error.py` while it loads its rows), so neither waits: a training start
 fails while preprocessing runs, and preprocessing fails while a training start is loading. Stage 2
 reuses these same shards.
+A trajectory whose raw output froze in mid-evolution (the generator repeated its last state
+while a species was still changing by more than 1e-3 dex per raw interval) is cut after its last
+changing row, so its windows come only from the evolving part; one with no room left for a
+window is rejected (`frozen_tail_no_window`). Converged repeated tails are kept. On the 4 raw
+files this cuts 16,311 of 649,084 kept trajectories and rejects 986 of them (docs/DECISIONS.md,
+open item 17).
 `normalization.json` also records the input units and the trained domain (window start
 times, (T, P) coverage, the tracked-species sum); `preprocessing_summary.json` is the
-build record (per raw file: size, groups, rejects, windows; the config blocks used; the
-normalization fingerprint). Training refuses a processed dir whose record does not match
-its config (except `overwrite`, `num_workers`), whose `normalization.json` was changed
+build record (per raw file: size, groups, rejects, windows; the frozen-tail counts; the config
+blocks used; the normalization fingerprint). Training refuses a processed dir whose record does
+not match its config (except `overwrite`, `num_workers`), that was built before the frozen-tail
+cut (2026-10-01), whose `normalization.json` was changed
 after the build, or (fresh runs) whose raw files were added or resized since: rebuild
 it, into a new `processed_dir` if the old one must stay.
 
