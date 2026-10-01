@@ -1,5 +1,41 @@
 # Production config decisions — evidence and justification
 
+## REVISION 2026-10-01: four run-contract fixes from an independent review (theme D1b)
+
+Training numerics are unchanged (30-step fingerprints of both stages bitwise identical to
+`ref_after_D1_s1` / `_s2`). What changed:
+- **Processed-data lock.** Training holds a shared flock on `<processed_dir>.lock` (the file
+  preprocessing locks exclusively for its whole run) from before it reads normalization.json and
+  the build record until both splits are preloaded, then releases it; `testing/eval_rollout_error.py`
+  holds it from its manifest read until its rows are loaded. Neither side waits: a training start
+  (or that evaluation) fails at once while preprocessing runs, and preprocessing fails at once
+  while a reader holds it. A reader creates a missing lock file, as preprocessing does. Not locked:
+  `testing/export.py` (reads normalization.json only) and `testing/predictions.py` (a diagnostic
+  figure from one shard). Before, a rebuild could swap shards in under a training start that had
+  already read the old manifest.
+- **Non-finite training loss.** At the end of every epoch (on_validation_epoch_end, before that
+  epoch's checkpoints and before the val_loss check) the epoch's device-side training-loss sum
+  is checked once; a non-finite one aborts the run (exit 1), naming the epoch and global step. It
+  is caught at the end of its epoch, not at the step (no per-step host sync): the rest of that
+  epoch still trains, and none of it is checkpointed. Before, only a non-finite val_loss aborted,
+  and the EMA val_loss can stay finite while the live training loss is not.
+- **A finished run that died before publishing.** Every checkpoint now also stores the val_loss of
+  the epoch that saved it (`epoch_val_loss`). A resume whose checkpoint is terminal (early stopping
+  exhausted its patience, or the last epoch of max_epochs) in a work_dir without COMPLETED now
+  publishes best.ckpt and COMPLETED from the checkpoint's state, through the same publication
+  code and checks as the end of fit, without training, and exits 0 (run_daw.sh then runs the
+  post step and stage 2); it appends a provenance line (`published_without_training`) and writes
+  no config.resume snapshot. COMPLETED present still refuses. A terminal checkpoint without
+  `epoch_val_loss` (written before this change) is refused. This supersedes the T7 rule below
+  that refused every terminal checkpoint: deleting COMPLETED without raising max_epochs now
+  republishes the same files instead of failing; extending still means deleting COMPLETED and
+  raising max_epochs, and an early-stopped run continues only as a new weights_only run.
+- **Handoff identity.** weights_only from a source run's `checkpoints/best.ckpt` requires its
+  sha256 to equal the `best.sha256` that run's COMPLETED records (a mismatch or a missing record
+  is refused before loading). Any other file of that run (e.g. a deliberate last.ckpt) loads with
+  a WARNING naming it and the recorded best. The loaded file's sha256 was already recorded
+  (`init_checkpoint.sha256` in provenance.jsonl).
+
 ## REVISION 2026-10-01: stage-2 recipe R, the handoff LR cap, persistence skill and a provisional gate 1 (author decisions, theme D1)
 
 Author decisions of 2026-10-01 (open items 1, 2, 8, 9 and 10). The persistence diagnostics change

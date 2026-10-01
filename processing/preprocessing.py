@@ -28,8 +28,11 @@ Temporary stage (under paths.processed_dir):
   until the new one is complete: only preprocessing-owned entries are swapped, with
   normalization.json (the launchers' "dataset complete" marker) moved out first and in last.
 
-Lock: <processed_dir>.lock, a persistent 0-byte sibling file, is flocked for the whole run so
-two preprocessing runs (or leftover workers of a killed run) never share a processed_dir.
+Lock: <processed_dir>.lock, a persistent 0-byte sibling file, is flocked exclusively for the whole
+run so two preprocessing runs (or leftover workers of a killed run) never share a processed_dir,
+and training (src/main.py, which holds it shared from reading normalization.json until both splits
+are preloaded) or the rollout-error evaluation never reads a half-replaced dataset. Either side
+fails at once while the other holds it.
 
 Shard schema:
   Physical shards (temporary):
@@ -187,7 +190,8 @@ _ALLOWED_GLOBAL_METHODS = {"standard", "min-max", "log-min-max", "log-standard"}
 # Config keys starting with this prefix are comments (same rule as src/utils.py); any other
 # '_'-prefixed key is unknown.
 _COMMENT_KEY_PREFIX = "_comment"
-# One preprocessing run per processed_dir: <processed_dir>.lock is flocked for the whole run.
+# One preprocessing run per processed_dir: <processed_dir>.lock is flocked for the whole run
+# (readers lock the same file shared: src/utils.py PROCESSED_DIR_LOCK_SUFFIX must equal this).
 _LOCK_SUFFIX = ".lock"
 # prctl(2) option from <linux/prctl.h>: signal this process when its parent thread exits.
 _PR_SET_PDEATHSIG = 1
@@ -1813,7 +1817,9 @@ def main() -> None:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         raise RuntimeError(
-            f"another preprocessing run, or leftover workers of a killed run, still holds {lock_path}"
+            f"{lock_path} is held by another preprocessing run (or leftover workers of a killed run), or by a "
+            "training or evaluation process reading this processed_dir (training holds it from its manifest "
+            "read until both splits are preloaded); not touching it"
         ) from None
 
     # Refuse before creating or deleting anything: overwrite=false never deletes. The previous

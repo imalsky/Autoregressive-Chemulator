@@ -11,6 +11,7 @@ Included helpers:
   - comment keys, dotted flattening and the model-block check shared by main.py and export.py
   - normalization_sha256: the fingerprint that ties a checkpoint or export to its normalization
   - file_sha256, git_state, collect_provenance: best-effort run and export provenance
+  - lock_processed_dir_shared: a reader's shared flock on the processed data (vs preprocessing)
   - PrecisionConfig / parse_precision_config: central dtype configuration for training
 
 Note:
@@ -20,6 +21,7 @@ Note:
 from __future__ import annotations
 
 import datetime
+import fcntl
 import hashlib
 import importlib.metadata
 import json
@@ -54,6 +56,12 @@ NORM_FINGERPRINT_KEYS = (
 )
 # Streamed hashing of checkpoints / artifacts (bytes per read).
 _HASH_CHUNK_BYTES = 1 << 20
+# processing/preprocessing.py flocks <processed_dir>.lock (a persistent 0-byte sibling of the resolved
+# processed_dir; must equal its _LOCK_SUFFIX) exclusively for its whole run. Readers that load the
+# manifest and then the shards hold it shared meanwhile, so neither side sees the other half-way.
+PROCESSED_DIR_LOCK_SUFFIX = ".lock"
+# Mode of a lock file a reader creates: open()'s default, as preprocessing's open(lock_path, "w").
+_LOCK_FILE_MODE = 0o666
 # A provenance subprocess (git, nvidia-smi) that takes longer than this is recorded as an error.
 _PROVENANCE_SUBPROCESS_TIMEOUT_S = 10.0
 
@@ -174,6 +182,28 @@ def file_sha256(path: Union[str, os.PathLike]) -> str:
         for chunk in iter(lambda: f.read(_HASH_CHUNK_BYTES), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def lock_processed_dir_shared(processed_dir: Union[str, os.PathLike]) -> int:
+    """Take a shared, non-blocking flock on <processed_dir>.lock; return its fd (os.close releases it).
+
+    Fails at once while a preprocessing run holds the lock (it is rebuilding processed_dir). A
+    missing lock file (a build copied without it) is created, as preprocessing creates it, so both
+    sides always lock the same file.
+    """
+    resolved = Path(processed_dir).resolve()
+    if not resolved.is_dir():
+        raise FileNotFoundError(f"processed_dir {resolved} does not exist (paths.processed_dir)")
+    lock_path = resolved.parent / (resolved.name + PROCESSED_DIR_LOCK_SUFFIX)
+    fd = os.open(lock_path, os.O_RDONLY | os.O_CREAT, _LOCK_FILE_MODE)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise RuntimeError(
+            f"{lock_path} is held by a preprocessing run that is rebuilding {resolved}; wait for it to finish"
+        ) from None
+    return fd
 
 
 def best_effort(fn: Callable[[], Any]) -> Any:

@@ -10,11 +10,14 @@ Principles (by design):
 This script:
 1) Loads config JSON and validates it (keys, types, cross-key rules, runtime constraints).
 2) Resolves relative paths relative to the config file directory.
-3) Loads the normalization manifest (processed_dir/normalization.json), builds the model
-   and loads weights_only weights (capping the peak LR at the source checkpoint's LR), all
-   before the run directory is created.
+3) Takes a shared flock on <processed_dir>.lock (held until step 5 has preloaded both splits;
+   preprocessing holds it exclusively), loads the normalization manifest
+   (processed_dir/normalization.json), builds the model and loads weights_only weights (capping
+   the peak LR at the source checkpoint's LR), all before the run directory is created.
 4) Creates and flocks work_dir (one training process per run directory), then checks its
-   contents (fresh: empty; resume: the run it continues) and opens work_dir/train.log.
+   contents (fresh: empty; resume: the run it continues) and opens work_dir/train.log. A resume
+   from the final checkpoint of a run that died before publishing publishes best.ckpt and
+   COMPLETED from it and exits 0, without training.
 5) Builds datasets/dataloaders sized for the rollouts actually used (memory budget first).
 6) Runs Lightning training using explicit checkpoint behavior.
 
@@ -49,7 +52,13 @@ from lightning.pytorch.utilities.exceptions import SIGTERMException
 
 from dataset import FlowMapRolloutDataset, create_train_dataloader, create_val_dataloader, preload_nbytes
 from model import _REQUIRED_GLOBALS, create_model
-from trainer import _MONITOR_METRIC, FlowMapRolloutModule, build_lightning_trainer, build_loss_buffers
+from trainer import (
+    _MONITOR_METRIC,
+    CKPT_EPOCH_VAL_LOSS_KEY,
+    FlowMapRolloutModule,
+    build_lightning_trainer,
+    build_loss_buffers,
+)
 from utils import (
     as_bool,
     as_int,
@@ -63,6 +72,7 @@ from utils import (
     flatten_dotted,
     is_comment_key,
     load_json_config,
+    lock_processed_dir_shared,
     non_finite_tensor_keys,
     normalization_sha256,
     parse_precision_config,
@@ -113,6 +123,8 @@ _BYTES_PER_MB = 1e6
 # with patience exhausted, with a finite last val_loss and best score. run_daw.sh gates on it; a
 # resume refuses a run that has it, and weights_only refuses a source run without it.
 _COMPLETED_NAME = "COMPLETED"
+# The stable-name copy of a finished run's best-val_loss checkpoint (export and the stage-2 handoff).
+_BEST_CKPT_NAME = "best.ckpt"
 # One JSON line per invocation (append-only): environment, code, data and init-checkpoint identity.
 _PROVENANCE_NAME = "provenance.jsonl"
 # weights_only: the loaded weights' validation scores before any training (separate Trainer).
@@ -1116,7 +1128,9 @@ def _load_weights_only(module: FlowMapRolloutModule, ckpt_path: Path) -> float:
 
     The source run must be finished (its work_dir holds COMPLETED: best.ckpt of a run that is
     still being extended is not a handoff), and the checkpoint must have been trained in this
-    processed_dir's normalization (norm_sha256). Uses ``ema_state_dict`` (saved by EMACallback),
+    processed_dir's normalization (norm_sha256). The source run's checkpoints/best.ckpt must have
+    the sha256 its COMPLETED records; any other file of that run (e.g. a deliberate last.ckpt) loads
+    with a WARNING naming the recorded best. Uses ``ema_state_dict`` (saved by EMACallback),
     which holds the smoothed weights that produced the checkpoint's val_loss; it is required when
     the checkpoint's own run had EMA enabled. The checkpoint's saved model block must equal this
     run's (comment keys ignored), every floating tensor must be finite, and any missing or
@@ -1131,6 +1145,24 @@ def _load_weights_only(module: FlowMapRolloutModule, ckpt_path: Path) -> float:
         raise FileNotFoundError(
             f"weights_only source run {source_run} has no {_COMPLETED_NAME} marker: it did not finish "
             f"(or is being extended), so {ckpt_path.name} is not a final handoff checkpoint"
+        )
+    best = load_json_config(source_run / _COMPLETED_NAME).get("best")
+    best_sha = best.get("sha256") if isinstance(best, Mapping) else None
+    best_ckpt = source_run / "checkpoints" / _BEST_CKPT_NAME
+    if ckpt_path.resolve() == best_ckpt.resolve():
+        if not best_sha:
+            raise ValueError(f"{source_run / _COMPLETED_NAME} records no best.sha256: cannot verify {ckpt_path}")
+        sha = file_sha256(ckpt_path)
+        if sha != best_sha:
+            raise ValueError(
+                f"{ckpt_path} has sha256 {sha}, not the {best_sha} its run's {_COMPLETED_NAME} records: "
+                "replaced or modified after the run finished; refusing the handoff"
+            )
+    else:
+        log.warning(
+            "weights_only: %s is not the source run's %s (its %s records best %s, sha256 %s); loading it as configured",
+            ckpt_path, best_ckpt, _COMPLETED_NAME,
+            best.get("source") if isinstance(best, Mapping) else None, best_sha,
         )
 
     obj = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
@@ -1254,12 +1286,13 @@ def _check_resume_checkpoint(ckpt_path: Path, work_dir: Path, *, checkpointing: 
             )
 
 
-def _check_resume_not_finished(ckpt_path: Path, work_dir: Path, *, max_epochs: int) -> None:
+def _check_resume_not_finished(ckpt_path: Path, work_dir: Path, *, max_epochs: int) -> Optional[str]:
     """A resume must not extend a finished run by accident (it would rewrite its checkpoints).
 
-    Refuses when work_dir holds COMPLETED, or when the checkpoint itself is from a finished run
-    (last epoch of max_epochs, or early stopping already stopped it): the second case covers a
-    run that ended before COMPLETED was written.
+    Refuses when work_dir holds COMPLETED. A checkpoint from a finished run without COMPLETED (early
+    stopping exhausted its patience, or the last epoch of max_epochs) is a run that died after its
+    final last.ckpt, before best.ckpt and COMPLETED were published: return its stop reason (decided
+    as _completion does) so main() publishes it without training; None for a run to continue.
     """
     marker = work_dir / _COMPLETED_NAME
     if marker.exists():
@@ -1268,21 +1301,21 @@ def _check_resume_not_finished(ckpt_path: Path, work_dir: Path, *, max_epochs: i
             f"To extend it deliberately, delete {marker} and raise training.max_epochs"
         )
     obj = torch.load(str(ckpt_path), map_location="cpu", weights_only=True, mmap=True)
-    epoch = obj.get("epoch") if isinstance(obj, dict) else None
-    if isinstance(epoch, int) and epoch + 1 >= max_epochs:
-        raise RuntimeError(
-            f"resume checkpoint {ckpt_path} is from epoch {epoch}, the last of training.max_epochs={max_epochs}: "
-            "the run already finished; raise training.max_epochs to extend it deliberately"
-        )
     for key, state in ((obj.get("callbacks") or {}) if isinstance(obj, dict) else {}).items():
         if "EarlyStopping" in str(key) and isinstance(state, Mapping):
             reason = state.get("stopping_reason", EarlyStoppingReason.NOT_STOPPED.value)
+            if reason == EarlyStoppingReason.PATIENCE_EXHAUSTED.value:
+                return "early_stopping"
             if reason != EarlyStoppingReason.NOT_STOPPED.value:
                 raise RuntimeError(
                     f"resume checkpoint {ckpt_path}: early stopping already stopped this run "
                     f"({state.get('stopping_reason_message')!r}); start a new run with "
                     "training.checkpoint_mode='weights_only' instead"
                 )
+    epoch = obj.get("epoch") if isinstance(obj, dict) else None
+    if isinstance(epoch, int) and epoch + 1 >= max_epochs:
+        return "max_epochs"
+    return None
 
 
 def _check_resume_config(cfg: Mapping[str, Any], work_dir: Path) -> None:
@@ -1342,6 +1375,29 @@ def _append_provenance(work_dir: Path, record: Mapping[str, Any]) -> None:
         os.fsync(f.fileno())
 
 
+def _completion_record(
+    stop_reason: str, *, epochs: int, global_step: int, last_val_loss: Any, best: Optional[List[Any]]
+) -> Dict[str, Any]:
+    """The COMPLETED record, or raise (no best.ckpt, no marker, exit 1): the last val_loss must be
+    finite and, with checkpointing (`best` = the val_loss ModelCheckpoint's [best_model_path,
+    best_model_score]), so must the best score."""
+    if last_val_loss is None or not math.isfinite(float(last_val_loss)):
+        raise RuntimeError(f"last {_MONITOR_METRIC} is {last_val_loss!r}; not publishing best.ckpt or COMPLETED")
+    rec: Dict[str, Any] = {
+        "stop_reason": stop_reason,
+        "epochs": int(epochs),
+        "global_step": int(global_step),
+        "last_val_loss": float(last_val_loss),
+        "best": None,
+    }
+    if best is not None:
+        path, score = best
+        if score is None or not math.isfinite(float(score)):
+            raise RuntimeError(f"best {_MONITOR_METRIC} score is {score!r}; not publishing best.ckpt or COMPLETED")
+        rec["best"] = {"source": str(path or ""), "val_loss": float(score)}
+    return rec
+
+
 def _completion(trainer: pl.Trainer, *, ckpt_enabled: bool) -> Dict[str, Any]:
     """The COMPLETED record of a run that finished, or raise (no best.ckpt, no marker, exit 1).
 
@@ -1359,25 +1415,80 @@ def _completion(trainer: pl.Trainer, *, ckpt_enabled: bool) -> Dict[str, Any]:
             f"training stopped at epoch {trainer.current_epoch} of max_epochs={trainer.max_epochs} without "
             "early stopping (interrupted?); not publishing best.ckpt or COMPLETED; resume from last.ckpt"
         )
-    last = trainer.callback_metrics.get(_MONITOR_METRIC)
-    if last is None or not math.isfinite(float(last)):
-        raise RuntimeError(f"last {_MONITOR_METRIC} is {last!r}; not publishing best.ckpt or COMPLETED")
-    rec: Dict[str, Any] = {
-        "stop_reason": stop_reason,
-        "epochs": int(trainer.current_epoch),
-        "global_step": int(trainer.global_step),
-        "last_val_loss": float(last),
-        "best": None,
-    }
+    best = None
     if ckpt_enabled:
         top_k = [c for c in trainer.checkpoint_callbacks if getattr(c, "monitor", None) == _MONITOR_METRIC]
         if len(top_k) != 1:
             raise RuntimeError(f"expected exactly one {_MONITOR_METRIC} ModelCheckpoint callback, found {len(top_k)}")
-        score = top_k[0].best_model_score
-        if score is None or not math.isfinite(float(score)):
-            raise RuntimeError(f"best {_MONITOR_METRIC} score is {score!r}; not publishing best.ckpt or COMPLETED")
-        rec["best"] = {"source": str(top_k[0].best_model_path or ""), "val_loss": float(score)}
-    return rec
+        best = [top_k[0].best_model_path, top_k[0].best_model_score]
+    return _completion_record(
+        stop_reason, epochs=trainer.current_epoch, global_step=trainer.global_step,
+        last_val_loss=trainer.callback_metrics.get(_MONITOR_METRIC), best=best,
+    )
+
+
+def _completion_from_checkpoint(
+    module: FlowMapRolloutModule, ckpt_path: Path, stop_reason: str, *, ckpt_enabled: bool
+) -> Dict[str, Any]:
+    """The COMPLETED record from a terminal resume checkpoint (_check_resume_not_finished), or raise.
+
+    The checkpoint was written in its run's final epoch's on_train_epoch_end, after that epoch's
+    early-stopping check and top-k save, so its state is what _completion would have read: epochs =
+    its epoch + 1, its global_step, its stored val_loss (CKPT_EPOCH_VAL_LOSS_KEY) and the val_loss
+    ModelCheckpoint's best path and score; the same checks apply. Its norm_sha256 is checked as a
+    resume's is (module.on_load_checkpoint, which Lightning would call in fit).
+    """
+    obj = torch.load(str(ckpt_path), map_location="cpu", weights_only=True, mmap=True)
+    module.on_load_checkpoint(obj)
+    if CKPT_EPOCH_VAL_LOSS_KEY not in obj:
+        raise KeyError(
+            f"{ckpt_path} holds no {CKPT_EPOCH_VAL_LOSS_KEY!r} (written before 2026-10-01), so its run cannot be "
+            "published without training; raise training.max_epochs to finish it with one more epoch, or "
+            "start a new run from it with checkpoint_mode='weights_only'"
+        )
+    best = None
+    if ckpt_enabled:
+        states = [s for k, s in (obj.get("callbacks") or {}).items()
+                  if str(k).startswith("ModelCheckpoint") and isinstance(s, Mapping) and s.get("monitor") == _MONITOR_METRIC]
+        if len(states) != 1:
+            raise RuntimeError(f"{ckpt_path}: expected exactly one {_MONITOR_METRIC} ModelCheckpoint state, found {len(states)}")
+        best = [states[0].get("best_model_path"), states[0].get("best_model_score")]
+    return _completion_record(
+        stop_reason, epochs=int(obj["epoch"]) + 1, global_step=obj["global_step"],
+        last_val_loss=obj[CKPT_EPOCH_VAL_LOSS_KEY], best=best,
+    )
+
+
+def _publish_completion(work_dir: Path, completed: Dict[str, Any]) -> None:
+    """Publish a finished run: copy its best checkpoint to checkpoints/best.ckpt (checkpointing on), then
+    write COMPLETED last. The end of fit and a terminal resume checkpoint both publish through here.
+    """
+    # The stable name is what export tooling (testing/export.py, testing/aoti_export.py) and the
+    # stage-2 handoff consume.
+    if completed["best"] is not None:
+        best_src = completed["best"]["source"].strip()
+        if not best_src:
+            raise RuntimeError(
+                "checkpointing enabled but ModelCheckpoint.best_model_path is empty; "
+                "no best checkpoint was saved during fit"
+            )
+        best_path = Path(best_src)
+        if not best_path.is_file():
+            raise FileNotFoundError(f"best checkpoint not found: {best_path}")
+        ckpt_dir = (work_dir / "checkpoints").resolve()
+        if best_path.resolve().parent != ckpt_dir:
+            raise RuntimeError(
+                f"best checkpoint {best_path} is outside this run's checkpoints dir {ckpt_dir}; "
+                "refusing to publish it as best.ckpt"
+            )
+        dst = work_dir / "checkpoints" / _BEST_CKPT_NAME
+        tmp = dst.parent / (dst.name + ".tmp")
+        shutil.copy2(best_path, tmp)
+        tmp.replace(dst)
+        completed["best"]["sha256"] = file_sha256(dst)
+        log.info("best checkpoint (val_loss): %s -> %s", best_path, dst)
+    atomic_write_json(work_dir / _COMPLETED_NAME, completed)
+    log.info("run finished (%s after %d epochs): wrote %s", completed["stop_reason"], completed["epochs"], _COMPLETED_NAME)
 
 
 def main() -> None:
@@ -1442,6 +1553,11 @@ def main() -> None:
 
     processed_dir = Path(as_str(require(paths, "processed_dir"), "paths.processed_dir")).expanduser().resolve()
 
+    # Shared lock on the processed data from the manifest read until both splits are preloaded
+    # (released below): preprocessing holds it exclusively while it replaces the data, so this run
+    # never pairs one build's manifest with another's shards. Either side fails at once on the other.
+    data_lock_fd = lock_processed_dir_shared(processed_dir)
+
     # Manifest must exist and must declare variable lists that exactly match config.data.
     manifest, species_vars, global_vars = load_manifest_and_validate_config(
         cfg, processed_dir, fresh=ckpt_mode == "none"
@@ -1492,6 +1608,7 @@ def main() -> None:
     # No automatic backups. Fresh training requires an empty work_dir (a lone train.log from a
     # run that failed after creating work_dir counts as empty and is appended to).
     # Resume mode allows non-empty work_dir (continuing in same directory).
+    terminal_stop_reason: Optional[str] = None
     if ckpt_mode != "resume":
         if any(p.name != _RUN_LOG_NAME for p in work_dir.iterdir()):
             raise RuntimeError(
@@ -1503,10 +1620,38 @@ def main() -> None:
             )
     else:
         # A resume continues this run: its own checkpoint, its own ModelCheckpoint state, its own config.
-        _check_resume_not_finished(ckpt_path, work_dir, max_epochs=as_int(tcfg["max_epochs"], "training.max_epochs"))
+        terminal_stop_reason = _check_resume_not_finished(
+            ckpt_path, work_dir, max_epochs=as_int(tcfg["max_epochs"], "training.max_epochs")
+        )
         _check_resume_checkpoint(ckpt_path, work_dir, checkpointing=ckpt_enabled)
         _check_resume_config(cfg, work_dir)
     _attach_run_log(work_dir)
+
+    if terminal_stop_reason is not None:
+        # The run finished training but died before publishing: publish best.ckpt and COMPLETED from
+        # the checkpoint's state, without training (idempotent; exit 0, so run_daw.sh carries on).
+        completed = _completion_from_checkpoint(lit_module, ckpt_path, terminal_stop_reason, ckpt_enabled=ckpt_enabled)
+        log.info(
+            "resume checkpoint %s is the run's final one (%s, %d epochs) and %s is missing: publishing it "
+            "without training (%s)", ckpt_path, terminal_stop_reason, completed["epochs"], _COMPLETED_NAME,
+            "to extend the run instead, delete COMPLETED and raise training.max_epochs"
+            if terminal_stop_reason == "max_epochs" else
+            "early stopping ended it; to train further, start a new run with checkpoint_mode='weights_only'",
+        )
+        _append_provenance(work_dir, collect_provenance(
+            _CODE_DIR,
+            autochem_config_path=os.environ.get("AUTOCHEM_CONFIG_PATH"),
+            config_snapshot=None,
+            checkpoint_mode=ckpt_mode,
+            published_without_training=True,
+            init_checkpoint=best_effort(lambda: _init_checkpoint_record(ckpt_path)),
+            processed_dir=str(processed_dir),
+            norm_sha256=lit_module.hparams["norm_sha256"],
+            tf32=tf32,
+        ))
+        _publish_completion(work_dir, completed)
+        os.close(data_lock_fd)
+        return
 
     preload_device = select_preload_device(cfg)
     log.info("preload device: %s", preload_device)
@@ -1519,6 +1664,7 @@ def main() -> None:
         preload_device=preload_device,
         seed=seed,
     )
+    os.close(data_lock_fd)  # both splits are preloaded: release the processed-data lock
     train_batches_per_epoch = len(train_dl)
     _log_schedule_in_steps(cfg, steps_per_epoch=train_batches_per_epoch)
 
@@ -1577,34 +1723,7 @@ def main() -> None:
         metrics_part.replace(work_dir / "metrics.csv")
 
     # Only a finished run publishes best.ckpt and COMPLETED (decided first; otherwise exit 1).
-    completed = _completion(trainer, ckpt_enabled=ckpt_enabled)
-
-    # Publish the best-val_loss checkpoint under a stable name for export tooling
-    # (testing/export.py, testing/aoti_export.py consume checkpoints/best.ckpt).
-    if ckpt_enabled and trainer.is_global_zero:
-        best_src = completed["best"]["source"].strip()
-        if not best_src:
-            raise RuntimeError(
-                "checkpointing enabled but ModelCheckpoint.best_model_path is empty; "
-                "no best checkpoint was saved during fit"
-            )
-        best_path = Path(best_src)
-        if not best_path.is_file():
-            raise FileNotFoundError(f"best checkpoint not found: {best_path}")
-        ckpt_dir = (work_dir / "checkpoints").resolve()
-        if best_path.resolve().parent != ckpt_dir:
-            raise RuntimeError(
-                f"best checkpoint {best_path} is outside this run's checkpoints dir {ckpt_dir}; "
-                "refusing to publish it as best.ckpt"
-            )
-        dst = work_dir / "checkpoints" / "best.ckpt"
-        tmp = dst.parent / (dst.name + ".tmp")
-        shutil.copy2(best_path, tmp)
-        tmp.replace(dst)
-        completed["best"]["sha256"] = file_sha256(dst)
-        log.info("best checkpoint (val_loss): %s -> %s", best_path, dst)
-    atomic_write_json(work_dir / _COMPLETED_NAME, completed)
-    log.info("run finished (%s after %d epochs): wrote %s", completed["stop_reason"], completed["epochs"], _COMPLETED_NAME)
+    _publish_completion(work_dir, _completion(trainer, ckpt_enabled=ckpt_enabled))
 
 
 if __name__ == "__main__":

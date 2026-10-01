@@ -97,6 +97,9 @@ _MONITOR_METRIC = "val_loss"
 _MONITOR_MODE = "min"
 # last.ckpt must hold the latest completed epoch (auto-resume starts from it).
 LAST_CKPT_EVERY_N_EPOCHS = 1
+# Checkpoint key holding the val_loss of the epoch that saved it: Lightning's callback state keeps only
+# best/top-k scores, and main.py publishes a run that died after its final last.ckpt from this value.
+CKPT_EPOCH_VAL_LOSS_KEY = "epoch_val_loss"
 # One validation batch before epoch 0 runs the validation step (and its compiled path) once, so a
 # compile or shape failure surfaces in minutes instead of after the first ~2 h epoch.
 _SANITY_VAL_BATCHES = 1
@@ -539,6 +542,8 @@ class FlowMapRolloutModule(pl.LightningModule):
         # sample count (steps x batch_size) relies on the same fact.
         self._train_loss_sum: Optional[torch.Tensor] = None
         self._train_loss_n = 0
+        # The latest epoch's val_loss (a float), stored in every checkpoint (CKPT_EPOCH_VAL_LOSS_KEY).
+        self._epoch_val_loss: Optional[float] = None
         # runtime.log_grad_norm: per-epoch device sum of [pre-clip total grad norm, clip fired] over
         # optimizer steps, logged once per epoch as grad_norm (mean) and grad_clip_frac.
         self._grad_stats_sum: Optional[torch.Tensor] = None
@@ -562,6 +567,10 @@ class FlowMapRolloutModule(pl.LightningModule):
                 f"resume checkpoint norm_sha256={saved!r} does not match this processed_dir's normalization.json "
                 f"({self.hparams['norm_sha256']}); the checkpoint was trained on other normalization statistics"
             )
+
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        """Store the saving epoch's val_loss (already a host float; CKPT_EPOCH_VAL_LOSS_KEY)."""
+        checkpoint[CKPT_EPOCH_VAL_LOSS_KEY] = self._epoch_val_loss
 
     # ------------------------
     # Fit-time note about metric comparability
@@ -1079,12 +1088,23 @@ class FlowMapRolloutModule(pl.LightningModule):
         return self._eval_step(batch)
 
     def on_validation_epoch_end(self) -> None:
-        """Abort on a non-finite val_loss, then step the ReduceLROnPlateau scheduler (both modes).
+        """Abort on a non-finite training loss or val_loss, then step the ReduceLROnPlateau scheduler.
 
         This hook runs once val_loss is final and before ModelCheckpoint/EarlyStopping act on it
         (they run in on_train_epoch_end), so a diverged epoch writes no checkpoint and every
         checkpoint holds the scheduler state after this epoch's plateau step (resume-safe).
         """
+        # A non-finite training loss is caught here, at the end of its epoch, not at the step: the
+        # check reads the epoch's device-side loss sum once (any non-finite step loss makes it
+        # non-finite), so training adds no per-step host sync. Zero steps: sanity batch, init validation.
+        if self._train_loss_n > 0 and not bool(torch.isfinite(self._train_loss_sum).all()):
+            raise FloatingPointError(
+                f"training loss is non-finite in epoch {self.current_epoch} (sum of [loss_total, "
+                f"loss_log10_mae, loss_z_mse] over its {self._train_loss_n} steps = "
+                f"{self._train_loss_sum.tolist()}; global_step {self.global_step}): training diverged; "
+                "caught at the end of the epoch, not at the step; aborting before this epoch's "
+                "checkpoint is written."
+            )
         # The plateau monitors _MONITOR_METRIC (val_loss).
         metric = self.trainer.callback_metrics.get(_MONITOR_METRIC)
         if metric is None:
@@ -1096,6 +1116,7 @@ class FlowMapRolloutModule(pl.LightningModule):
                 f"(global_step {self.global_step}): training diverged; aborting before this "
                 "epoch's checkpoint is written."
             )
+        self._epoch_val_loss = metric_val
         # val_skill = 1 - val_loss / val_persistence_loss from the two epoch means (a diagnostic, also
         # logged by the weights_only init validation; a zero persistence mean gives -inf or nan).
         persistence = self.trainer.callback_metrics.get("val_persistence_loss")

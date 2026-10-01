@@ -71,7 +71,10 @@ until the new one is complete (it is built in `_tmp_final/` and swapped in, with
 `_tmp_old/`) are removed on success; after a failure the next run wipes them
 (`preprocessing.overwrite=true`) or refuses (`false`). One preprocessing run at a time per
 processed dir: it holds a lock on `data/processed.lock`, a persistent 0-byte file next to the
-processed dir, and a second run (or leftover workers of a killed one) exits with an error. Stage 2
+processed dir, and a second run (or leftover workers of a killed one) exits with an error.
+Training holds the same lock shared from reading `normalization.json` until both splits are
+preloaded (`eval_rollout_error.py` while it loads its rows), so neither waits: a training start
+fails while preprocessing runs, and preprocessing fails while a training start is loading. Stage 2
 reuses these same shards.
 `normalization.json` also records the input units and the trained domain (window start
 times, (T, P) coverage, the tracked-species sum); `preprocessing_summary.json` is the
@@ -100,7 +103,9 @@ Outputs land under `paths.work_dir` (`models/stage1`):
 An epoch is `dataset.train_batches_per_epoch` random batches; validation scores the
 fixed set of `dataset.val_samples` windows (see docs/DECISIONS.md). Every checkpoint
 records the normalization fingerprint (`norm_sha256`) of the processed data it was
-trained on.
+trained on. A non-finite val_loss, or a non-finite training loss anywhere in the epoch
+(checked at the end of the epoch, not at the step), aborts the run (exit 1) before that
+epoch's checkpoints are written.
 
 ### 3. Train stage 2 (autoregressive fine-tune)
 
@@ -109,7 +114,8 @@ trained on.
 `stage2.json` loads stage-1 `checkpoints/best.ckpt` via `checkpoint_mode="weights_only"`
 (EMA weights are preferred automatically) and fine-tunes with a rollout
 curriculum. The stage-1 run must have finished (`COMPLETED`) on the same processed
-data (matching `norm_sha256`). Its peak LR is min(`training.optimizer.lr`, the LR saved
+data (matching `norm_sha256`), and its `best.ckpt` must have the sha256 that `COMPLETED`
+records (any other checkpoint of that run loads with a warning naming the recorded best). Its peak LR is min(`training.optimizer.lr`, the LR saved
 in the loaded checkpoint), logged and recorded in `provenance.jsonl` (`handoff_peak_lr`);
 a resume keeps it. Before training, the loaded weights are scored once on the validation
 set (`init_val.json`, with `val_persistence_loss` and `val_skill`). Outputs land under
@@ -122,11 +128,13 @@ point `runtime.checkpoint` at a checkpoint in that run's own `checkpoints/` (nor
 `last.ckpt`); the config must equal `config.resolved.json` except
 `training.checkpoint_mode`, `runtime.checkpoint` and `training.max_epochs`. A moved or
 copied run directory cannot be resumed: start a new run from its weights with
-`checkpoint_mode="weights_only"`. A finished run (`COMPLETED`, or a checkpoint from its
-last epoch or after early stopping) is not resumed: to extend it deliberately, delete
-`COMPLETED` and raise `training.max_epochs`. (`run_daw.sh` resumes an interrupted stage
-automatically once its `last.ckpt` exists; a work dir from a run that died before its first
-checkpoint must be removed by hand.)
+`checkpoint_mode="weights_only"`. A finished run (`COMPLETED`) is not resumed: to extend it
+deliberately, delete `COMPLETED` and raise `training.max_epochs`. A resume from a run's final
+checkpoint (its last epoch, or after early stopping) in a work dir without `COMPLETED`, i.e. a
+run that died after its last `last.ckpt` but before publishing, publishes `best.ckpt` and
+`COMPLETED` from that checkpoint without training and exits 0. (`run_daw.sh` resumes an
+interrupted stage automatically once its `last.ckpt` exists; a work dir from a run that died
+before its first checkpoint must be removed by hand.)
 
 ### 4. Export and inspect
 
@@ -173,8 +181,8 @@ export.
 trains stage 1 and then stage 2 from stage 1's `best.ckpt`, and after each stage runs its post
 step (`export.py`, `training_logs.py`, `predictions.py`, `eval_rollout_error.py`,
 `efficiency_summary.py`). Re-running it is safe: a finished stage (`COMPLETED`) is not
-retrained, an interrupted one resumes from `last.ckpt`, and refusals from `src/main.py` are
-reported, not retried. It takes one GPU (the first idle one, or `AUTOCHEM_GPU`; it refuses a
+retrained, an interrupted one resumes from `last.ckpt` (one that had finished training but not
+published is published from it), and refusals from `src/main.py` are reported, not retried. It takes one GPU (the first idle one, or `AUTOCHEM_GPU`; it refuses a
 second GPU for the same user), pins itself to 16 CPUs on that GPU's NUMA node
 (`AUTOCHEM_THREADS`; all child processes inherit the pin), sets the thread counts, `TMPDIR`
 and the compile caches, and stops cleanly on Ctrl-C or `kill <pid>` (training exits 143 and

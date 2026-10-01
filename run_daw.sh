@@ -10,10 +10,12 @@
 #   smoke_scratch/) in this environment.
 #
 # Re-running is safe: a finished stage (work_dir/COMPLETED) is not retrained (its post step runs
-# again), an interrupted stage resumes from its last.ckpt, and stage 2 starts only from a finished
-# stage 1's best.ckpt. Refusals from src/main.py or preprocessing (work_dir in use, a finished or
-# moved run, a resume config that differs from the run's, data built differently, another
-# preprocessing run) are reported and never retried. Stopping: Ctrl-C, or kill -TERM / -HUP of
+# again), an interrupted stage resumes from its last.ckpt (one that died after its final epoch's
+# last.ckpt, before publishing, gets best.ckpt and COMPLETED from it without training), and stage 2
+# starts only from a finished stage 1's best.ckpt. Refusals from src/main.py or preprocessing
+# (work_dir in use, a finished or moved run, a resume config that differs from the run's, data
+# built differently, another preprocessing run, processed data being rebuilt or read) are
+# reported and never retried. Stopping: Ctrl-C, or kill -TERM / -HUP of
 # this script's PID, is forwarded as SIGTERM to the running python step (training then stops at
 # the end of its current step, exits 143 and resumes from last.ckpt on the next run).
 #

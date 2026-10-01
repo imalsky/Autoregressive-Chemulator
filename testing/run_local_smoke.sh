@@ -6,7 +6,9 @@
 #   2. stage 1 with the production compile settings, 2 epochs
 #   3. a deliberate extension: delete COMPLETED, resume in place with one more epoch (epoch, step and
 #      metrics.csv continue; last.ckpt holds the final epoch although no top-k checkpoint saved it)
-#   4. a re-run of the finished stage 1, which src/main.py must refuse, leaving best.ckpt unchanged
+#   4. a re-run of the finished stage 1, which src/main.py must refuse, leaving best.ckpt unchanged;
+#      then, with best.ckpt and COMPLETED deleted (a crash after the final last.ckpt), the same
+#      resume must publish both again without training: byte-identical, last.ckpt untouched
 #   5. stage 2 default recipe (AR + BPTT, compiled) from stage 1's handoff checkpoint (the file name
 #      configs/stage2.json uses, best.ckpt)
 #   6. stage 2 fallback recipe (detached + backward_per_step + gamma 0.9), eager
@@ -295,13 +297,23 @@ train stage1_extend
 check trained "${SCRATCH}/stage1_work" 3 "${SCRATCH}/logs/stage1_extend.log" "${GATE_S2_FORWARD_STEP_VARIANTS}"
 check continued "${SCRATCH}/stage1_work" 3
 
-echo "=== [4/8] re-run of the finished stage 1 (must be refused) ==="
+echo "=== [4/8] re-run of the finished stage 1 (must be refused), then the publish-only resume ==="
 before="$(sha256sum "${SCRATCH}/stage1_work/checkpoints/best.ckpt" "${SCRATCH}/stage1_work/COMPLETED")"
 if run stage1_rerun "${SCRATCH}/smoke_stage1_extend.json" src/main.py; then die "re-running a finished run was not refused"; fi
 grep -q "this run finished" "${SCRATCH}/logs/stage1_rerun.log" || die "the re-run failed for another reason (see ${SCRATCH}/logs/stage1_rerun.log)"
 [ "$(sha256sum "${SCRATCH}/stage1_work/checkpoints/best.ckpt" "${SCRATCH}/stage1_work/COMPLETED")" = "${before}" ] \
   || die "the refused re-run changed best.ckpt or COMPLETED"
 echo "OK re-run refused; best.ckpt and COMPLETED unchanged"
+last_before="$(sha256sum "${SCRATCH}/stage1_work/checkpoints/last.ckpt")"
+rm "${SCRATCH}/stage1_work/checkpoints/best.ckpt" "${SCRATCH}/stage1_work/COMPLETED"
+run stage1_publish "${SCRATCH}/smoke_stage1_extend.json" src/main.py \
+  || die "resuming the final last.ckpt of a run without best.ckpt/COMPLETED failed (see ${SCRATCH}/logs/stage1_publish.log)"
+grep -q "publishing it without training" "${SCRATCH}/logs/stage1_publish.log" || die "the publish-only resume did not take the publish path"
+if grep -q "epoch [0-9]*: K_train" "${SCRATCH}/logs/stage1_publish.log"; then die "the publish-only resume trained an epoch"; fi
+[ "$(sha256sum "${SCRATCH}/stage1_work/checkpoints/best.ckpt" "${SCRATCH}/stage1_work/COMPLETED")" = "${before}" ] \
+  || die "the republished best.ckpt or COMPLETED differs from the original"
+[ "$(sha256sum "${SCRATCH}/stage1_work/checkpoints/last.ckpt")" = "${last_before}" ] || die "the publish-only resume changed last.ckpt"
+echo "OK publish-only resume: best.ckpt and COMPLETED republished byte-identical, no epoch trained"
 
 echo "=== [5/8] stage 2 default recipe (AR + BPTT, compiled, handoff from stage-1 best.ckpt) ==="
 train stage2

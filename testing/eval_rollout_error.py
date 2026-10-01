@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -60,7 +61,7 @@ import export as E  # noqa: E402  (export's baked normalizer: the round-trip che
 import predictions as P  # noqa: E402  (its independent numpy inverse normalization and loaders)
 import preprocessing as PP  # noqa: E402  (its own window draws: the window-start time replay)
 from run_dir import resolve_run_dir  # noqa: E402
-from utils import file_sha256, normalization_sha256  # noqa: E402
+from utils import file_sha256, lock_processed_dir_shared, normalization_sha256  # noqa: E402
 
 # Every gate, flip and trigger decision uses validation; 'test' only for the single final paper run.
 EVAL_SPLIT = "validation"
@@ -365,6 +366,9 @@ def main() -> None:
     cfg = P._load_json(run_dir / "config.resolved.json")
     shard_root = (Path(EVAL_SHARD_ROOT).expanduser() if EVAL_SHARD_ROOT is not None
                   else (run_dir / cfg["paths"]["processed_dir"]).resolve())
+    # Shared lock on the shard root from the manifest read until the rows are loaded (released below),
+    # as training holds it: a preprocessing run rebuilding it holds it exclusively (src/utils.py).
+    data_lock_fd = lock_processed_dir_shared(shard_root)
     root_manifest = P._load_json(shard_root / "normalization.json")
     if normalization_sha256(root_manifest) != meta["norm_sha256"]:
         raise ValueError(f"{shard_root} is not normalized like {export_path.name} (norm_sha256 differs)")
@@ -383,6 +387,7 @@ def main() -> None:
         shards, max_rows_per_source=int(summary["config"]["samples_per_source_trajectory"]))
     selection_sha = hashlib.sha256(json.dumps([[shards[s].name, r] for s, r in rows]).encode()).hexdigest()
     y_mat, g_mat, dt_norm_mat = _load_rows(shards, rows)
+    os.close(data_lock_fd)
     N, T, S = y_mat.shape
     K = (T - 1) - ROLLOUT_START_INDEX
     print(f"[eval]  {N} sources of {n_sources_total} ({n_rows_total} windows, {len(shards)} shards), seed {EVAL_SEED}; "
