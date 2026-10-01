@@ -189,12 +189,18 @@ def plot_overlay_all_species(
     legend: bool,
     species_count: int,
     dt_s: float,
+    source: str,
 ) -> None:
     raw_pts_per_species = int(np.sum(t_raw > 0))
     chunk_pts = int(len(t_chunk))
+    # Raw outputs inside the window: few means the window is mostly interpolation.
+    n_inside = int(np.count_nonzero((t_raw >= t_chunk[0]) & (t_raw <= t_chunk[-1])))
 
-    raw_label = f"Raw ({raw_pts_per_species} pts/species, N={species_count})"
-    chunk_label = f"Chunk ({chunk_pts} pts, dt={dt_s:.3g} s)"
+    raw_label = f"Raw {source} ({raw_pts_per_species} pts/species, N={species_count})"
+    chunk_label = (
+        f"Chunk ({chunk_pts} pts, dt={dt_s:.3g} s, t_start={float(t_chunk[0]):.3g} s, "
+        f"{n_inside} raw outputs inside)"
+    )
 
     did_raw_label = False
     did_chunk_label = False
@@ -326,14 +332,10 @@ def main() -> None:
     )
 
     for r, (fname, gname, t_raw, y_raw, t_chunk, y_chunk, dt_s) in enumerate(samples):
-        # Raw outputs inside the window: few means the window is mostly interpolation.
-        n_inside = int(np.count_nonzero((t_raw >= t_chunk[0]) & (t_raw <= t_chunk[-1])))
-        where = f"{fname}:{gname} t_start={float(t_chunk[0]):.3g} s, {n_inside} raw outputs inside"
-
         # Left: log-x (and log-y)
         axL = axes[r][0]
         style_axes(axL, xlog=True)
-        axL.set_title(f"{where} (log-x)", pad=10)
+        axL.set_title(f"{gname} (log-x)", pad=10)
         plot_overlay_all_species(
             axL,
             t_raw,
@@ -343,12 +345,13 @@ def main() -> None:
             legend=True,
             species_count=len(cfg.species_variables),
             dt_s=dt_s,
+            source=f"{fname}:{gname}",
         )
 
         # Right: linear-x (log-y) BUT x-range exactly equals blue-dot extent
         axR = axes[r][1]
         style_axes(axR, xlog=False)
-        axR.set_title(f"{where} (linear-x; xlim=chunk extent)", pad=10)
+        axR.set_title(f"{gname} (linear-x; xlim=chunk extent)", pad=10)
         plot_overlay_all_species(
             axR,
             t_raw,
@@ -358,16 +361,11 @@ def main() -> None:
             legend=True,
             species_count=len(cfg.species_variables),
             dt_s=dt_s,
+            source=f"{fname}:{gname}",
         )
         axR.set_xlim(float(t_chunk[0]), float(t_chunk[-1]))
 
-    fig.suptitle(
-        f"Raw vs Generated Chunk Overlay (dt_sampling={cfg.dt_sampling}, n_steps={cfg.n_steps}, eps={cfg.epsilon:.1e})\n"
-        f"Raw files: {', '.join(sorted({s[0] for s in samples}))}",
-        fontsize=11,
-        y=0.995,
-    )
-    plt.tight_layout(rect=[0, 0, 1, 0.965])
+    plt.tight_layout()
 
     fig.savefig(OUT_PNG, dpi=DPI)
     plt.close(fig)

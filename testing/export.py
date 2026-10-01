@@ -420,7 +420,8 @@ def build_baked_normalizer(
 
     Validates that species use log-standard and globals use a supported method, and that every
     statistic the export uses is sane (NaN fails every check): means and ranges finite, stds
-    >= the manifest's min_std, and each min-max range hi > lo on the float32 values baked. Then
+    >= the manifest's min_std, and every range used as a denominator (min-max, log-min-max, dt)
+    hi > lo on the float32 values baked. Then
     packs the per-key statistics into float32 buffers for the exported module.
     """
     methods_map = manifest.get("normalization_methods")
@@ -465,15 +466,22 @@ def build_baked_normalizer(
     s_methods = [_method_for(k, allowed=_SUPPORTED_SPECIES_METHODS) for k in species_vars]
     g_methods = [_method_for(k, allowed=_SUPPORTED_GLOBAL_METHODS) for k in global_vars]
 
-    for k in species_vars:  # log-standard (+ log_min/log_max for the example inputs)
+    # hi > lo only where the range is a denominator (min-max, log-min-max, dt); the species
+    # log_min/log_max and the globals' min/max otherwise only bound the example inputs (a constant
+    # species has log_min == log_max).
+    for k in species_vars:  # log-standard
         _finite(k, "log_mean")
         _std(k, "log_std")
-        _range(k, "log_min", "log_max")
+        _finite(k, "log_min")
+        _finite(k, "log_max")
     for k, m in zip(global_vars, g_methods):
-        _range(k, "min", "max")  # also used for the example inputs
+        _finite(k, "min")
+        _finite(k, "max")
         if m == "standard":
             _finite(k, "mean")
             _std(k, "std")
+        elif m == "min-max":
+            _range(k, "min", "max")
         elif m == "log-min-max":
             _range(k, "log_min", "log_max")
         elif m == "log-standard":
