@@ -11,7 +11,8 @@ This script:
 1) Loads config JSON and validates it (keys, types, cross-key rules, runtime constraints).
 2) Resolves relative paths relative to the config file directory.
 3) Loads the normalization manifest (processed_dir/normalization.json), builds the model
-   and loads weights_only weights, all before the run directory is created.
+   and loads weights_only weights (capping the peak LR at the source checkpoint's LR), all
+   before the run directory is created.
 4) Creates and flocks work_dir (one training process per run directory), then checks its
    contents (fresh: empty; resume: the run it continues) and opens work_dir/train.log.
 5) Builds datasets/dataloaders sized for the rollouts actually used (memory budget first).
@@ -1085,8 +1086,33 @@ def _log_schedule_in_steps(cfg: Mapping[str, Any], *, steps_per_epoch: int) -> N
 # ==============================================================================
 
 
-def _load_weights_only(module: FlowMapRolloutModule, ckpt_path: Path) -> None:
-    """Load Lightning checkpoint weights only (no optimizer/scheduler state), strictly.
+def _checkpoint_lr(obj: Mapping[str, Any], ckpt_path: Path) -> float:
+    """The LR the checkpoint's run would train at next: its optimizer's param-group LR, strictly.
+
+    Lightning saves it after that epoch's plateau step (on_validation_epoch_end runs before the
+    checkpoint is written); the param groups differ only in weight decay, so they must share it.
+    """
+    states = obj.get("optimizer_states")
+    try:
+        lrs = {float(g["lr"]) for g in states[0]["param_groups"]}
+    except (TypeError, KeyError, IndexError) as e:
+        raise KeyError(
+            f"checkpoint {ckpt_path} has no optimizer_states[0]['param_groups'][*]['lr']: the weights_only "
+            "peak LR cap min(training.optimizer.lr, source LR) needs the source run's LR"
+        ) from e
+    if len(states) != 1 or len(lrs) != 1:
+        raise ValueError(
+            f"checkpoint {ckpt_path}: expected one optimizer whose param groups share one LR, got "
+            f"{len(states)} optimizer state(s) with LRs {sorted(lrs)}"
+        )
+    lr = lrs.pop()
+    if not (math.isfinite(lr) and lr > 0.0):
+        raise ValueError(f"checkpoint {ckpt_path}: optimizer LR {lr} is not finite and > 0")
+    return lr
+
+
+def _load_weights_only(module: FlowMapRolloutModule, ckpt_path: Path) -> float:
+    """Load Lightning checkpoint weights only (no optimizer/scheduler state), strictly; return the source LR.
 
     The source run must be finished (its work_dir holds COMPLETED: best.ckpt of a run that is
     still being extended is not a handoff), and the checkpoint must have been trained in this
@@ -1095,7 +1121,8 @@ def _load_weights_only(module: FlowMapRolloutModule, ckpt_path: Path) -> None:
     the checkpoint's own run had EMA enabled. The checkpoint's saved model block must equal this
     run's (comment keys ignored), every floating tensor must be finite, and any missing or
     unexpected key makes load_state_dict raise. The loss statistics (criterion buffers) are then
-    rebuilt from this run's manifest, never taken from the checkpoint.
+    rebuilt from this run's manifest, never taken from the checkpoint. The returned LR
+    (_checkpoint_lr) caps this run's peak LR.
     """
     if not ckpt_path.exists():
         raise FileNotFoundError("ckpt not found")
@@ -1119,6 +1146,7 @@ def _load_weights_only(module: FlowMapRolloutModule, ckpt_path: Path) -> None:
             "normalization statistics (or before the fingerprint existed)"
         )
     require_same_model_block(hparams.get("model"), module.hparams["model"], source=str(ckpt_path))
+    source_lr = _checkpoint_lr(obj, ckpt_path)
 
     if "ema_state_dict" in obj:
         source = "ema_state_dict"
@@ -1142,6 +1170,7 @@ def _load_weights_only(module: FlowMapRolloutModule, ckpt_path: Path) -> None:
         module.criterion.log_means.copy_(log_means)
         module.criterion.log_stds.copy_(log_stds)
     log.info("weights_only: loaded %s from %s (loss statistics from this run's manifest)", source, ckpt_path)
+    return source_lr
 
 
 def _validate_init_weights(
@@ -1284,7 +1313,8 @@ def _next_free_path(work_dir: Path, stem: str, suffix: str) -> Path:
 
 
 def _init_checkpoint_record(ckpt_path: Optional[Path]) -> Any:
-    """Identity of the checkpoint a run starts from: path, sha256, epoch/step, optimizer LR, val_loss scores."""
+    """Identity of the checkpoint a run starts from: path, sha256, epoch/step, optimizer LR and the
+    scheduler's peak (base_lrs, which a resume restores), val_loss scores."""
     if ckpt_path is None:
         return None
     rec: Dict[str, Any] = {"path": str(ckpt_path), "sha256": file_sha256(ckpt_path)}
@@ -1293,6 +1323,8 @@ def _init_checkpoint_record(ckpt_path: Optional[Path]) -> Any:
     rec["global_step"] = obj.get("global_step")
     opt_states = obj.get("optimizer_states") or []
     rec["optimizer_lr"] = [float(g["lr"]) for g in opt_states[0]["param_groups"]] if opt_states else None
+    sched_states = obj.get("lr_schedulers") or []
+    rec["scheduler_base_lrs"] = [float(v) for v in sched_states[0]["base_lrs"]] if sched_states else None
     for key, state in (obj.get("callbacks") or {}).items():
         if str(key).startswith("ModelCheckpoint") and f"'monitor': {_MONITOR_METRIC!r}" in str(key):
             for name in ("current_score", "best_model_score"):
@@ -1441,8 +1473,17 @@ def main() -> None:
         species_variables=species_vars,
         precision=prec,
     )
+    # weights_only: the peak LR is capped at the source run's LR, so a handoff never warms above where
+    # the source run was training (a resume keeps it: base_lrs come back with the scheduler state).
+    handoff_peak_lr: Optional[Dict[str, float]] = None
     if ckpt_mode == "weights_only":
-        _load_weights_only(lit_module, ckpt_path)
+        source_lr = _load_weights_only(lit_module, ckpt_path)
+        configured_lr = float(tcfg["optimizer"]["lr"])
+        lit_module.handoff_peak_lr = min(configured_lr, source_lr)
+        handoff_peak_lr = {"peak_lr": lit_module.handoff_peak_lr, "configured_lr": configured_lr,
+                           "source_checkpoint_lr": source_lr}
+        log.info("weights_only: peak LR %.6g = min(training.optimizer.lr %.6g, source checkpoint LR %.6g)",
+                 lit_module.handoff_peak_lr, configured_lr, source_lr)
     _log_keep_all_checkpoints_estimate(cfg, total_params)
 
     ensure_dir(work_dir)
@@ -1512,6 +1553,7 @@ def main() -> None:
         config_snapshot_sha256=file_sha256(snapshot_path),
         checkpoint_mode=ckpt_mode,
         init_checkpoint=best_effort(lambda: _init_checkpoint_record(ckpt_path)),
+        handoff_peak_lr=handoff_peak_lr,
         processed_dir=str(processed_dir),
         norm_sha256=lit_module.hparams["norm_sha256"],
         tf32=tf32,

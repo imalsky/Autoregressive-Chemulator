@@ -15,6 +15,13 @@
     "keeping skip_steps 1 and training.curriculum 2->10. Write the nested keys: a dotted key such as",
     "\"autoregressive_training.loss_discount_gamma\" is rejected at startup.",
     "docs/DECISIONS.md: per-key evidence, and the Inherited / unjustified table for values without it.",
+    "Schedule: recipe R (author decision 2026-10-01; docs/DECISIONS.md): fixed step budgets, not derived from the",
+    "data size. 20,000-step epochs; 1-epoch LR warmup; curriculum 2->10 over 16 epochs (K up by 1 every 2);",
+    "plateau patience 5; early-stopping patience 12; at most 120 epochs (2.4M steps). Both monitors start",
+    "counting at the first epoch after the warmup and the ramp (epoch 16). If the epoch length changes,",
+    "re-derive every epoch-counted knob from its step target.",
+    "Peak LR at the handoff: min(training.optimizer.lr, the LR saved in the loaded stage-1 checkpoint)",
+    "(src/main.py; logged and recorded in provenance.jsonl); a resume keeps it.",
     "Stage 2 reuses the stage-1 processed shards; do NOT rerun preprocessing.",
     "Run: AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u src/main.py"
   ],
@@ -119,9 +126,9 @@
     "num_workers": 16
   },
   "dataset": {
-    "_comment": "Epoch by count (docs/DECISIONS.md): 93367 = floor(N_train * 92 / 2048) and 23708768 = N_val * 92 for the 4-file build (N_train 2078448, N_val 257704); 92 windows per trajectory inherited.",
-    "train_batches_per_epoch": 93367,
-    "val_samples": 23708768
+    "_comment": "Epoch by count, a fixed step budget (recipe R, docs/DECISIONS.md): 20000 optimizer steps per epoch and a fixed validation set of 2621440 = 1280 x 2048 windows (no ragged last batch; 10 or 11 even-stride starts per validation trajectory of the 4-file build, N_val 257704). Not re-derived when data is added.",
+    "train_batches_per_epoch": 20000,
+    "val_samples": 2621440
   },
   "model": {
     "type": "mlp",
@@ -160,7 +167,7 @@
   },
   "training": {
     "batch_size": 2048,
-    "max_epochs": 200,
+    "max_epochs": 120,
     "checkpoint_mode": "weights_only",
     "pin_memory": true,
     "rollout_steps": 10,
@@ -183,9 +190,9 @@
     },
     "scheduler": {
       "enabled": true,
-      "warmup_epochs": 5,
+      "warmup_epochs": 1,
       "factor": 0.5,
-      "patience": 10,
+      "patience": 5,
       "threshold": 0.0001,
       "min_lr": 1e-08
     },
@@ -200,7 +207,7 @@
       "enabled": true,
       "start_steps": 2,
       "end_steps": 10,
-      "ramp_epochs": 30
+      "ramp_epochs": 16
     },
     "ema": {
       "enabled": true,
@@ -208,7 +215,7 @@
     },
     "early_stopping": {
       "enabled": true,
-      "patience": 20,
+      "patience": 12,
       "min_delta": 0.0
     }
   }

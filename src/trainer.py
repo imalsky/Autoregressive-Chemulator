@@ -500,6 +500,10 @@ class FlowMapRolloutModule(pl.LightningModule):
         )
 
         self.sched_cfg = dict(tcfg["scheduler"])
+        # Peak LR of a weights_only start (the warmup target and the plateau's first LR): main.py sets
+        # min(training.optimizer.lr, the source checkpoint's LR) before fit; None = training.optimizer.lr.
+        # A resume restores its peak with the optimizer and scheduler state (base_lrs), never from here.
+        self.handoff_peak_lr: Optional[float] = None
         # Optimizer steps per epoch (one per training batch): the train loader's length, which is
         # dataset.train_batches_per_epoch by construction (dataset.py _PreloadedStochasticBatchStream).
         self._train_batches_per_epoch = int(cfg["dataset"]["train_batches_per_epoch"])
@@ -585,6 +589,13 @@ class FlowMapRolloutModule(pl.LightningModule):
                 f"({weights}) and data (training vs validation windows){dropout_note}."
             )
         log.info(msg)
+
+    def on_train_start(self) -> None:
+        """Log the peak LR in force (after a resume has restored the optimizer and scheduler state)."""
+        sched = self._get_scheduler()
+        peak = float(sched.base_lrs[0]) if sched is not None else self._current_lr()
+        log.info("peak LR (warmup target, plateau start) %.6g; training.optimizer.lr %.6g; LR now %.6g",
+                 peak, float(self.hparams["training"]["optimizer"]["lr"]), self._current_lr())
 
     # ------------------------
     # Epoch timing
@@ -1120,7 +1131,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         opt_cfg = dict(tcfg["optimizer"])
 
         name = str(opt_cfg["name"]).lower()
-        lr = float(opt_cfg["lr"])
+        lr = float(opt_cfg["lr"]) if self.handoff_peak_lr is None else float(self.handoff_peak_lr)
         weight_decay = float(opt_cfg["weight_decay"])
         exclude_nd = bool(opt_cfg["exclude_norm_and_bias_from_weight_decay"])
         param_groups = _build_optimizer_param_groups(self, weight_decay=weight_decay, exclude_norm_and_bias=exclude_nd)

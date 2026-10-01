@@ -109,8 +109,11 @@ trained on.
 `stage2.json` loads stage-1 `checkpoints/best.ckpt` via `checkpoint_mode="weights_only"`
 (EMA weights are preferred automatically) and fine-tunes with a rollout
 curriculum. The stage-1 run must have finished (`COMPLETED`) on the same processed
-data (matching `norm_sha256`). Before training, the loaded weights are scored once on
-the validation set (`init_val.json`). Outputs land under `models/stage2`.
+data (matching `norm_sha256`). Its peak LR is min(`training.optimizer.lr`, the LR saved
+in the loaded checkpoint), logged and recorded in `provenance.jsonl` (`handoff_peak_lr`);
+a resume keeps it. Before training, the loaded weights are scored once on the validation
+set (`init_val.json`, with `val_persistence_loss` and `val_skill`). Outputs land under
+`models/stage2`.
 
 Fresh training requires an empty `work_dir` (one holding only `train.log` from a
 failed start counts as empty). Only one training process may use a `work_dir` (it

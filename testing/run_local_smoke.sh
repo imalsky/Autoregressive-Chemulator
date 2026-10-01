@@ -16,7 +16,8 @@
 #      .pt2 reloaded: ep.module() without .eval() under inference_mode, finite in-range rows, a NaN row
 #      for an out-of-range dt, units and ranges in the metadata, and the export gate re-run against eager
 # Every training run: COMPLETED, finite train/val losses at every epoch, the expected epoch count,
-# last.ckpt at the final epoch, a ragged last validation batch (as production always has), and the
+# last.ckpt at the final epoch, a ragged last validation batch (as production stage 1 has; stage 2's
+# recipe-R validation set is a whole number of batches), and the
 # compiled-function variant counts (TORCH_LOGS); a ragged-batch graph must have been compiled and
 # stage 2's forward_step may not exceed the latest compile gate's count. Stage-2 live weights must
 # differ from the handoff weights and between the two recipes.
@@ -223,7 +224,8 @@ scratch = Path(sys.argv[1])
 prod = {s: json.loads(Path(f"configs/{s}.json").read_text()) for s in ("stage1", "stage2")}
 HANDOFF = Path(prod["stage2"]["runtime"]["checkpoint"]).name  # the production handoff file (best.ckpt)
 BATCH = 64
-# Not a multiple of BATCH, so the last validation batch is ragged (production always has one).
+# Not a multiple of BATCH, so the last validation batch is ragged (production stage 1 has one; stage 2's
+# 2621440 = 1280 x 2048 has none, so the smoke is where its ragged-batch graph is exercised).
 VAL_SAMPLES = BATCH + BATCH // 4
 EXTEND_EPOCHS = 1  # the deliberate extension of the finished stage-1 run
 

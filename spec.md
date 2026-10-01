@@ -55,7 +55,7 @@ Audience: Professional collaborators and maintainers
 6. Stage 1 run uses one-jump training with `rollout_steps = 1`.
 7. Stage 2 run uses autoregressive multi-step training with `rollout_steps = N`, where `N > 1`.
 8. Stage 2 `N` is user-configured per run and not fixed by the codebase.
-9. The order of the two runs is a canonical workflow guideline, but the stage-2 handoff is guarded: a `weights_only` load requires the source run's `COMPLETED` marker and a matching normalization fingerprint (`norm_sha256`).
+9. The order of the two runs is a canonical workflow guideline, but the stage-2 handoff is guarded: a `weights_only` load requires the source run's `COMPLETED` marker and a matching normalization fingerprint (`norm_sha256`), and caps the run's peak LR at min(`training.optimizer.lr`, the source checkpoint's optimizer LR); a checkpoint without that optimizer state is refused.
 10. Resume/checkpoint options are retained.
 11. Fresh runs still require an empty work directory unless explicitly resuming; a work directory whose only entry is `train.log` (left by a failed start) counts as empty. The training process holds an exclusive flock on the work directory itself (no lock file is created), so a second training process on the same work directory fails at startup.
 12. Curriculum support is retained.
