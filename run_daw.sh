@@ -115,6 +115,9 @@ taskset -pc "${CPUS}" "$$" >/dev/null || fail "could not pin this shell to CPUs 
 export CUDA_VISIBLE_DEVICES="${GPU}"
 export OMP_NUM_THREADS="${THREADS}" MKL_NUM_THREADS="${THREADS}" OPENBLAS_NUM_THREADS="${THREADS}" NUMEXPR_NUM_THREADS="${THREADS}"
 export TMPDIR="${TMPDIR:-${HOME}/tmp}" TORCHINDUCTOR_CACHE_DIR="${HOME}/.cache/torchinductor" TRITON_CACHE_DIR="${HOME}/.cache/triton"
+# Compile in-process: inductor's compile-worker pool creates POSIX semaphores on the shared RAM
+# disk (seen in the 2026-10-01 pilot), which the daw rules forbid. Cost: slower cold compiles.
+export TORCHINDUCTOR_COMPILE_THREADS=1
 export PYTHONUNBUFFERED=1 HDF5_USE_FILE_LOCKING=FALSE
 export PYTHONPATH="${ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 export PY
