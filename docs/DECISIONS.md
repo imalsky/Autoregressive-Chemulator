@@ -59,6 +59,67 @@ item). What changed:
   sync requirements.lock`. pyproject pins torch 2.8.* and lightning 2.6.* and is not installable as
   a package (no modules are built).
 
+Data side (one preprocessing change, then one real build of the 4 raw files on daw, 2026-09-30:
+584 s with 4 workers, peak 13.5 GB in the processed dir):
+- **Window draws per trajectory.** Each trajectory's windows (dt and start time) come from its own
+  generator seeded with [preprocessing.seed, a SHA-1 word of the group name]; the per-file
+  generator (seeded with the file name, no longer the file's index in the sorted list) only shuffles
+  the group pool. A window therefore no longer changes when a file is added or renamed elsewhere, or
+  when another group is kept or rejected. This redrew every window once (a training-data change:
+  any earlier processed dir and every checkpoint made on it are superseded); split membership,
+  counts and rejects are unchanged. Verified: with only the two seedings reverted, the new code
+  writes shards equal to the previous code's array by array.
+- **Split seed.** Split membership uses the module constant `SPLIT_SEED = 1234` (the historical
+  preprocessing.seed, so today's splits are unchanged), not preprocessing.seed, so a sampling
+  replicate keeps the same test trajectories. The split key (file basename and group name; renaming
+  a raw file moves about a third of its groups to another split) and the raw basenames are recorded
+  in the summary; a group name present in two raw files fails the build. Keying on the group name
+  alone (rename-proof) is a pending author decision.
+- **Build record and checks.** preprocessing_summary.json now holds one row per raw file (name,
+  size, groups, rejects, windows per split, shards, raw time grid), group-level rejects
+  (non_finite, non_positive_global, too_few_valid, drop_below; whole source groups) and chunk-level
+  rejects (no_fit_chunk, interp_non_finite; window attempts) with groups_seen = sum(group rejects) +
+  groups_kept, `windows_written_by_split` (was `counts_total`), the (T, log10 P) coverage table,
+  start-time and dt histograms, the config blocks used, norm_sha256, and code/library versions.
+  src/main.py now refuses to train on a processed dir whose summary is missing or predates this
+  record, whose recorded preprocessing / normalization / data blocks differ from the config's
+  (except overwrite and num_workers; per-key "config vs built" message), whose normalization.json
+  is not the one the summary describes (fingerprint), or (fresh runs) whose raw files were added or
+  resized since the build; removed raw files or a missing raw_dir only warn (raw data may be pruned
+  for quota). It also validates the manifest's statistics with named errors.
+- **Manifest additions (descriptive; not part of the fingerprint).** `units` (P dyn/cm^2 (barye),
+  T K, dt s, species: mixing ratios n_i / n_total over all gas of the generator run (inferred; the
+  generator config is not on daw), the training initial gas held only the tracked species, outputs
+  use the same denominator); `window_start_time_s` (earliest train window start: 0.001 s);
+  `coverage` (train windows per 100 K x 1 dex cell, lowest-retention cell); `species_sum` (the
+  train-split distribution of the tracked-species sum per state: min 0.0253, 0.1% / 1% / 5% levels
+  0.6467 / 0.9109 / 0.9877 at 1e-4 resolution, median 1.0); `std_floored` (fields whose variance
+  fell below min_std**2; none on the 4 files; an exactly constant column is not caught by it).
+- **Measured on the 4-file build (recompute as data arrives):**
+  - drop_below (rule kept) rejects 244,756 of 893,840 finite groups (27.4%), skewed by T and P:
+    67.1% at 300-600 K, 54.0% at 600-900 K, 14.1-16.3% at 1200-2700 K, 25.4% at 2700-3000 K;
+    37.6% at log10 P (barye) 0-1 down to 17.9% at 9-10. Kept groups per K are 2.6x denser at
+    1200-2400 K than at 300-600 K. Worst 100 K x 1 dex cell: 700-800 K at 1e9-1e10 barye keeps 144
+    of 3,297 (4.4%); every one of the 270 cells keeps >= 144 groups. Triggers (a group can have
+    several): O 50.7%, C2H2 46.0%, OH 18.7%; 64.4% of rejected groups hold an exact zero. The
+    per-cell table is in preprocessing_summary.json; the composition skew (kept cool groups are
+    more O-rich, rejected hot groups are the extremely O-rich ones; audit R1-018) is not visible in
+    it. Reweighting, a per-cell evaluation gate or a composition-aware out-of-distribution flag is
+    the author's decision.
+  - Per file: drop_below rejects 29.2-29.4% of run10017, run10142 and run9095 but 21.5% of run6050,
+    whose initial compositions come from a different distribution (audit: median trace log10 y0
+    about -10.1 vs -12.6; inferred to be a different sampler setting; the raw files carry no
+    generator settings). All four files store the same grid: t=0, then 1e-3..1e8 s, 100 points.
+  - Window starts: draw 0 of every kept group is anchored at the first positive raw time (1e-3 s),
+    draws 1-3 are log-uniform, so 25% of windows start at exactly 1e-3 s and 31.8% of starts fall in
+    [1e-3, 1e-2) s against 6.8% per later decade. Whether to keep this weighting is the author's
+    decision.
+  - Training states start at max(t_min, first positive raw time) = 1e-3 s: the raw t=0 rows (the
+    generator's randomized initial compositions) never enter training (log-time interpolation cannot
+    represent t=0). Unrelaxed compositions (under ~1 ms after initialization) are therefore out of
+    distribution, and the model cannot detect that from its inputs. A future fixed-dt evaluation
+    generator must start at k >= 1 (prepare_log_interp maps t=0 to y(1e-3 s)).
+
 ## REVISION 2026-09-30: correctness and contract fixes (audit theme T1)
 
 Production training numerics are unchanged by these fixes except the three listed at the end of this
@@ -279,7 +340,7 @@ no inversion of any adopted finding.
 | `model.fourier_dt.sigma` | 1.0 | EDM2 pattern: normalize the log-quantity to O(1) (Auto-Chem's dt_norm ∈ [0,1] already is), then σ≈1. Sandbox win used σ=3.0 on the same normalization — both in the working range; σ too high risks wiggly dt-interpolation at the deployment dt (Tancik). Spot-check: stage-1 val with σ ∈ {0.5, 1, 2} over the first ~20 epochs if desired. | medium (literature; exact value not locally discriminated) |
 | `model.mlp.hidden_dims` 10×2048, residual, LN, SiLU, `predict_delta` | unchanged from v3 lineage | v3 (10×2048) reached val ~7e-4 and is deployed; LN value re-confirmed locally (MLP+LN 2.9× over MLP, E1); delta-head small-init is the sandbox/paper convention. Not re-tuned: out of local scope. | inherited |
 | `preprocessing.dt_min/dt_max` | 0.1 / 1000.0 s | User deployment decision (Canoe dt≈6.4 s sits ~1.3 decades inside each edge — Fourier features interpolate well inside support, poorly outside; Tancik). | decision |
-| `preprocessing.samples_per_source_trajectory` | 4 (was 1) | E2 mechanism: per-state dt diversity is the robustness lever; 4 independent (dt, t_start) draws per source trajectory maximize (state, dt) coverage from the same raws. | medium |
+| `preprocessing.samples_per_source_trajectory` | 4 (was 1) | E2 mechanism: per-state dt diversity is the robustness lever; 4 (dt, t_start) draws per source trajectory maximize (state, dt) coverage from the same raws. dt is log-uniform in every draw; draw 0 starts at the first positive raw time (1e-3 s; 25% of windows), draws 1-3 at a log-uniform time (T7 entry). | medium |
 | `preprocessing.output_trajectories_per_file`, `pool_size` | 1e6 (consume all) | "Use the full dataset" (user decision); ~62M samples across ~160 raw files. | decision |
 | `training.batch_size` | 2048 | Paper finding: >2048 degraded generalization; v2_bigger_batch (8192) plateaued at val ~9e-3. | high (production-scale evidence) |
 | stage-1 `lr` / `wd` / scheduler / EMA 0.9995 / early-stop | template values | v3-lineage except the scheduler (v3 used `cosine_with_warmup`, see REVISION 2026-09-30; the shipped plateau schedule is not v3-lineage); converged to val ~7e-4 historically. EMA window rule (1/(1−d) ≈ 1–10% of updates, ACE uses 0.9999): 0.9995 is a 2,000-step horizon, 0.06 of a 32,475-step stage-1 epoch and 0.015% of the 400-epoch budget (0.999 in stage 2: 1,000 steps, 0.011 of a 93,367-step epoch); 0.9999 would be 10,000 steps; not locally discriminable. | inherited |

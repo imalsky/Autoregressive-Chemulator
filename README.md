@@ -62,6 +62,13 @@ until the new one is complete (it is built in `_tmp_final/` and swapped in, with
 `normalization.json` last). The scratch dirs (`_tmp_physical/`, `_tmp_final/`,
 `_tmp_old/`) are removed on success; after a failure the next run wipes them
 (`preprocessing.overwrite=true`) or refuses (`false`). Stage 2 reuses these same shards.
+`normalization.json` also records the input units and the trained domain (window start
+times, (T, P) coverage, the tracked-species sum); `preprocessing_summary.json` is the
+build record (per raw file: size, groups, rejects, windows; the config blocks used; the
+normalization fingerprint). Training refuses a processed dir whose record does not match
+its config (except `overwrite`, `num_workers`), whose `normalization.json` was changed
+after the build, or (fresh runs) whose raw files were added or resized since: rebuild
+it, into a new `processed_dir` if the old one must stay.
 
 ### 2. Train stage 1 (one-jump pretrain)
 

@@ -85,9 +85,10 @@
     "_comment_full_dataset": [
       "Full-dataset settings: pool_size and output_trajectories_per_file are set high",
       "enough to consume every trajectory in every raw file (~160 files).",
-      "samples_per_source_trajectory=4 draws 4 independent (dt, t_start) chunks per",
-      "source trajectory - dt-diversity per state is the load-bearing robustness",
-      "ingredient found in E2 (see docs/DECISIONS.md)."
+      "samples_per_source_trajectory=4 draws 4 (dt, t_start) chunks per source trajectory",
+      "(draw 0 anchored at the first positive raw time, draws 1-3 log-uniform; dt log-uniform",
+      "in every draw) - dt-diversity per state is the load-bearing robustness ingredient found",
+      "in E2 (see docs/DECISIONS.md)."
     ],
     "raw_file_patterns": [
       "*.h5",

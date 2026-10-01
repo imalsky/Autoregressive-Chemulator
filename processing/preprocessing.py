@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 """preprocessing.py
 
-Preprocess raw adaptive-timestep HDF5 trajectories into fixed-length uniform-dt
-windows, shard to NPZ, compute normalization, and write final normalized shards.
+Preprocess raw HDF5 trajectories, saved on a fixed log-spaced output grid (current files: t=0,
+then 1e-3..1e8 s, 100 points), into fixed-length uniform-dt windows, shard to NPZ, compute
+normalization, and write final normalized shards. The raw dt is non-uniform, so every window is
+resampled (log-log interpolation); each group's own time vector is used, so a file on another grid
+works too (its grid is recorded per file in preprocessing_summary.json).
 
 Outputs (under paths.processed_dir):
-  normalization.json
-  preprocessing_summary.json
+  normalization.json          normalization manifest read by training and export: methods and
+                              train-split statistics, plus units, trained-domain records
+                              (window start times, (T, P) coverage, tracked-species sum) and the
+                              std-floor record
+  preprocessing_summary.json  build record: per-file rows (size, groups, rejects, windows, shards,
+                              raw time grid), split definition, (T, P) coverage table, window-start
+                              and dt histograms, the config blocks used, code/library versions
   train/shard_*.npz
   validation/shard_*.npz
   test/shard_*.npz
@@ -34,6 +42,12 @@ Shard schema:
     globals     : [N, G]          float32  (normalized globals)
     dt_norm_mat : [N, n_steps-1]  float32  (normalized dt in [0, 1])
 
+Randomness: split membership is a hash of (SPLIT_SEED, file basename, group name), independent of
+preprocessing.seed. Window draws (dt, start time) use one generator per trajectory, seeded with
+[preprocessing.seed, a hash of the group name], so they do not depend on the file's position in
+the file list or on which other groups were kept. The per-file generator (seeded with the file
+name) only shuffles the group pool.
+
 This script is intentionally strict:
 - Configuration must use the canonical schema (the file named by AUTOCHEM_CONFIG_PATH).
 - Dataset names must match exactly (no implicit renaming).
@@ -48,6 +62,7 @@ Run:
 from __future__ import annotations
 
 import ctypes
+import datetime
 import fcntl
 import hashlib
 import json
@@ -55,8 +70,10 @@ import logging
 import math
 import multiprocessing
 import os
+import platform
 import shutil
 import signal
+import subprocess
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -107,6 +124,64 @@ log = logging.getLogger(__name__)
 # Fixed global set, in this order (spec.md section 5, items 4-6). This standalone script
 # imports nothing from src/, so it keeps its own copy of src/model.py:_REQUIRED_GLOBALS.
 _REQUIRED_GLOBALS: Tuple[str, str] = ("P", "T")
+# Physical units of the raw inputs, written to normalization.json. The raw files carry no unit
+# attributes and preprocessing applies no conversion, so these declare the VULCAN source's units.
+UNITS: Dict[str, str] = {
+    "P": "dyn/cm^2 (barye)",
+    "T": "K",
+    "dt": "s",
+    "time": "s (since the raw t=0)",
+    "species": (
+        "mixing ratio y_i = n_i / n_total over all gas species of the generator run (inferred; the "
+        "generator config is not on daw); the training initial gas held only the tracked species "
+        "(their sum is 1 at t=0 and at most 1 afterwards; train-split distribution of the sum: "
+        "normalization.json species_sum); model outputs use the same denominator"
+    ),
+}
+# Split membership: a fixed constant, not preprocessing.seed, so a sampling replicate (another
+# preprocessing.seed) keeps the same train/validation/test trajectories. 1234 is the historical
+# preprocessing.seed, so today's splits are unchanged.
+SPLIT_SEED = 1234
+# split_for_trajectory keys on 64 bits of SHA-1, mapped to a uniform in (0, 1) as (u + 0.5) / 2**64.
+_SPLIT_HASH_BYTES = 8
+SPLIT_KEY_DEFINITION = (
+    "u = int.from_bytes(sha1(f'{SPLIT_SEED}:{file basename}:{group name}').digest()[:8], 'big'); "
+    "x = (u + 0.5) / 2**64, uniform in (0, 1); test if x < test_fraction, validation if "
+    "x < test_fraction + val_fraction, else train"
+)
+# Generators are seeded with [preprocessing.seed, one 64-bit word of SHA-1 of an identity]: the file
+# name (pool shuffle) or the group name (window draws). The same word is the group-name digest of
+# the cross-file duplicate check.
+_SEED_WORD_BYTES = 8
+# (T, log10 P) coverage cells, floor-based and open-ended (no fixed box: the synthetic smoke data
+# reaches log10 P = -2). 100 K x 1 dex resolves the drop_below skew (>= 144 kept groups per cell on
+# the 4-file set, audit R1-018).
+_COVERAGE_T_BIN_K = 100.0
+_COVERAGE_LOG10P_BIN_DEX = 1.0
+# Histograms of the written windows' log10 start time and log10 dt (floor-based, open-ended bins):
+# 1 dex spans the 11-decade raw grid in 11 bins, 0.5 dex the 4-decade dt range in 8.
+_TSTART_HIST_BIN_DEX = 1.0
+_DT_HIST_BIN_DEX = 0.5
+# Train-split distribution of the tracked-species sum per state: a fixed histogram on [0, 1]
+# (sums above 1 from float32 rounding land in the last bin) with this resolution, read at these
+# cumulative levels (the low tail, plus the median).
+_SPECIES_SUM_HIST_BINS = 10_000
+_SPECIES_SUM_QUANTILE_LEVELS: Tuple[float, ...] = (0.001, 0.01, 0.05, 0.5)
+# Best-effort git provenance in the summary: a git call slower than this is recorded as null.
+_GIT_TIMEOUT_S = 10.0
+_SPLITS: Tuple[str, str, str] = ("train", "validation", "test")
+# The manifest keys that define the z-space; their canonical-JSON sha256 is the normalization
+# fingerprint (norm_sha256). Same definition as src/utils.py (this script imports nothing from
+# src/); src/main.py checks that the summary's copy equals the one it computes from the manifest.
+_NORM_FINGERPRINT_KEYS: Tuple[str, ...] = (
+    "normalization_methods",
+    "per_key_stats",
+    "epsilon",
+    "min_std",
+    "dt",
+    "species_variables",
+    "global_variables",
+)
 _REQUIRED_DT_SAMPLING = "loguniform"
 _ALLOWED_GLOBAL_METHODS = {"standard", "min-max", "log-min-max", "log-standard"}
 # Config keys starting with this prefix are comments (same rule as src/utils.py); any other
@@ -597,15 +672,20 @@ def reservoir_sample(keys: Iterable[str], k: int, rng: np.random.Generator) -> L
 
 
 def split_for_trajectory(file_name: str, traj_name: str, *, seed: int, val_frac: float, test_frac: float) -> str:
-    """Deterministically assign a trajectory to train/validation/test via SHA-1(seed:file:traj)."""
+    """Deterministically assign a trajectory to train/validation/test (SPLIT_KEY_DEFINITION, seed=SPLIT_SEED)."""
     key = f"{file_name}:{traj_name}"
     h = hashlib.sha1(f"{seed}:{key}".encode()).digest()
-    u = (int.from_bytes(h[:8], "big") + 0.5) / 2**64
+    u = (int.from_bytes(h[:_SPLIT_HASH_BYTES], "big") + 0.5) / 2 ** (8 * _SPLIT_HASH_BYTES)
     if u < test_frac:
         return "test"
     if u < test_frac + val_frac:
         return "validation"
     return "train"
+
+
+def _seed_word(name: str) -> int:
+    """One 64-bit word of SHA-1(name): a stable per-identity seed component and group-name digest."""
+    return int.from_bytes(hashlib.sha1(name.encode()).digest()[:_SEED_WORD_BYTES], "big")
 
 
 def sample_dt(cfg: PreCfg, rng: np.random.Generator) -> float:
@@ -870,41 +950,72 @@ def interp_loglog(
 # -----------------------------------------------------------------------------
 
 
+def _coverage_cell(g_vec: np.ndarray) -> Tuple[int, int]:
+    """(T bin, log10 P bin) indices of a group, floor-based (P > 0 is guaranteed by read_globals_vector)."""
+    p_val, t_val = float(g_vec[0]), float(g_vec[1])
+    return (
+        int(math.floor(t_val / _COVERAGE_T_BIN_K)),
+        int(math.floor(math.log10(p_val) / _COVERAGE_LOG10P_BIN_DEX)),
+    )
+
+
+def _new_cell() -> Dict[str, Any]:
+    return {"too_few_valid": 0, "reached_drop_test": 0, "drop_below": 0, "windows": {sp: 0 for sp in _SPLITS}}
+
+
+def _hist_add(hist: Dict[int, int], value: float, width: float) -> None:
+    """Count log10(value) in the floor-based bin of `width` dex (keyed by the bin index)."""
+    b = int(math.floor(math.log10(value) / width))
+    hist[b] = hist.get(b, 0) + 1
+
+
 def sample_file(
     file_path: Path,
     file_idx: int,
     *,
     out_tmp: Path,
     cfg: PreCfg,
-) -> Tuple[Dict[str, int], Dict[str, int], bool]:
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Sample and resample trajectories from a single HDF5 file into physical shards.
 
-    Self-contained so it can run in a worker process: it owns a per-file RNG (seeded
-    deterministically from ``cfg.seed`` and ``file_idx``, independent of how many files
-    run concurrently), its own per-split shard counters, and a per-file shard-name
-    prefix. Returns ``(written_by_split, rejects, truncated)`` for the parent to
-    aggregate; ``truncated`` is True only when the per-file output cap stopped
-    sampling while candidate draws remained.
-    """
+    Self-contained so it can run in a worker process. Generators: one per file, seeded from
+    ``cfg.seed`` and the file name, only reservoir-samples and shuffles the group pool; one per
+    trajectory, seeded from ``cfg.seed`` and the group name, draws that trajectory's windows (dt and
+    start time), so a window does not depend on the file's position in the list or on which other
+    groups were kept. ``file_idx`` only namespaces this file's shard names.
 
-    rng = np.random.default_rng([int(cfg.seed), int(file_idx)])
-    shard_idx: Dict[str, int] = {"train": 0, "validation": 0, "test": 0}
+    Returns ``(row, agg)``. ``row`` is this file's preprocessing_summary.json entry: name, size,
+    group counts (groups_seen = sum(group_rejects) + groups_kept), group- and chunk-level rejects,
+    windows written per split, ``truncated`` (the per-file output cap stopped sampling while
+    candidate draws remained), shards per split and the raw time grid of the first group with a
+    finite time vector. ``agg`` holds the counters the parent sums over files: the (T, log10 P)
+    coverage cells, drop_below trigger counts, window start-time / dt histograms, anchored windows,
+    per-split window start-time range, and the 64-bit digests of every group name in the file (the
+    cross-file duplicate check).
+    """
+    rng = np.random.default_rng([int(cfg.seed), _seed_word(file_path.name)])
+    shard_idx: Dict[str, int] = {sp: 0 for sp in _SPLITS}
     name_prefix = f"shard_f{int(file_idx):04d}"
 
-    y_buf: Dict[str, List[np.ndarray]] = {"train": [], "validation": [], "test": []}
-    g_buf: Dict[str, List[np.ndarray]] = {"train": [], "validation": [], "test": []}
-    dt_buf: Dict[str, List[np.ndarray]] = {"train": [], "validation": [], "test": []}
+    y_buf: Dict[str, List[np.ndarray]] = {sp: [] for sp in _SPLITS}
+    g_buf: Dict[str, List[np.ndarray]] = {sp: [] for sp in _SPLITS}
+    dt_buf: Dict[str, List[np.ndarray]] = {sp: [] for sp in _SPLITS}
 
-    rejects: Dict[str, int] = {
-        "too_few_valid": 0,
-        "drop_below": 0,
-        "non_finite": 0,
-        "non_positive_global": 0,
-        "no_fit_chunk": 0,
-        "interp_non_finite": 0,
-    }
+    # Group-level rejects (a whole source group) and chunk-level rejects (one window attempt).
+    group_rejects: Dict[str, int] = {"non_finite": 0, "non_positive_global": 0, "too_few_valid": 0, "drop_below": 0}
+    chunk_rejects: Dict[str, int] = {"no_fit_chunk": 0, "interp_non_finite": 0}
+    windows_by_split = {sp: 0 for sp in _SPLITS}
+    groups_seen = 0
+    groups_kept = 0
+    raw_time_grid: Optional[Dict[str, Any]] = None
 
-    written_by_split = {"train": 0, "validation": 0, "test": 0}
+    coverage: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    drop_triggers = {sp: 0 for sp in cfg.species_variables}
+    drop_exact_zero = 0
+    t_start_hist: Dict[str, Dict[int, int]] = {sp: {} for sp in _SPLITS}
+    dt_hist: Dict[str, Dict[int, int]] = {sp: {} for sp in _SPLITS}
+    anchored = {sp: 0 for sp in _SPLITS}
+    t_start_range: Dict[str, List[float]] = {}
 
     target = int(cfg.output_trajectories_per_file)
     written = 0
@@ -913,6 +1024,8 @@ def sample_file(
     step_offsets = np.arange(cfg.n_steps, dtype=np.float64)
 
     with h5py.File(file_path, "r") as fin:
+        n_groups = len(fin)
+        name_digests = np.fromiter((_seed_word(str(k)) for k in fin.keys()), dtype=np.uint64, count=n_groups)
         pool = reservoir_sample(fin.keys(), int(cfg.pool_size), rng)
         rng.shuffle(pool)
 
@@ -920,6 +1033,7 @@ def sample_file(
             if written >= target:
                 truncated = True
                 break
+            groups_seen += 1
 
             grp_obj = fin[traj_name]
             if not isinstance(grp_obj, h5py.Group):
@@ -936,7 +1050,7 @@ def sample_file(
                 t_raw = read_time(grp, time_key=cfg.time_key, leaf_index=leaf_index)
             except (KeyError, ValueError, TypeError) as e:
                 if isinstance(e, ValueError) and _is_non_finite_raw_error(e):
-                    rejects["non_finite"] += 1
+                    group_rejects["non_finite"] += 1
                     log.debug(
                         "Reject trajectory '%s' in %s: non-finite time values (%s)",
                         traj_name,
@@ -949,13 +1063,22 @@ def sample_file(
                 ) from e
 
             T = int(t_raw.shape[0])
+            if raw_time_grid is None:
+                pos_t = t_raw[t_raw > 0]
+                raw_time_grid = {
+                    "group": str(traj_name),
+                    "n_points": T,
+                    "t_first": float(t_raw[0]),
+                    "t_first_positive": float(pos_t[0]) if pos_t.size else None,
+                    "t_last": float(t_raw[-1]),
+                }
 
             # Species
             try:
                 y_raw = read_species_matrix(grp, t_len=T, species_vars=cfg.species_variables, leaf_index=leaf_index)
             except (KeyError, ValueError, TypeError) as e:
                 if isinstance(e, ValueError) and _is_non_finite_raw_error(e):
-                    rejects["non_finite"] += 1
+                    group_rejects["non_finite"] += 1
                     log.debug(
                         "Reject trajectory '%s' in %s: non-finite species values (%s)",
                         traj_name,
@@ -972,7 +1095,7 @@ def sample_file(
                 g_vec = read_globals_vector(grp, global_vars=cfg.global_variables, leaf_index=leaf_index)
             except (KeyError, ValueError, TypeError) as e:
                 if isinstance(e, ValueError) and _is_non_finite_raw_error(e):
-                    rejects["non_finite"] += 1
+                    group_rejects["non_finite"] += 1
                     log.debug(
                         "Reject trajectory '%s' in %s: non-finite global values (%s)",
                         traj_name,
@@ -981,7 +1104,7 @@ def sample_file(
                     )
                     continue
                 if isinstance(e, ValueError) and _is_non_positive_global_error(e):
-                    rejects["non_positive_global"] += 1
+                    group_rejects["non_positive_global"] += 1
                     log.debug(
                         "Reject trajectory '%s' in %s: non-positive global value (%s)",
                         traj_name,
@@ -993,19 +1116,29 @@ def sample_file(
                     f"Raw schema mismatch while reading globals for trajectory '{traj_name}' in {file_path.name}: {e}"
                 ) from e
             g_vec32 = g_vec.astype(np.float32, copy=False)
+            cell = coverage.setdefault(_coverage_cell(g_vec32), _new_cell())
 
             # Validity mask (matches training assumptions):
             # - Only consider positive times (log-time interpolation).
             # - Require at least 2 valid samples.
             valid = t_raw > 0
             if int(np.count_nonzero(valid)) < 2:
-                rejects["too_few_valid"] += 1
+                group_rejects["too_few_valid"] += 1
+                cell["too_few_valid"] += 1
                 continue
 
-            if np.any(y_raw < float(cfg.drop_below)):
-                rejects["drop_below"] += 1
+            cell["reached_drop_test"] += 1
+            below = y_raw < float(cfg.drop_below)
+            if np.any(below):
+                group_rejects["drop_below"] += 1
+                cell["drop_below"] += 1
+                for j in np.flatnonzero(np.any(below, axis=0)):
+                    drop_triggers[cfg.species_variables[int(j)]] += 1
+                if np.any(y_raw == 0.0):
+                    drop_exact_zero += 1
                 continue
 
+            groups_kept += 1
             t_valid = t_raw[valid]
             log_t_valid = np.log10(t_valid)
             y_valid = y_raw[valid, :]
@@ -1013,29 +1146,33 @@ def sample_file(
             split = split_for_trajectory(
                 file_path.name,
                 str(traj_name),
-                seed=cfg.seed,
+                seed=SPLIT_SEED,
                 val_frac=cfg.val_fraction,
                 test_frac=cfg.test_fraction,
             )
+            # This trajectory's own generator: its windows depend only on (seed, group name).
+            traj_rng = np.random.default_rng([int(cfg.seed), _seed_word(str(traj_name))])
+            # The anchor of draw 0 (pick_t_start's t_lo).
+            t_anchor = max(float(cfg.t_min), float(t_valid[0]))
 
             for sidx in range(int(cfg.samples_per_source_trajectory)):
                 if written >= target:
                     truncated = True
                     break
 
-                dt_s = sample_dt(cfg, rng)
+                dt_s = sample_dt(cfg, traj_rng)
                 t_start = pick_t_start(
                     t_raw=t_raw,
                     t_valid=t_valid,
                     dt_s=dt_s,
                     n_steps=cfg.n_steps,
                     t_min=cfg.t_min,
-                    rng=rng,
+                    rng=traj_rng,
                     anchor_first=(sidx == 0),
                     max_attempts=cfg.max_chunk_attempts_per_source,
                 )
                 if t_start is None:
-                    rejects["no_fit_chunk"] += 1
+                    chunk_rejects["no_fit_chunk"] += 1
                     continue
 
                 t_chunk = float(t_start) + step_offsets * float(dt_s)
@@ -1045,15 +1182,23 @@ def sample_file(
                 y_new = interp_loglog(y_valid, i0=i0, i1=i1, w=w, epsilon=cfg.epsilon)
 
                 if not np.all(np.isfinite(y_new)):
-                    rejects["interp_non_finite"] += 1
+                    chunk_rejects["interp_non_finite"] += 1
                     continue
 
                 y_buf[split].append(y_new.astype(np.float32, copy=False))
                 g_buf[split].append(g_vec32)
                 dt_buf[split].append(np.full(cfg.n_steps - 1, dt_s, dtype=np.float32))
 
-                written_by_split[split] += 1
+                windows_by_split[split] += 1
                 written += 1
+                cell["windows"][split] += 1
+                _hist_add(t_start_hist[split], float(t_start), _TSTART_HIST_BIN_DEX)
+                _hist_add(dt_hist[split], float(dt_s), _DT_HIST_BIN_DEX)
+                if sidx == 0 and float(t_start) == t_anchor:
+                    anchored[split] += 1
+                lo_hi = t_start_range.setdefault(split, [float(t_start), float(t_start)])
+                lo_hi[0] = min(lo_hi[0], float(t_start))
+                lo_hi[1] = max(lo_hi[1], float(t_start))
 
                 if len(y_buf[split]) >= cfg.shard_size:
                     shard_idx[split], _ = flush_shard(
@@ -1070,7 +1215,7 @@ def sample_file(
                     g_buf[split].clear()
                     dt_buf[split].clear()
 
-        for sp in ("train", "validation", "test"):
+        for sp in _SPLITS:
             shard_idx[sp], _ = flush_shard(
                 out_tmp,
                 split=sp,
@@ -1083,16 +1228,45 @@ def sample_file(
             )
 
     log.info(
-        "file=%s written=%d (train=%d val=%d test=%d) rejects=%s",
+        "file=%s groups seen=%d kept=%d group_rejects=%s chunk_rejects=%s windows=%d (train=%d val=%d test=%d) truncated=%s",
         file_path.name,
+        groups_seen,
+        groups_kept,
+        group_rejects,
+        chunk_rejects,
         written,
-        written_by_split["train"],
-        written_by_split["validation"],
-        written_by_split["test"],
-        rejects,
+        windows_by_split["train"],
+        windows_by_split["validation"],
+        windows_by_split["test"],
+        truncated,
     )
 
-    return written_by_split, rejects, truncated
+    row = {
+        "file_idx": int(file_idx),
+        "name": file_path.name,
+        "size_bytes": int(file_path.stat().st_size),
+        "n_groups": int(n_groups),
+        "n_pooled": len(pool),
+        "groups_seen": groups_seen,
+        "groups_kept": groups_kept,
+        "group_rejects": group_rejects,
+        "chunk_rejects": chunk_rejects,
+        "windows_written_by_split": windows_by_split,
+        "truncated": truncated,
+        "shards_by_split": dict(shard_idx),
+        "raw_time_grid": raw_time_grid,
+    }
+    agg = {
+        "coverage": coverage,
+        "drop_triggers": drop_triggers,
+        "drop_exact_zero": drop_exact_zero,
+        "t_start_hist": t_start_hist,
+        "dt_hist": dt_hist,
+        "anchored": anchored,
+        "t_start_range": t_start_range,
+        "name_digests": name_digests,
+    }
+    return row, agg
 
 
 # -----------------------------------------------------------------------------
@@ -1131,17 +1305,28 @@ class RunningMeanVar:
         self.M2 = self.M2 + b_M2 + (delta**2) * (self.n * m / n_new)
         self.n = n_new
 
-    def finalize(self, *, min_std: float) -> Tuple[np.ndarray, np.ndarray]:
-        """Return (mean, std) with std floored at min_std; raise if fewer than 2 samples seen."""
+    def finalize(self, *, min_std: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return (mean, std, floored): std floored at min_std, floored = var < min_std**2.
+
+        Raises if fewer than 2 samples were seen. An exactly or nearly constant column is NOT caught
+        by `floored`: float roundoff keeps its variance above min_std**2 (log_min == log_max in
+        per_key_stats is the trace of such a column).
+        """
         if self.n <= 1:
             raise RuntimeError("Insufficient samples to compute variance")
         var = self.M2 / (self.n - 1)
-        std = np.sqrt(np.maximum(var, float(min_std) ** 2))
-        return self.mean, std
+        floor_var = float(min_std) ** 2
+        std = np.sqrt(np.maximum(var, floor_var))
+        return self.mean, std, var < floor_var
 
 
-def compute_train_stats(out_tmp: Path, cfg: PreCfg) -> Tuple[Dict, Dict[str, str]]:
-    """Compute normalization statistics from physical train shards."""
+def compute_train_stats(out_tmp: Path, cfg: PreCfg) -> Tuple[Dict, Dict[str, str], Dict[str, List[str]], Dict[str, Any]]:
+    """Compute normalization statistics from physical train shards.
+
+    Returns (per_key_stats, methods, std_floored, species_sum): std_floored names every
+    (key, field) whose variance was below min_std**2 (std floored at min_std; logged as a warning);
+    species_sum is the distribution of the tracked-species sum over every train-split state.
+    """
 
     shards = iter_shards(out_tmp, "train", "_physical")
     if not shards:
@@ -1161,10 +1346,18 @@ def compute_train_stats(out_tmp: Path, cfg: PreCfg) -> Tuple[Dict, Dict[str, str
     glog_min = np.full(G, np.inf, dtype=np.float64)
     glog_max = np.full(G, -np.inf, dtype=np.float64)
 
+    sum_counts = np.zeros(_SPECIES_SUM_HIST_BINS, dtype=np.int64)
+    sum_min, sum_max = np.inf, -np.inf
+
     for p in tqdm(shards, desc="Computing stats"):
         with np.load(p) as z:
             y = np.asarray(z["y_mat"], dtype=np.float64)
             g = np.asarray(z["globals"], dtype=np.float64)
+
+        ysum = y.sum(axis=2).reshape(-1)
+        sum_min, sum_max = min(sum_min, float(ysum.min())), max(sum_max, float(ysum.max()))
+        bins = np.clip((ysum * _SPECIES_SUM_HIST_BINS).astype(np.int64), 0, _SPECIES_SUM_HIST_BINS - 1)
+        sum_counts += np.bincount(bins, minlength=_SPECIES_SUM_HIST_BINS)
 
         ylog = np.log10(np.maximum(y, cfg.epsilon))
         y2 = ylog.reshape(-1, S)
@@ -1182,9 +1375,40 @@ def compute_train_stats(out_tmp: Path, cfg: PreCfg) -> Tuple[Dict, Dict[str, str
         glog_min = np.minimum(glog_min, np.min(glog, axis=0))
         glog_max = np.maximum(glog_max, np.max(glog, axis=0))
 
-    mu_s, sd_s = rms_logy.finalize(min_std=cfg.min_std)
-    mu_g, sd_g = rms_g.finalize(min_std=cfg.min_std)
-    mu_glog, sd_glog = rms_glog.finalize(min_std=cfg.min_std)
+    mu_s, sd_s, fl_s = rms_logy.finalize(min_std=cfg.min_std)
+    mu_g, sd_g, fl_g = rms_g.finalize(min_std=cfg.min_std)
+    mu_glog, sd_glog, fl_glog = rms_glog.finalize(min_std=cfg.min_std)
+
+    std_floored: Dict[str, List[str]] = {}
+    for i, name in enumerate(cfg.species_variables):
+        if fl_s[i]:
+            std_floored[name] = ["log_std"]
+    for i, name in enumerate(cfg.global_variables):
+        fields = [f for f, fl in (("std", fl_g[i]), ("log_std", fl_glog[i])) if fl]
+        if fields:
+            std_floored[name] = fields
+    for name, fields in std_floored.items():
+        log.warning("normalization: %s %s below min_std=%g; floored at min_std", name, fields, cfg.min_std)
+
+    n_states = int(sum_counts.sum())
+    cdf = np.cumsum(sum_counts)
+    species_sum = {
+        "definition": (
+            "sum of the tracked species' mixing ratios per state, over every row of every train-split "
+            "window (float32 physical shards, summed in float64)"
+        ),
+        "n_states": n_states,
+        "min": sum_min,
+        "max": sum_max,
+        "quantiles": {
+            str(q): float(int(np.searchsorted(cdf, q * n_states, side="left")) + 1) / _SPECIES_SUM_HIST_BINS
+            for q in _SPECIES_SUM_QUANTILE_LEVELS
+        },
+        "quantile_method": (
+            f"upper edge of the first bin of a {_SPECIES_SUM_HIST_BINS}-bin histogram on [0, 1] (sums above 1 "
+            "in the last bin) at which the cumulative count reaches level * n_states"
+        ),
+    }
 
     per_key_stats: Dict[str, Dict] = {}
     for i, name in enumerate(cfg.species_variables):
@@ -1214,7 +1438,13 @@ def compute_train_stats(out_tmp: Path, cfg: PreCfg) -> Tuple[Dict, Dict[str, str
     for g in cfg.global_variables:
         methods[g] = cfg.methods[g]
 
-    return per_key_stats, methods
+    return per_key_stats, methods, std_floored, species_sum
+
+
+def normalization_sha256(manifest: Mapping[str, Any]) -> str:
+    """sha256 of the canonical JSON (sorted keys, compact) of the manifest's _NORM_FINGERPRINT_KEYS."""
+    sub = {k: manifest[k] for k in _NORM_FINGERPRINT_KEYS}
+    return hashlib.sha256(json.dumps(sub, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
 
 
 def normalize_and_write(
@@ -1225,8 +1455,14 @@ def normalize_and_write(
     per_key_stats: Dict,
     methods: Dict[str, str],
     counts_total: Dict[str, int],
-) -> None:
+    descriptive: Mapping[str, Any],
+) -> str:
     """Normalize every physical shard to z-space and write the final shards + normalization.json.
+
+    Returns the manifest's normalization fingerprint (norm_sha256).
+
+    `descriptive` holds the additive top-level manifest keys that describe the trained domain
+    (window_start_time_s, coverage, species_sum, std_floored); units come from UNITS.
 
     Species use log-standard normalization; globals use their per-key method; dt is log10 +
     min-max clipped to [0, 1]. Each physical shard is deleted once its final shard is written,
@@ -1363,11 +1599,55 @@ def normalize_and_write(
         "dt": {"log_min": dt_log_min, "log_max": dt_log_max},
         "species_variables": list(cfg.species_variables),
         "global_variables": list(cfg.global_variables),
+        "units": UNITS,
+        **descriptive,
     }
 
     with open(out_final / "normalization.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
         f.write("\n")
+    return normalization_sha256(manifest)
+
+
+def _git_value(args: List[str]) -> Optional[str]:
+    """stdout of a read-only git command in this file's checkout, or None (logged) on any failure."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(Path(__file__).resolve().parent), *args],
+            check=True, capture_output=True, text=True, timeout=_GIT_TIMEOUT_S,
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("git provenance unavailable (%s): %s", " ".join(args), e)
+        return None
+    return out.strip()
+
+
+def _run_record() -> Dict[str, Any]:
+    """The volatile part of the summary (differs on every run; determinism checks drop it)."""
+    status = _git_value(["--no-optional-locks", "status", "--porcelain", "--untracked-files=no"])
+    return {
+        "utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "git_head": _git_value(["rev-parse", "HEAD"]),
+        "git_dirty": None if status is None else bool(status),
+        "code_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "python": platform.python_version(),
+        "numpy": np.__version__,
+        "h5py": h5py.__version__,
+        "hdf5": h5py.version.hdf5_version,
+    }
+
+
+def _strip_comments(obj: Any) -> Any:
+    """A JSON-like value with every '_comment*' key removed (at any depth)."""
+    if isinstance(obj, Mapping):
+        return {k: _strip_comments(v) for k, v in obj.items() if not str(k).startswith(_COMMENT_KEY_PREFIX)}
+    if isinstance(obj, list):
+        return [_strip_comments(v) for v in obj]
+    return obj
+
+
+def _hist_rows(hist: Mapping[int, int], width: float) -> List[Dict[str, Any]]:
+    return [{"log10_lo": b * width, "count": n} for b, n in sorted(hist.items())]
 
 
 def write_summary(
@@ -1375,12 +1655,24 @@ def write_summary(
     *,
     processed_dir: Path,
     cfg: PreCfg,
-    counts_total: Dict[str, int],
-    rejects_total: Dict[str, int],
+    cfg_dict: Mapping[str, Any],
+    rows: List[Dict[str, Any]],
+    totals: Mapping[str, Any],
+    norm_sha256: str,
 ) -> None:
-    """Write dest_dir/preprocessing_summary.json (per-split counts, reject breakdown, resolved config).
+    """Write dest_dir/preprocessing_summary.json: the record of this build.
 
-    Paths are stored relative to processed_dir, where the summary is published.
+    norm_sha256 is the normalization fingerprint of the normalization.json written with it.
+
+    Keys: windows_written_by_split, groups_seen / groups_kept, group_rejects (whole source groups:
+    non_finite, non_positive_global, too_few_valid, drop_below) and chunk_rejects (window attempts:
+    no_fit_chunk, interp_non_finite), files_truncated; raw_files (one row per file, by file_idx);
+    split (seed, fractions, key definition, raw basenames); coverage ((T, log10 P) cells: groups
+    that reached the drop_below test, drop_below rejects, too_few_valid, windows per split; plus
+    drop_below trigger counts); windows (log10 start-time and dt histograms per split, anchored
+    windows, start-time range); config (the parsed PreCfg, paths relative to processed_dir) and
+    config_blocks (the raw preprocessing / normalization / data blocks, comment keys removed, which
+    src/main.py compares with the training config); run (time, git, code hash, versions: volatile).
     """
     base = processed_dir.resolve()
     cfg_serialized: Dict[str, Any] = {}
@@ -1393,10 +1685,45 @@ def write_summary(
         else:
             cfg_serialized[k] = v
 
+    cov = totals["coverage"]
     summary = {
-        "counts_total": counts_total,
-        "rejects_total": rejects_total,
+        "norm_sha256": norm_sha256,
+        "windows_written_by_split": totals["windows_written_by_split"],
+        "groups_seen": totals["groups_seen"],
+        "groups_kept": totals["groups_kept"],
+        "group_rejects": totals["group_rejects"],
+        "chunk_rejects": totals["chunk_rejects"],
+        "files_truncated": sum(1 for r in rows if r["truncated"]),
+        "raw_files": rows,
+        "split": {
+            "split_seed": SPLIT_SEED,
+            "val_fraction": cfg.val_fraction,
+            "test_fraction": cfg.test_fraction,
+            "key": SPLIT_KEY_DEFINITION,
+            "raw_basenames": sorted(r["name"] for r in rows),
+        },
+        "coverage": {
+            "units": {"T": UNITS["T"], "P": UNITS["P"]},
+            "T_bin_K": _COVERAGE_T_BIN_K,
+            "log10P_bin_dex": _COVERAGE_LOG10P_BIN_DEX,
+            "cells": [
+                {"T_lo_K": ti * _COVERAGE_T_BIN_K, "log10P_lo": pi * _COVERAGE_LOG10P_BIN_DEX, **c}
+                for (ti, pi), c in sorted(cov.items())
+            ],
+            "drop_below_trigger_species": totals["drop_triggers"],
+            "drop_below_with_exact_zero": totals["drop_exact_zero"],
+        },
+        "windows": {
+            "t_start_s_log10_bin_dex": _TSTART_HIST_BIN_DEX,
+            "dt_s_log10_bin_dex": _DT_HIST_BIN_DEX,
+            "t_start_hist": {sp: _hist_rows(totals["t_start_hist"][sp], _TSTART_HIST_BIN_DEX) for sp in _SPLITS},
+            "dt_hist": {sp: _hist_rows(totals["dt_hist"][sp], _DT_HIST_BIN_DEX) for sp in _SPLITS},
+            "anchored_at_first_positive_time": totals["anchored"],
+            "t_start_range_s": totals["t_start_range"],
+        },
         "config": cfg_serialized,
+        "config_blocks": {k: _strip_comments(cfg_dict[k]) for k in ("preprocessing", "normalization", "data")},
+        "run": _run_record(),
     }
     with open(dest_dir / "preprocessing_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
@@ -1493,6 +1820,7 @@ def main() -> None:
     try:
         _build_dataset(
             cfg,
+            cfg_dict=cfg_dict,
             raw_files=raw_files,
             log_level=log_level,
             out_final=out_final,
@@ -1509,9 +1837,100 @@ def main() -> None:
         raise
 
 
+def _check_unique_group_names(raw_files: List[Path], digests: Dict[int, np.ndarray]) -> None:
+    """Raise if a group name occurs in two raw files (each copy would be split independently).
+
+    Compares the workers' 64-bit name digests; a repeated digest is re-checked on the real names,
+    so only a true duplicate raises (naming both files).
+    """
+    idx = np.concatenate([np.full(d.shape[0], i, dtype=np.int64) for i, d in sorted(digests.items())])
+    allv = np.concatenate([d for _, d in sorted(digests.items())])
+    order = np.argsort(allv, kind="stable")
+    sv, si = allv[order], idx[order]
+    rep = np.flatnonzero(sv[1:] == sv[:-1])
+    pairs = sorted({(int(si[k]), int(si[k + 1])) for k in rep if si[k] != si[k + 1]})
+    for a, b in pairs:
+        with h5py.File(raw_files[a], "r") as fa, h5py.File(raw_files[b], "r") as fb:
+            common = sorted(set(fa.keys()) & set(fb.keys()))
+        if common:
+            raise RuntimeError(
+                f"group name(s) {common[:5]} (and {max(0, len(common) - 5)} more) occur in both "
+                f"{raw_files[a].name} and {raw_files[b].name}: each copy would be assigned a split "
+                "independently; remove the duplicate"
+            )
+
+
+def _merge_totals(rows: List[Dict[str, Any]], aggs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Sum the per-file counters (rows and aggregates, in file_idx order) into build totals."""
+    tot: Dict[str, Any] = {
+        "windows_written_by_split": {sp: sum(r["windows_written_by_split"][sp] for r in rows) for sp in _SPLITS},
+        "groups_seen": sum(r["groups_seen"] for r in rows),
+        "groups_kept": sum(r["groups_kept"] for r in rows),
+        "group_rejects": {},
+        "chunk_rejects": {},
+        "coverage": {},
+        "drop_triggers": {},
+        "drop_exact_zero": sum(a["drop_exact_zero"] for a in aggs),
+        "t_start_hist": {sp: {} for sp in _SPLITS},
+        "dt_hist": {sp: {} for sp in _SPLITS},
+        "anchored": {sp: sum(a["anchored"][sp] for a in aggs) for sp in _SPLITS},
+        "t_start_range": {},
+    }
+    for r in rows:
+        for key in ("group_rejects", "chunk_rejects"):
+            for k, v in r[key].items():
+                tot[key][k] = tot[key].get(k, 0) + int(v)
+    for a in aggs:
+        for cell, c in a["coverage"].items():
+            t = tot["coverage"].setdefault(cell, _new_cell())
+            for k in ("too_few_valid", "reached_drop_test", "drop_below"):
+                t[k] += c[k]
+            for sp in _SPLITS:
+                t["windows"][sp] += c["windows"][sp]
+        for k, v in a["drop_triggers"].items():
+            tot["drop_triggers"][k] = tot["drop_triggers"].get(k, 0) + v
+        for key in ("t_start_hist", "dt_hist"):
+            for sp in _SPLITS:
+                for b, n in a[key][sp].items():
+                    tot[key][sp][b] = tot[key][sp].get(b, 0) + n
+        for sp, (lo, hi) in a["t_start_range"].items():
+            cur = tot["t_start_range"].setdefault(sp, [lo, hi])
+            cur[0], cur[1] = min(cur[0], lo), max(cur[1], hi)
+    return tot
+
+
+def _manifest_coverage(totals: Mapping[str, Any]) -> Dict[str, Any]:
+    """normalization.json 'coverage': train windows per (T, log10 P) cell and the lowest-retention cell."""
+    cells = sorted(totals["coverage"].items())
+    worst = None
+    for (ti, pi), c in cells:
+        if c["reached_drop_test"] == 0:
+            continue
+        kept = c["reached_drop_test"] - c["drop_below"]
+        ret = kept / c["reached_drop_test"]
+        if worst is None or ret < worst["retention"]:
+            worst = {"T_lo_K": ti * _COVERAGE_T_BIN_K, "log10P_lo": pi * _COVERAGE_LOG10P_BIN_DEX,
+                     "reached_drop_test": c["reached_drop_test"], "kept": kept, "retention": ret}
+    return {
+        "definition": (
+            "train-split windows per floor-based (T, log10 P) cell (all splits' group counts are in "
+            "preprocessing_summary.json); retention = groups kept / groups that reached the drop_below test"
+        ),
+        "units": {"T": UNITS["T"], "P": UNITS["P"]},
+        "T_bin_K": _COVERAGE_T_BIN_K,
+        "log10P_bin_dex": _COVERAGE_LOG10P_BIN_DEX,
+        "train_windows": [
+            {"T_lo_K": ti * _COVERAGE_T_BIN_K, "log10P_lo": pi * _COVERAGE_LOG10P_BIN_DEX, "windows": c["windows"]["train"]}
+            for (ti, pi), c in cells if c["windows"]["train"]
+        ],
+        "lowest_retention_cell": worst,
+    }
+
+
 def _build_dataset(
     cfg: PreCfg,
     *,
+    cfg_dict: Mapping[str, Any],
     raw_files: List[Path],
     log_level: str,
     out_final: Path,
@@ -1520,9 +1939,6 @@ def _build_dataset(
     out_trash: Path,
 ) -> None:
     """Sample every raw file, normalize into out_stage, then swap the new dataset into out_final."""
-    counts_total = {"train": 0, "validation": 0, "test": 0}
-    rejects_total: Dict[str, int] = {}
-
     # Never more workers than files or than the cores this process may run on.
     n_workers = min(int(cfg.num_workers), len(raw_files), len(os.sched_getaffinity(0)))
 
@@ -1537,8 +1953,10 @@ def _build_dataset(
     t0 = time.time()
 
     per_file_cap = int(cfg.output_trajectories_per_file)
+    rows_by_idx: Dict[int, Dict[str, Any]] = {}
+    aggs_by_idx: Dict[int, Dict[str, Any]] = {}
 
-    # Fan out one process per raw file. Files are independent (per-file RNG and
+    # Fan out one process per raw file. Files are independent (per-file and per-trajectory RNGs,
     # per-file shard-name prefix), so there is no shared mutable state to guard.
     # fork is pinned: the initializer's parent-pid check assumes the pool's parent is this
     # process (under forkserver every worker's parent is the server). The initializer also
@@ -1555,15 +1973,13 @@ def _build_dataset(
         }
         try:
             for fut in tqdm(as_completed(futures), total=len(futures), desc="raw files"):
-                written_by_split, rej, truncated = fut.result()
-                for sp in ("train", "validation", "test"):
-                    counts_total[sp] += int(written_by_split[sp])
-                for k, v in rej.items():
-                    rejects_total[k] = rejects_total.get(k, 0) + int(v)
-                if truncated:
+                row, agg = fut.result()
+                rows_by_idx[row["file_idx"]] = row
+                aggs_by_idx[row["file_idx"]] = agg
+                if row["truncated"]:
                     log.warning(
                         "File %s hit output_trajectories_per_file=%d; remaining "
-                        "trajectories in that file were not sampled",
+                        "source groups in that file were not sampled",
                         futures[fut].name,
                         per_file_cap,
                     )
@@ -1580,33 +1996,60 @@ def _build_dataset(
             executor.shutdown(wait=False, cancel_futures=True)
             raise
 
+    _check_unique_group_names(raw_files, {i: a.pop("name_digests") for i, a in aggs_by_idx.items()})
+    rows = [rows_by_idx[i] for i in sorted(rows_by_idx)]
+    totals = _merge_totals(rows, [aggs_by_idx[i] for i in sorted(aggs_by_idx)])
+    counts_total = totals["windows_written_by_split"]
+
     total_written = counts_total["train"] + counts_total["validation"] + counts_total["test"]
     if total_written == 0:
-        raise RuntimeError("No trajectories were written. Check rejects_total for the failure mode.")
-    if rejects_total.get("non_positive_global", 0):
+        raise RuntimeError("No windows were written. Check group_rejects / chunk_rejects for the failure mode.")
+    if totals["group_rejects"].get("non_positive_global", 0):
         log.warning(
-            "%d trajectory groups rejected: P or T not > 0 (as float32); see rejects_total",
-            rejects_total["non_positive_global"],
+            "%d trajectory groups rejected: P or T not > 0 (as float32); see group_rejects",
+            totals["group_rejects"]["non_positive_global"],
         )
 
     log.info(
-        "Totals written=%d (train=%d val=%d test=%d)",
+        "Totals: groups seen=%d kept=%d group_rejects=%s chunk_rejects=%s windows=%d (train=%d val=%d test=%d)",
+        totals["groups_seen"],
+        totals["groups_kept"],
+        totals["group_rejects"],
+        totals["chunk_rejects"],
         total_written,
         counts_total["train"],
         counts_total["validation"],
         counts_total["test"],
     )
 
-    per_key_stats, methods = compute_train_stats(out_tmp, cfg)
-    normalize_and_write(
+    per_key_stats, methods, std_floored, species_sum = compute_train_stats(out_tmp, cfg)
+    lo_hi = totals["t_start_range"].get("train")
+    descriptive = {
+        "window_start_time_s": {
+            "definition": (
+                "absolute time (s since the raw t=0) of the first state of the earliest and latest "
+                "train-split window; earlier states never entered training (descriptive, not checkable "
+                "by a host at call time)"
+            ),
+            "min": lo_hi[0] if lo_hi else None,
+            "max": lo_hi[1] if lo_hi else None,
+        },
+        "coverage": _manifest_coverage(totals),
+        "species_sum": species_sum,
+        "std_floored": std_floored,
+    }
+    norm_sha256 = normalize_and_write(
         out_tmp=out_tmp,
         out_final=out_stage,
         cfg=cfg,
         per_key_stats=per_key_stats,
         methods=methods,
         counts_total=counts_total,
+        descriptive=descriptive,
     )
-    write_summary(out_stage, processed_dir=out_final, cfg=cfg, counts_total=counts_total, rejects_total=rejects_total)
+    write_summary(
+        out_stage, processed_dir=out_final, cfg=cfg, cfg_dict=cfg_dict, rows=rows, totals=totals, norm_sha256=norm_sha256
+    )
     swap_in_outputs(out_stage, out_final, out_trash)
     remove_tmp_dir(out_tmp)
     log.info("Removed temporary physical shard directory: %s", out_tmp)

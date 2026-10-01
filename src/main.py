@@ -59,14 +59,17 @@ from utils import (
     dotted_differences,
     ensure_dir,
     file_sha256,
+    flatten_dotted,
     is_comment_key,
     load_json_config,
     non_finite_tensor_keys,
+    normalization_sha256,
     parse_precision_config,
     require,
     require_dict,
     require_dotted,
     require_same_model_block,
+    strip_comment_keys,
 )
 
 log = logging.getLogger(__name__)
@@ -116,6 +119,20 @@ _INIT_VAL_NAME = "init_val.json"
 _VAL_METRICS = ("val_loss", "val_loss_log10_mae", "val_loss_z_mse")
 # The repository checkout that holds this file (git provenance).
 _CODE_DIR = Path(__file__).resolve().parent
+
+# The processed_dir's build record (processing/preprocessing.py); required in every checkpoint_mode.
+_SUMMARY_NAME = "preprocessing_summary.json"
+_BUILD_CONFIG_BLOCKS = ("preprocessing", "normalization", "data")
+# Build-config keys that may differ from the training config: overwrite (stage 1 rebuilds, stage 2
+# must not) and num_workers (the outputs do not depend on the worker count).
+_BUILD_CONFIG_MUTABLE_KEYS = frozenset({"preprocessing.overwrite", "preprocessing.num_workers"})
+# Statistics each global normalization method needs (std-like fields must also be > 0).
+_GLOBAL_METHOD_FIELDS: Dict[str, Tuple[str, ...]] = {
+    "standard": ("mean", "std"),
+    "min-max": ("min", "max"),
+    "log-min-max": ("log_min", "log_max"),
+    "log-standard": ("log_mean", "log_std"),
+}
 
 def _resolve_config_path() -> Path:
     """Resolve the training config path from the AUTOCHEM_CONFIG_PATH env var.
@@ -773,12 +790,113 @@ def _require_unique_species(species: List[str], source: str) -> None:
         raise ValueError(f"{source}: duplicate species names {dups}")
 
 
+def _validate_manifest_schema(manifest: Mapping[str, Any], mpath: Path, species: List[str], globals_: List[str]) -> None:
+    """Named errors for a malformed normalization.json (instead of a bare KeyError deep in the trainer)."""
+    def finite(v: Any) -> bool:
+        return _is_finite_number(v)
+
+    for key in ("epsilon", "min_std"):
+        if not (finite(manifest.get(key)) and manifest[key] > 0):
+            raise ValueError(f"{mpath}: {key} must be a finite number > 0, got {manifest.get(key)!r}")
+    dt = manifest.get("dt")
+    if not (isinstance(dt, Mapping) and finite(dt.get("log_min")) and finite(dt.get("log_max"))
+            and dt["log_min"] < dt["log_max"]):
+        raise ValueError(f"{mpath}: dt must hold finite log_min < log_max, got {dt!r}")
+    methods = manifest.get("normalization_methods")
+    stats = manifest.get("per_key_stats")
+    if not isinstance(methods, Mapping) or not isinstance(stats, Mapping):
+        raise ValueError(f"{mpath}: normalization_methods and per_key_stats must be objects")
+    for name in species:
+        st = stats.get(name)
+        if methods.get(name) != "log-standard" or not isinstance(st, Mapping):
+            raise ValueError(f"{mpath}: species {name!r} needs method 'log-standard' and a per_key_stats entry")
+        if not finite(st.get("log_mean")):
+            raise ValueError(f"{mpath}: per_key_stats[{name!r}].log_mean must be finite, got {st.get('log_mean')!r}")
+        if not (finite(st.get("log_std")) and st["log_std"] > 0):
+            raise ValueError(f"{mpath}: per_key_stats[{name!r}].log_std must be finite and > 0, got {st.get('log_std')!r}")
+    for name in globals_:
+        method, st = methods.get(name), stats.get(name)
+        if method not in _GLOBAL_METHOD_FIELDS or not isinstance(st, Mapping):
+            raise ValueError(f"{mpath}: global {name!r} has method {method!r} (expected one of "
+                             f"{sorted(_GLOBAL_METHOD_FIELDS)}) or no per_key_stats entry")
+        lo, hi = _GLOBAL_METHOD_FIELDS[method]
+        if not (finite(st.get(lo)) and finite(st.get(hi))):
+            raise ValueError(f"{mpath}: per_key_stats[{name!r}] needs finite {lo} and {hi} for method {method!r}")
+        if not st[hi] > (st[lo] if method in ("min-max", "log-min-max") else 0):
+            raise ValueError(f"{mpath}: per_key_stats[{name!r}].{hi} invalid for method {method!r}: {st[hi]!r}")
+
+
+def _check_raw_files(cfg: Mapping[str, Any], recorded: List[Any], *, fresh: bool) -> None:
+    """Compare the raw files the processed_dir was built from with raw_dir now (names and sizes).
+
+    Added or resized files fail a fresh run (it would train on stale data); a resume or weights_only
+    run only warns (the data it continues on is still the built data; norm_sha256 gates the
+    checkpoint). Removed files and a missing raw_dir only warn: raw data may be pruned for quota.
+    """
+    raw_dir = Path(cfg["paths"]["raw_dir"])
+    if not raw_dir.is_dir():
+        log.warning("raw_dir %s is missing: the processed data cannot be checked against the raw files", raw_dir)
+        return
+    current: Dict[str, int] = {}
+    for pattern in cfg["preprocessing"]["raw_file_patterns"]:
+        for p in raw_dir.glob(pattern):
+            r = p.resolve()
+            current[r.name] = r.stat().st_size
+    built = {str(r["name"]): int(r["size_bytes"]) for r in recorded}
+    added = sorted(set(current) - set(built))
+    removed = sorted(set(built) - set(current))
+    resized = sorted(n for n in set(current) & set(built) if current[n] != built[n])
+    if removed:
+        log.warning("raw files the processed data was built from are no longer in %s: %s", raw_dir, removed)
+    if added or resized:
+        msg = f"raw files in {raw_dir} changed since the processed data was built: added {added}, resized {resized}"
+        if fresh:
+            raise RuntimeError(msg + "; rebuild paths.processed_dir (a fresh run must train on the current raw data)")
+        log.warning("%s (continuing on the built data)", msg)
+
+
+def _check_build_matches_config(
+    cfg: Mapping[str, Any], processed_dir: Path, *, manifest_sha256: str, fresh: bool
+) -> None:
+    """The processed_dir must have been built, with this normalization.json, from this config's blocks."""
+    spath = processed_dir / _SUMMARY_NAME
+    if not spath.is_file():
+        raise FileNotFoundError(f"missing {spath}: every processed_dir needs its build record; rebuild it")
+    summary = load_json_config(spath)
+    blocks, raw_files = summary.get("config_blocks"), summary.get("raw_files")
+    if not isinstance(blocks, Mapping) or not isinstance(raw_files, list):
+        raise ValueError(f"{spath} records no config_blocks/raw_files (built before 2026-09-30): rebuild required")
+    if summary.get("norm_sha256") != manifest_sha256:
+        raise ValueError(
+            f"{processed_dir}/normalization.json (norm_sha256 {manifest_sha256}) is not the one its build "
+            f"record {spath} describes ({summary.get('norm_sha256')!r}): edited or replaced after the build; rebuild"
+        )
+    built = {k: blocks.get(k) for k in _BUILD_CONFIG_BLOCKS}
+    current = {k: cfg[k] for k in _BUILD_CONFIG_BLOCKS}
+    diff = [k for k in dotted_differences(built, current) if k not in _BUILD_CONFIG_MUTABLE_KEYS]
+    if diff:
+        fb, fc = flatten_dotted(strip_comment_keys(built)), flatten_dotted(strip_comment_keys(current))
+        lines = "\n  ".join(f"{k}: config {fc.get(k, '<absent>')!r} vs built {fb.get(k, '<absent>')!r}" for k in diff)
+        raise ValueError(
+            f"{processed_dir} was built with a different config ({spath}):\n  {lines}\nrebuild it with this "
+            "config, or point paths.processed_dir at a matching build"
+        )
+    _check_raw_files(cfg, raw_files, fresh=fresh)
+
+
 def load_manifest_and_validate_config(
     cfg: Mapping[str, Any],
     processed_dir: Path,
+    *,
+    fresh: bool,
 ) -> Tuple[Dict[str, Any], List[str], List[str]]:
-    """Load normalization.json and require that it declares species_variables and
-    global_variables exactly matching config.data (missing keys or any mismatch is a hard error)."""
+    """Load normalization.json and check that the processed data fits this config.
+
+    The manifest must declare species_variables and global_variables exactly matching config.data
+    and hold valid statistics (named errors); preprocessing_summary.json must record a build from
+    this config's preprocessing/normalization/data blocks (except overwrite and num_workers) and
+    raw files that still match raw_dir (`fresh`: a checkpoint_mode='none' run, see _check_raw_files).
+    """
     mpath = processed_dir / "normalization.json"
     if not mpath.exists():
         raise FileNotFoundError(
@@ -818,6 +936,9 @@ def load_manifest_and_validate_config(
         raise TypeError("bad manifest.global_variables")
     if list(cfg_globals) != list(man_globals):
         raise ValueError(f"global_variables mismatch: config={cfg_globals} manifest={man_globals}")
+
+    _validate_manifest_schema(manifest, mpath, list(cfg_species), list(cfg_globals))
+    _check_build_matches_config(cfg, processed_dir, manifest_sha256=normalization_sha256(manifest), fresh=fresh)
 
     return manifest, list(cfg_species), list(cfg_globals)
 
@@ -1304,7 +1425,9 @@ def main() -> None:
     processed_dir = Path(as_str(require(paths, "processed_dir"), "paths.processed_dir")).expanduser().resolve()
 
     # Manifest must exist and must declare variable lists that exactly match config.data.
-    manifest, species_vars, global_vars = load_manifest_and_validate_config(cfg, processed_dir)
+    manifest, species_vars, global_vars = load_manifest_and_validate_config(
+        cfg, processed_dir, fresh=ckpt_mode == "none"
+    )
 
     prec = parse_precision_config(cfg)
     log.info(
