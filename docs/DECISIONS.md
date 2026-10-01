@@ -1,5 +1,24 @@
 # Production config decisions — evidence and justification
 
+## REVISION 2026-09-30: per-epoch timing, throughput and job-log line (audit theme T4)
+
+Training numerics are unchanged (30-step fingerprint of both stages bitwise identical to the T7
+reference); only what is logged changes, and no sync is added per step.
+- `epoch_time_sec` now uses `time.perf_counter` between device-synchronized hook boundaries and is
+  documented as training plus the end-of-epoch validation pass (checkpoint writes come after it).
+- `metrics.csv` gains `perf_val_time_s`, `perf_train_step_ms`, `perf_train_samples_per_s`,
+  `perf_train_tflops` and (CUDA) `perf_peak_mem_gb`; definitions in the `src/trainer.py` docstring.
+  Model FLOPs are 2*sum(in*out) over the `nn.Linear` layers per sample-step forward, x3 for a
+  step with backward, x1 for a no-grad skip step. Epoch 0 includes compile and CUDA-graph warm-up.
+- The job log gets one INFO line per epoch (epoch, K_train, LR at the epoch start and after its
+  plateau step, train and val losses in `%.6e`, epoch time). EarlyStopping's 3-decimal messages and
+  the checkpoint file names are unchanged.
+- New diagnostics: `testing/efficiency_summary.py` (medians of the perf columns over every metrics
+  segment, plus the launcher's GPU logger `logs/<run dir name>_gpu_util.csv`: utilization, SM clock,
+  power-cap share, and achieved TFLOP/s against the TF32/BF16/FP32 peak at the measured clock) and
+  `testing/profile_training.py` (torch.profiler summary and Chrome trace of a short fit, written to
+  `<work_dir>_profile/`, never to the run directory).
+
 ## REVISION 2026-09-30: run contracts, fingerprints and provenance (audit theme T7)
 
 Training side. Training numerics are unchanged: the 30-step fingerprint of both stages (live and EMA

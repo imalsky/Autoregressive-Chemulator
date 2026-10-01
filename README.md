@@ -76,7 +76,7 @@ it, into a new `processed_dir` if the old one must stay.
 
 Outputs land under `paths.work_dir` (`models/stage1`):
 
-    metrics.csv                 per-epoch metrics (CSVLogger)
+    metrics.csv                 per-epoch metrics (CSVLogger), incl. timing/throughput (epoch_time_sec, perf_*; src/trainer.py)
     train.log                   run log (appended on resume)
     config.resolved.json        portable snapshot of the config the run was started with
     config.resume[.N].json      the config of each resume (must match config.resolved.json)
@@ -125,6 +125,9 @@ same commands serve stage 1 and stage 2:
     AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u testing/predictions.py         # rollout plot against a shard
     AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u testing/bench_speedup.py       # exported-model latency sweep
     AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u testing/training_logs.py       # loss curves
+    AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u testing/efficiency_summary.py  # throughput, TFLOP/s, GPU logger summary
+    AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u testing/profile_training.py    # torch.profiler summary + trace of a short fit
+                                                                                      # (writes <work_dir>_profile/; never the run itself)
 
 Export requires a finished run (`COMPLETED`) whose checkpoint matches its processed data
 (`norm_sha256`); every requested device must be available. Inputs are in physical units

@@ -27,7 +27,23 @@ Optional curriculum (training only):
 Logging:
 - Uses Lightning CSVLogger. All self.log(...) metrics are written to metrics.csv.
 - LearningRateMonitor logs LR automatically.
-- epoch_time_sec is logged manually (so we do not need Timer).
+- Per-epoch timing uses time.perf_counter at three device-synchronized hook boundaries (epoch
+  start, validation start, epoch end; no sync per step):
+    epoch_time_sec            training plus the end-of-epoch validation pass (checkpoint writes
+                              come after it). Training time = epoch_time_sec - perf_val_time_s.
+    perf_val_time_s           the validation pass. The EMA weight swap-in runs just before this
+                              module's on_validation_start (callback hooks first), so it counts as
+                              training time; it takes milliseconds.
+    perf_train_step_ms        training time per training step.
+    perf_train_samples_per_s  training samples (steps x batch_size) per second of training time.
+    perf_train_tflops         model matmul FLOP/s over training time: a forward is
+                              2*sum(in*out) over the nn.Linear layers per sample-step, a step with
+                              backward counts 3 forwards, a no-grad skip (pushforward) step 1.
+    perf_peak_mem_gb          CUDA only: peak allocated memory over the epoch (training and
+                              validation), 1e9 bytes.
+  Epoch 0 also contains the torch.compile and CUDA-graph warm-up.
+- One INFO line per epoch in the job log: epoch, K_train, the LR at epoch start and now (after
+  this epoch's plateau step), train/val losses and epoch_time_sec.
 
 Batch contract (from dataset.py):
 - y:  [B, K_full, S]   (states in z-space)
@@ -75,6 +91,15 @@ LAST_CKPT_EVERY_N_EPOCHS = 1
 # One validation batch before epoch 0 runs the validation step (and its compiled path) once, so a
 # compile or shape failure surfaces in minutes instead of after the first ~2 h epoch.
 _SANITY_VAL_BATCHES = 1
+# Per-epoch perf metrics (see Logging in the module docstring).
+_FLOPS_PER_MAC = 2              # one multiply-add
+_TRAIN_FLOPS_PER_FORWARD = 3    # forward + backward (input and weight gradients, ~2 forwards)
+_BYTES_PER_GB = 1e9
+_MS_PER_S = 1e3
+_FLOPS_PER_TFLOP = 1e12
+# Float format of the per-epoch INFO line (val_loss near the ~7e-4 stage-1 gate needs more than the
+# 3 decimals EarlyStopping prints).
+_EPOCH_LOG_FLOAT_FMT = "%.6e"
 log = logging.getLogger(__name__)
 
 # ==============================================================================
@@ -484,14 +509,23 @@ class FlowMapRolloutModule(pl.LightningModule):
             if bool(tc["compile_open_loop_unroll"]):
                 self._compiled_open_loop_unroll = _try_torch_compile(self._open_loop_unroll_raw_step, cfg=cfg)
 
-        # Epoch timing (logged; CSVLogger writes it)
+        # Epoch timing: perf_counter at epoch start and at validation start (None outside an epoch,
+        # e.g. the sanity batch); the LR the epoch started with.
         self._epoch_t0: Optional[float] = None
+        self._val_t0: Optional[float] = None
+        self._epoch_lr_start: Optional[float] = None
+        # Matmul FLOPs of one forward_step per sample (nn.Linear holds every matmul of the model);
+        # perf_train_tflops and testing/profile_training.py count FLOPs from it.
+        self.fwd_flops_per_sample_step = sum(
+            _FLOPS_PER_MAC * m.in_features * m.out_features for m in self.model.modules() if isinstance(m, nn.Linear)
+        )
         # AR training horizon of the current epoch (set by the curriculum); logged once per epoch.
         self._epoch_k_train: Optional[int] = None
         # Per-epoch device sum of [loss_total, loss_log10_mae, loss_z_mse] and step count; the epoch
         # means are logged once in on_train_epoch_end instead of three self.log calls per step.
         # A per-step mean equals Lightning's per-sample mean only because every training batch is
-        # full-size (main.py builds the train loader with drop_last=True).
+        # full-size (the training stream yields only full batches, dataset.py); the perf metrics'
+        # sample count (steps x batch_size) relies on the same fact.
         self._train_loss_sum: Optional[torch.Tensor] = None
         self._train_loss_n = 0
         # runtime.log_grad_norm: per-epoch device sum of [pre-clip total grad norm, clip fired] over
@@ -549,21 +583,97 @@ class FlowMapRolloutModule(pl.LightningModule):
     # Epoch timing
     # ------------------------
 
+    def _sync_device(self) -> None:
+        """Wait for the queued GPU work (epoch-boundary timing only; never called per step)."""
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    def _current_lr(self) -> float:
+        """LR of the first param group (both groups share it)."""
+        return float(self.trainer.optimizers[0].param_groups[0]["lr"])
+
     def on_train_epoch_start(self) -> None:
         # The training stream draws this epoch's windows from (seed, epoch): resume-safe.
         self.trainer.train_dataloader.dataset.set_epoch(int(self.current_epoch))
-        self._epoch_t0 = time.time()
+        self._sync_device()
+        if self.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(self.device)
+        self._epoch_lr_start = self._current_lr()
+        self._val_t0 = None
+        self._epoch_t0 = time.perf_counter()
         self._train_loss_sum = None
         self._train_loss_n = 0
         self._grad_stats_sum = None
         self._grad_stats_n = 0
 
+    def on_validation_start(self) -> None:
+        """Mark the end of this epoch's training steps (skipped outside an epoch: sanity batch, init validation)."""
+        if self._epoch_t0 is None:
+            return
+        self._sync_device()
+        self._val_t0 = time.perf_counter()
+
+    def train_forwards_per_sample(self) -> int:
+        """Forward-equivalents per training sample of this epoch's steps (after its first step).
+
+        A trained step (forward + backward) counts _TRAIN_FLOPS_PER_FORWARD, a no-grad skip step
+        (pushforward warmup) 1; one-jump training is one trained step.
+        """
+        k, skip = (self._epoch_k_train, self.ar_skip_steps) if self.autoregressive_training else (1, 0)
+        return skip + _TRAIN_FLOPS_PER_FORWARD * (k - skip)
+
+    def _log_epoch_perf(self) -> float:
+        """Log epoch_time_sec and the perf_* metrics (module docstring); return epoch_time_sec."""
+        self._sync_device()
+        t_end = time.perf_counter()
+        epoch_s = t_end - self._epoch_t0
+        self.log("epoch_time_sec", epoch_s, on_step=False, on_epoch=True)
+        train_s = epoch_s
+        if self._val_t0 is not None:
+            self.log("perf_val_time_s", t_end - self._val_t0, on_step=False, on_epoch=True)
+            train_s = self._val_t0 - self._epoch_t0
+        steps = self._train_loss_n
+        if steps > 0 and train_s > 0.0:
+            samples = steps * int(self.hparams["training"]["batch_size"])
+            flops = samples * self.train_forwards_per_sample() * self.fwd_flops_per_sample_step
+            self.log("perf_train_step_ms", _MS_PER_S * train_s / steps, on_step=False, on_epoch=True)
+            self.log("perf_train_samples_per_s", samples / train_s, on_step=False, on_epoch=True)
+            self.log("perf_train_tflops", flops / train_s / _FLOPS_PER_TFLOP, on_step=False, on_epoch=True)
+        if self.device.type == "cuda":
+            peak_gb = torch.cuda.max_memory_allocated(self.device) / _BYTES_PER_GB
+            self.log("perf_peak_mem_gb", peak_gb, on_step=False, on_epoch=True)
+        return epoch_s
+
+    def _log_epoch_line(self, *, k_train: int, train_loss: float, epoch_s: float) -> None:
+        """One INFO line per epoch in the job log (one .item() per metric, once per epoch)."""
+        nan = float("nan")
+        cm = self.trainer.callback_metrics
+
+        def metric(name: str) -> float:
+            v = cm.get(name)
+            return float(v) if v is not None else nan
+
+        fields = (
+            ("lr_start", self._epoch_lr_start if self._epoch_lr_start is not None else nan),
+            ("lr_now", self._current_lr()),
+            ("train_loss", train_loss),
+            ("val_loss", metric("val_loss")),
+            ("val_loss_log10_mae", metric("val_loss_log10_mae")),
+            ("val_loss_z_mse", metric("val_loss_z_mse")),
+            ("epoch_time_sec", epoch_s),
+        )
+        log.info(
+            "epoch %d: K_train=%d " + " ".join(f"{name}={_EPOCH_LOG_FLOAT_FMT}" for name, _ in fields),
+            int(self.current_epoch), k_train, *(v for _, v in fields),
+        )
+
     def on_train_epoch_end(self) -> None:
-        if self._epoch_t0 is not None:
-            self.log("epoch_time_sec", float(time.time() - self._epoch_t0), on_step=False, on_epoch=True)
+        epoch_s = self._log_epoch_perf() if self._epoch_t0 is not None else float("nan")
+        k_train = self._epoch_k_train if self._epoch_k_train is not None else self.rollout_steps
         if self._epoch_k_train is not None:
             self.log("train_rollout_steps", float(self._epoch_k_train), on_step=False, on_epoch=True)
             self._epoch_k_train = None
+        train_loss = float("nan")
         if self._train_loss_n > 0:
             # Device-tensor divisor: tensor / Python number would take CUDA's multiply-by-reciprocal
             # path and could differ from Lightning's epoch mean by 1 ulp.
@@ -571,6 +681,7 @@ class FlowMapRolloutModule(pl.LightningModule):
             self.log("train_loss", m[0], on_step=False, on_epoch=True, prog_bar=True)
             self.log("train_loss_log10_mae", m[1], on_step=False, on_epoch=True)
             self.log("train_loss_z_mse", m[2], on_step=False, on_epoch=True)
+            train_loss = float(m[0])
             self._train_loss_sum, self._train_loss_n = None, 0
         if self._grad_stats_n > 0:
             g = self._grad_stats_sum / self._grad_stats_sum.new_full((), float(self._grad_stats_n))
@@ -578,6 +689,10 @@ class FlowMapRolloutModule(pl.LightningModule):
             if self._grad_clip_val is not None:
                 self.log("grad_clip_frac", g[1], on_step=False, on_epoch=True)
             self._grad_stats_sum, self._grad_stats_n = None, 0
+        if self.trainer.is_global_zero:
+            self._log_epoch_line(k_train=k_train, train_loss=train_loss, epoch_s=epoch_s)
+        self._epoch_t0 = None
+        self._val_t0 = None
 
     # ------------------------
     # Forward utilities

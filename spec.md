@@ -106,7 +106,7 @@ Audience: Professional collaborators and maintainers
 ## 4.4 Diagnostic and Testing Scripts
 1. `testing/` holds diagnostic and deployment utilities; they are not release gates.
 2. `testing/export.py` and `testing/aoti_export.py` produce/validate deployment artifacts and follow the strict no-fallback contract.
-3. The plotting/inspection diagnostics (`testing/predictions.py`, `testing/bench_speedup.py`, `testing/training_logs.py`) may use explicit best-effort behavior for portability and local usability.
+3. The plotting/inspection diagnostics (`testing/predictions.py`, `testing/bench_speedup.py`, `testing/training_logs.py`, `testing/efficiency_summary.py`, `testing/profile_training.py`) may use explicit best-effort behavior for portability and local usability.
 4. `testing/run_local_smoke.sh` exercises the full preprocess -> stage-1 -> stage-2 pipeline on synthetic data.
 
 ## 5. Data and Schema Contracts

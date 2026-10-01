@@ -69,6 +69,11 @@ _LR_PREFIX = "lr"
 PREFERRED_METRIC_ORDER: tuple[str, ...] = (
     "step",
     "epoch_time_sec",
+    "perf_train_step_ms",
+    "perf_train_samples_per_s",
+    "perf_train_tflops",
+    "perf_val_time_s",
+    "perf_peak_mem_gb",
     "lr",
     "grad_norm",
     "train_loss",
