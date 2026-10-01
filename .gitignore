@@ -32,3 +32,7 @@ smoke_scratch/
 
 # Per-user Claude Code settings
 .claude/settings.local.json
+
+# Author-local files (not tracked)
+/CLAUDE.md
+/todo.md
