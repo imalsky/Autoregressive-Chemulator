@@ -126,8 +126,8 @@ EXAMPLE_INPUT_SEED = 0
 EXPORT_VERIFY_SEED = 1
 # Export-vs-eager tolerance of the gate (relative, atol 0): CPU is bitwise today. The output is an
 # increment, often near 0, where a relative tolerance with atol 0 leaves almost no absolute headroom
-# (none at an exact 0), so the gate passes on CUDA only if CUDA is bitwise or nearly so; unchecked
-# until the first CUDA export.
+# (none at an exact 0), so the gate passes on CUDA only if CUDA is bitwise or nearly so (it passed on
+# the smoke data's CUDA export).
 EXPORT_PARITY_RTOL = 1e-6
 # Out-of-range rule (see the module docstring): allowed excursion outside the train-split range, as
 # a fraction of each input's normalized range. It absorbs the float32 round trip at the exact edges
