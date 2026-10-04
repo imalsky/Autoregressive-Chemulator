@@ -41,7 +41,7 @@ ActivationFactory = Callable[[], nn.Module]
 # 2048 (unit-RMS LayerNorm output) and ~0.027 for the non-residual fallback (post-SiLU RMS ~0.6;
 # audit measurement). A width change therefore rescales the initial step as sqrt(width).
 _DELTA_OUT_INIT_STD = 1e-3
-# Fixed global set, in this order (spec.md section 5, items 4-6). src/main.py and testing/export.py
+# Fixed global set, in this order. src/main.py and testing/export.py
 # import it from here; the standalone processing/preprocessing.py and testing/predictions.py keep a copy.
 _REQUIRED_GLOBALS = ("P", "T")
 
@@ -219,7 +219,7 @@ def build_fourier_dt(fourier_cfg: Any) -> Optional[FourierDtFeatures]:
 def get_activation(name: str) -> ActivationFactory:
     """Return an activation factory by name."""
     key = str(name).lower().strip()
-    # SiLU only: the production trunk and both documented fallbacks use it (docs/DECISIONS.md).
+    # SiLU only: every shipped configuration uses it.
     factories: Dict[str, ActivationFactory] = {
         "silu": nn.SiLU,
     }

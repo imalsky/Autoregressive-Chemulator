@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end smoke of the PRODUCTION configs on synthetic data: the integration gate (spec 4.4.4).
+# End-to-end smoke of the PRODUCTION configs on synthetic data: the integration gate.
 # Every step asserts its outcome; a failed assertion stops the smoke with "SMOKE CHECK FAILED".
 #   1. synthetic raw (the real time grid; one drop_below group, one all-NaN group) -> preprocessing,
 #      which must count both rejects

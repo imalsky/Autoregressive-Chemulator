@@ -131,7 +131,7 @@ def _configure_logging(level: str) -> None:
 log = logging.getLogger(__name__)
 
 
-# Fixed global set, in this order (spec.md section 5, items 4-6). This standalone script
+# Fixed global set, in this order. This standalone script
 # imports nothing from src/, so it keeps its own copy of src/model.py:_REQUIRED_GLOBALS.
 _REQUIRED_GLOBALS: Tuple[str, str] = ("P", "T")
 # Physical units of the raw inputs, written to normalization.json. The raw files carry no unit
@@ -182,7 +182,7 @@ _SPECIES_SUM_HIST_BINS = 10_000
 _SPECIES_SUM_QUANTILE_LEVELS: Tuple[float, ...] = (0.001, 0.01, 0.05, 0.5)
 # Best-effort git provenance in the summary: a git call slower than this is recorded as null.
 _GIT_TIMEOUT_S = 10.0
-# Frozen raw tails (frozen_tail_cut; docs/DECISIONS.md open item 17): a repeated-state tail is cut when
+# Frozen raw tails (frozen_tail_cut): a repeated-state tail is cut when
 # the step into it still moves a species by more than this (dex). Species >= 1e-12 never exceed
 # 7.2e-4 dex there on the 4 raw files; recheck on new data.
 _FROZEN_TAIL_MAX_PRECHANGE_DEX = 1e-3

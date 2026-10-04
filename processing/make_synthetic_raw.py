@@ -34,7 +34,7 @@ SPECIES = [
     "N2_evolution", "NH3_evolution", "OH_evolution", "O_evolution",
 ]
 
-# Generation settings (no argparse; module-level constants per spec 9.3.4): the time grid, the
+# Generation settings (no argparse; module-level constants): the time grid, the
 # per-trajectory distributions and the run settings below. Smoke use only: not traced to the real
 # data except where noted. The output directory is the one run-varying input and comes from a required
 # environment variable (mirrors the AUTOCHEM_CONFIG_PATH fail-fast convention).

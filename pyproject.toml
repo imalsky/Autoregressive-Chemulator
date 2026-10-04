@@ -30,7 +30,7 @@ dev = [
 py-modules = []
 packages = []
 
-# The rule set behind "ruff clean" (spec 9.2), pinned so the result does not depend on the ruff
+# The rule set behind "ruff clean", pinned so the result does not depend on the ruff
 # version's defaults or on a config file outside the repo (ruff 0.16.9 from requirements.lock).
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F"]

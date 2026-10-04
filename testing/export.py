@@ -53,7 +53,7 @@ Behavior:
 
 Notes:
 - For correctness, export uses strict=True by default.
-- Exports are float32 only (a bf16 export was never numerically validated; docs/DECISIONS.md).
+- Exports are float32 only (a bf16 export was never numerically validated).
 - Each .pt2 is pinned to its export device: torch.export bakes device=<export device> into
   the input asserts, so .to(device) on ep.module() is not enough. On GPU, load
   export_cuda_dynB_1step_phys.pt2.
@@ -106,7 +106,7 @@ EXAMPLE_BATCH = 4
 MIN_EXAMPLE_BATCH = 2
 B_MIN = 1
 # Largest exported batch. Inherited with no recorded rationale and kept pending the host envelope
-# (Canoe's per-rank cell count is unknown; docs/DECISIONS.md). The .pt2 raises above it (torch.export
+# (Canoe's per-rank cell count is unknown). The .pt2 raises above it (torch.export
 # input constraints, checked by the export gate); the AOTI package does not check B (its host guard
 # does; testing/aoti_export.py). Dim("B", min=1) without a max was verified bit-identical to eager.
 B_MAX = 16384
@@ -840,7 +840,7 @@ def _resolve_processed_dir(cfg: Mapping[str, Any], *, cfg_path: Path) -> Path:
     """
     Locate processed_dir containing normalization.json.
 
-    Strict no-fallback contract (spec 4.4.2): the sole candidate is either
+    Strict no-fallback contract: the sole candidate is either
     PROCESSED_DIR_OVERRIDE (when set; for relocated datasets) or
     cfg.paths.processed_dir resolved against the config directory. The candidate
     must contain normalization.json or this hard-fails.

@@ -107,7 +107,7 @@ _LEGEND_CORNERS = ("upper right", "upper left", "lower right", "lower left")
 # Points sampled along each drawn segment when scoring a legend corner.
 _SEGMENT_SAMPLES = 20
 
-# Fixed global set, in this order (spec.md section 5, items 4-6). This standalone script
+# Fixed global set, in this order. This standalone script
 # imports nothing from src/, so it keeps its own copy of src/model.py:_REQUIRED_GLOBALS.
 REQUIRED_GLOBALS: Tuple[str, str] = ("P", "T")
 
