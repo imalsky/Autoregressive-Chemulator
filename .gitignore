@@ -40,3 +40,44 @@ smoke_scratch/
 # Paper notes, kept outside the repository
 /notes.md
 /Notes_Data/
+
+
+# Data and array dumps anywhere in the tree (data/ is already ignored above)
+*.h5
+*.hdf5
+*.npz
+*.npy
+*.csv
+*.parquet
+*.pkl
+*.joblib
+*.onnx
+*.safetensors
+*.zip
+*.tar
+*.tar.gz
+
+# Run outputs and renamed run folders
+models_old/
+runs/
+wandb/
+lightning_logs/
+*.log
+nohup.out
+
+# Environments and tool caches (do not rely on the tools' own self-ignore files)
+.venv/
+venv/
+.env
+.ruff_cache/
+
+# Editor swap and backup files
+*.swp
+*.swo
+*~
+
+# Author-local notes and assistant files, at any depth
+CLAUDE.md
+CLAUDE.local.md
+todo.md
+.claude/
