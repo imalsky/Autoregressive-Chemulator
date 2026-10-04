@@ -4,8 +4,10 @@
 Preprocess raw HDF5 trajectories, saved on a fixed log-spaced output grid (current files: t=0,
 then 1e-3..1e8 s, 100 points), into fixed-length uniform-dt windows, shard to NPZ, compute
 normalization, and write final normalized shards. The raw dt is non-uniform, so every window is
-resampled (log-log interpolation); each group's own time vector is used, so a file on another grid
-works too (its grid is recorded per file in preprocessing_summary.json).
+resampled (log-log interpolation) on each group's own time vector (preprocessing_summary.json
+records, per file, the grid of its first group with a finite time vector). The raw-trajectory store
+holds one time grid, so every kept train group must share it to _RAW_GRID_RTOL; a build whose kept
+train groups are on different grids is refused.
 
 Outputs (under paths.processed_dir):
   normalization.json          normalization manifest read by training and export: methods and
@@ -18,9 +20,17 @@ Outputs (under paths.processed_dir):
   train/shard_*.npz
   validation/shard_*.npz
   test/shard_*.npz
+  raw_trajectories/train.npz  every kept train-split group on its full raw grid, for sampling states
+                              at arbitrary times; load with allow_pickle=False:
+                                logy    [N, T, S] float64  log10 of the raw species, floored at epsilon
+                                end     [N]       int16    last valid raw row (frozen-tail cut, else T-1)
+                                globals [N, G]    float32  normalized exactly as the shards' globals
+                                name    [N]       unicode  group name (unique)
+  raw_trajectories/t_grid.npy the raw time grid [T] float64 (s) that every row is on
 
 Temporary stage (under paths.processed_dir):
   _tmp_physical/<split>/shard_*_physical.npz   (each deleted once its final shard is written)
+  _tmp_physical/raw_trajectories/part_f*.npz   (one per file; deleted once train.npz is written)
   _tmp_final/                                  (the new dataset, built before anything is replaced)
   _tmp_old/                                    (the previous dataset while it is being swapped out)
   All three are removed on success. A failed run leaves them in place; the next run wipes
@@ -187,6 +197,11 @@ _GIT_TIMEOUT_S = 10.0
 # 7.2e-4 dex there on the 4 raw files; recheck on new data.
 _FROZEN_TAIL_MAX_PRECHANGE_DEX = 1e-3
 _SPLITS: Tuple[str, str, str] = ("train", "validation", "test")
+# The raw-trajectory store: its directory under processed_dir (and of its per-file parts under
+# _tmp_physical). It holds one time grid, so every kept train group's raw time vector must match it
+# to this relative tolerance; the 4 raw files' grids differ from the first file's by at most 2.2e-16.
+_RAW_DIR = "raw_trajectories"
+_RAW_GRID_RTOL = 1e-12
 # The manifest keys that define the z-space; their canonical-JSON sha256 is the normalization
 # fingerprint (norm_sha256). Same definition as src/utils.py (this script imports nothing from
 # src/); src/main.py checks that the summary's copy equals the one it computes from the manifest.
@@ -618,8 +633,8 @@ def clean_dir(path: Path, *, overwrite: bool) -> None:
 
 
 def refuse_existing_outputs(processed_dir: Path) -> None:
-    """Raise if processed_dir already holds a split dir or the manifest/summary (overwrite=false)."""
-    for name in ("train", "validation", "test", "normalization.json", "preprocessing_summary.json"):
+    """Raise if processed_dir already holds a split dir, the raw store or the manifest/summary (overwrite=false)."""
+    for name in ("train", "validation", "test", _RAW_DIR, "normalization.json", "preprocessing_summary.json"):
         p = processed_dir / name
         if p.exists():
             raise RuntimeError(f"Refusing to overwrite existing output (preprocessing.overwrite=false): {p}")
@@ -1035,17 +1050,25 @@ def sample_file(
     ``cfg.seed`` and the file name, only reservoir-samples and shuffles the group pool; one per
     trajectory, seeded from ``cfg.seed`` and the group name, draws that trajectory's windows (dt and
     start time), so a window does not depend on the file's position in the list or on which other
-    groups were kept. ``file_idx`` only namespaces this file's shard names.
+    groups were kept. ``file_idx`` only namespaces this file's shard and raw-part names (the parts are
+    merged into raw_trajectories/train.npz in file_idx order).
 
     A kept group whose raw tail froze in mid-evolution (frozen_tail_cut) is sampled only up to the
     cut; if none of its draws fits there it is rejected as frozen_tail_no_window instead of kept.
 
+    Every kept train-split group goes to this file's raw-trajectory part,
+    ``out_tmp/raw_trajectories/part_f<file_idx>.npz`` (written only if the file keeps at least one
+    train group): its full raw grid as log10 of the species floored at epsilon (float64), its last
+    valid row (the cut, else the last row), its physical globals as in the shards and its name. The
+    part also holds the file's name and time grid, which every such group's raw time vector must
+    match (_RAW_GRID_RTOL).
+
     Returns ``(row, agg)``. ``row`` is this file's preprocessing_summary.json entry: name, size,
-    group counts (groups_seen = sum(group_rejects) + groups_kept), group- and chunk-level rejects,
-    windows written per split, ``frozen_tail`` (per split: groups cut, their draws that found no
-    placement, counted in no_fit_chunk too, and cut groups left with no window), ``truncated``
-    (the per-file output cap stopped sampling while candidate draws remained), shards per split
-    and the raw time grid of the first group with a finite time vector. ``agg`` holds the counters
+    group counts (groups_seen = sum(group_rejects) + groups_kept; groups_kept_by_split), group- and
+    chunk-level rejects, windows written per split, ``frozen_tail`` (per split: groups cut, their
+    draws that found no placement, counted in no_fit_chunk too, and cut groups left with no window),
+    ``truncated`` (the per-file output cap stopped sampling while candidate draws remained), shards
+    per split and the raw time grid of the first group with a finite time vector. ``agg`` holds the counters
     the parent sums over files: the (T, log10 P) coverage cells, drop_below trigger counts, window
     start-time / dt histograms, anchored windows, per-split window start-time range, and the 64-bit
     digests of every group name in the file (the cross-file duplicate check).
@@ -1069,7 +1092,14 @@ def sample_file(
     windows_by_split = {sp: 0 for sp in _SPLITS}
     groups_seen = 0
     groups_kept = 0
+    groups_kept_by_split = {sp: 0 for sp in _SPLITS}
     raw_time_grid: Optional[Dict[str, Any]] = None
+    # This file's raw-trajectory part: the kept train groups and their shared time grid.
+    raw_logy: List[np.ndarray] = []
+    raw_end: List[int] = []
+    raw_g: List[np.ndarray] = []
+    raw_name: List[str] = []
+    raw_t: Optional[np.ndarray] = None
 
     coverage: Dict[Tuple[int, int], Dict[str, Any]] = {}
     drop_triggers = {sp: 0 for sp in cfg.species_variables}
@@ -1295,6 +1325,20 @@ def sample_file(
                     cell["frozen_tail_no_window"] += 1
                     continue
             groups_kept += 1
+            groups_kept_by_split[split] += 1
+            if split == "train":
+                if raw_t is None:
+                    raw_t = t_raw
+                elif t_raw.shape != raw_t.shape or not np.allclose(t_raw, raw_t, rtol=_RAW_GRID_RTOL, atol=0.0):
+                    raise RuntimeError(
+                        f"trajectory '{traj_name}' in {file_path.name}: its raw time grid differs from the "
+                        f"file's first kept train group's (rtol {_RAW_GRID_RTOL}); {_RAW_DIR}/train.npz holds one "
+                        "time grid for every row"
+                    )
+                raw_logy.append(np.log10(np.maximum(y_raw, cfg.epsilon)))
+                raw_end.append(T - 1 if cut is None else cut)
+                raw_g.append(g_vec32)
+                raw_name.append(str(traj_name))
 
         for sp in _SPLITS:
             shard_idx[sp], _ = flush_shard(
@@ -1307,6 +1351,18 @@ def sample_file(
                 suffix="_physical",
                 name_prefix=name_prefix,
             )
+
+    if raw_name:
+        (out_tmp / _RAW_DIR).mkdir(parents=True, exist_ok=True)
+        np.savez(
+            out_tmp / _RAW_DIR / f"part_f{int(file_idx):04d}.npz",
+            logy=np.stack(raw_logy),
+            end=np.array(raw_end, dtype=np.int16),
+            globals=np.stack(raw_g),
+            name=np.array(raw_name),
+            t_grid=raw_t,
+            raw_file=np.array(file_path.name),
+        )
 
     log.info(
         "file=%s groups seen=%d kept=%d group_rejects=%s chunk_rejects=%s frozen_tail=%s windows=%d "
@@ -1332,6 +1388,7 @@ def sample_file(
         "n_pooled": len(pool),
         "groups_seen": groups_seen,
         "groups_kept": groups_kept,
+        "groups_kept_by_split": groups_kept_by_split,
         "group_rejects": group_rejects,
         "chunk_rejects": chunk_rejects,
         "frozen_tail": frozen_tail,
@@ -1537,9 +1594,11 @@ def normalize_and_write(
     per_key_stats: Dict,
     methods: Dict[str, str],
     counts_total: Dict[str, int],
+    train_groups_kept: int,
     descriptive: Mapping[str, Any],
 ) -> str:
-    """Normalize every physical shard to z-space and write the final shards + normalization.json.
+    """Normalize every physical shard to z-space and write the final shards, the raw-trajectory store
+    and normalization.json.
 
     Returns the manifest's normalization fingerprint (norm_sha256).
 
@@ -1547,10 +1606,13 @@ def normalize_and_write(
     (window_start_time_s, coverage, species_sum, std_floored); units come from UNITS.
 
     Species use log-standard normalization; globals use their per-key method; dt is log10 +
-    min-max clipped to [0, 1]. Each physical shard is deleted once its final shard is written,
-    so the peak disk is about one dataset plus one shard. The rows written per split must equal
-    the sampling totals (counts_total) before the normalization manifest consumed by
-    training/inference is written.
+    min-max clipped to [0, 1]. Before the shard pass, the raw-trajectory parts must hold the kept
+    train groups (train_groups_kept) on one time grid; after it, they are merged in file order into
+    raw_trajectories/train.npz (globals normalized by the shards' transform) and t_grid.npy. Each
+    physical shard is deleted once its final shard is written and the parts once train.npz is
+    written, so the peak disk is about one dataset (store included) plus the parts, about one more
+    store. The rows written per split must equal the sampling totals (counts_total) before the
+    normalization manifest consumed by training/inference is written.
     """
     eps = float(cfg.epsilon)
     S = len(cfg.species_variables)
@@ -1608,12 +1670,69 @@ def normalize_and_write(
 
         raise ValueError(f"Unsupported global normalization method '{m}' for '{name}'")
 
+    def normalize_globals(g2: np.ndarray) -> np.ndarray:
+        """[N, G] float64 physical globals -> [N, G] float32 normalized (each global by its method)."""
+        g_out = g2
+
+        # standard
+        std_mask = g_methods == "standard"
+        if np.any(std_mask):
+            g_out = np.where(std_mask.reshape(1, G), (g2 - g_mean.reshape(1, G)) / g_std.reshape(1, G), g_out)
+
+        # min-max
+        mm_mask = g_methods == "min-max"
+        if np.any(mm_mask):
+            g_out = np.where(mm_mask.reshape(1, G), (g2 - g_min.reshape(1, G)) / g_rng.reshape(1, G), g_out)
+
+        # log-min-max
+        lmm_mask = g_methods == "log-min-max"
+        if np.any(lmm_mask):
+            g_out = np.where(
+                lmm_mask.reshape(1, G),
+                (np.log10(np.maximum(g2, eps)) - glog_min.reshape(1, G)) / glog_rng.reshape(1, G),
+                g_out,
+            )
+
+        # log-standard
+        ls_mask = g_methods == "log-standard"
+        if np.any(ls_mask):
+            g_out = np.where(
+                ls_mask.reshape(1, G),
+                (np.log10(np.maximum(g2, eps)) - glog_mean.reshape(1, G)) / glog_std.reshape(1, G),
+                g_out,
+            )
+
+        return g_out.astype(np.float32, copy=False)
+
     # dt normalization: log10 + min-max to [0,1]
     dt_log_min = float(np.log10(cfg.dt_min))
     dt_log_max = float(np.log10(cfg.dt_max))
     dt_log_rng = dt_log_max - dt_log_min
     if dt_log_rng <= 0.0:
         raise ValueError("Invalid dt normalization range: dt_max must be greater than dt_min")
+
+    # Raw-trajectory parts, checked before the shard pass: a stray or missing part, or one on another
+    # time grid, must not be published.
+    parts = sorted((out_tmp / _RAW_DIR).glob("part_f*.npz"))
+    if not parts:
+        raise RuntimeError(f"No raw-trajectory parts found to write {_RAW_DIR}/train.npz")
+    with np.load(parts[0], allow_pickle=False) as z:
+        t_grid, first_file = z["t_grid"], str(z["raw_file"])
+    part_rows = []
+    for p in parts:
+        with np.load(p, allow_pickle=False) as z:
+            part_t = z["t_grid"]
+            if part_t.shape != t_grid.shape or not np.allclose(part_t, t_grid, rtol=_RAW_GRID_RTOL, atol=0.0):
+                raise RuntimeError(
+                    f"{z['raw_file']}: its kept train groups' raw time grid differs from {first_file}'s "
+                    f"(rtol {_RAW_GRID_RTOL}); {_RAW_DIR}/train.npz holds one time grid for every row"
+                )
+            part_rows.append(int(z["end"].shape[0]))
+    if sum(part_rows) != train_groups_kept:
+        raise RuntimeError(
+            f"raw-trajectory parts hold {sum(part_rows)} groups, but {train_groups_kept} train groups were "
+            "kept; not writing normalization.json"
+        )
 
     rows_written = {"train": 0, "validation": 0, "test": 0}
     for split in ("train", "validation", "test"):
@@ -1625,38 +1744,7 @@ def normalize_and_write(
                 dt = np.asarray(z["dt_mat"], dtype=np.float64)
 
             y_z = ((np.log10(np.maximum(y, eps)) - mu_s) / sd_s).astype(np.float32)
-
-            g_out = g2
-
-            # standard
-            std_mask = g_methods == "standard"
-            if np.any(std_mask):
-                g_out = np.where(std_mask.reshape(1, G), (g2 - g_mean.reshape(1, G)) / g_std.reshape(1, G), g_out)
-
-            # min-max
-            mm_mask = g_methods == "min-max"
-            if np.any(mm_mask):
-                g_out = np.where(mm_mask.reshape(1, G), (g2 - g_min.reshape(1, G)) / g_rng.reshape(1, G), g_out)
-
-            # log-min-max
-            lmm_mask = g_methods == "log-min-max"
-            if np.any(lmm_mask):
-                g_out = np.where(
-                    lmm_mask.reshape(1, G),
-                    (np.log10(np.maximum(g2, eps)) - glog_min.reshape(1, G)) / glog_rng.reshape(1, G),
-                    g_out,
-                )
-
-            # log-standard
-            ls_mask = g_methods == "log-standard"
-            if np.any(ls_mask):
-                g_out = np.where(
-                    ls_mask.reshape(1, G),
-                    (np.log10(np.maximum(g2, eps)) - glog_mean.reshape(1, G)) / glog_std.reshape(1, G),
-                    g_out,
-                )
-
-            g_z = g_out.astype(np.float32, copy=False)
+            g_z = normalize_globals(g2)
 
             dt_norm = (np.log10(np.maximum(dt, eps)) - dt_log_min) / dt_log_rng
             dt_norm = np.clip(dt_norm, 0.0, 1.0).astype(np.float32)
@@ -1672,6 +1760,31 @@ def normalize_and_write(
             f"normalized row counts {rows_written} differ from the sampled counts {counts_total}; "
             "not writing normalization.json"
         )
+
+    # Raw-trajectory store: the checked parts are copied into one preallocated array, so the peak
+    # memory is the store plus one part.
+    logy = np.empty((train_groups_kept, t_grid.shape[0], S), dtype=np.float64)
+    ends, gs, names = [], [], []
+    start = 0
+    for p, n in zip(parts, part_rows):
+        with np.load(p, allow_pickle=False) as z:
+            logy[start:start + n] = z["logy"]
+            ends.append(z["end"])
+            gs.append(z["globals"])
+            names.append(z["name"])
+        start += n
+    (out_final / _RAW_DIR).mkdir(parents=True, exist_ok=True)
+    np.savez(
+        out_final / _RAW_DIR / "train.npz",
+        logy=logy,
+        end=np.concatenate(ends),
+        globals=normalize_globals(np.concatenate(gs).astype(np.float64)),
+        name=np.concatenate(names),
+    )
+    np.save(out_final / _RAW_DIR / "t_grid.npy", t_grid, allow_pickle=False)
+    # After the write, so a failed write keeps its source parts.
+    for p in parts:
+        p.unlink()
 
     manifest = {
         "normalization_methods": methods,
@@ -1746,11 +1859,13 @@ def write_summary(
 
     norm_sha256 is the normalization fingerprint of the normalization.json written with it.
 
-    Keys: windows_written_by_split, groups_seen / groups_kept, group_rejects (whole source groups:
-    non_finite, non_positive_global, too_few_valid, drop_below, frozen_tail_no_window) and
-    chunk_rejects (window attempts: no_fit_chunk, interp_non_finite), files_truncated; frozen_tail
-    (the frozen_tail_cut threshold and rule, and per split the groups cut, their draws that found
-    no placement and the cut groups left with no window; src/main.py refuses a build without it);
+    Keys: windows_written_by_split, groups_seen / groups_kept / groups_kept_by_split, raw_trajectories
+    (groups per split in the raw-trajectory store: train only, equal to its groups_kept_by_split),
+    group_rejects (whole source groups: non_finite, non_positive_global, too_few_valid, drop_below,
+    frozen_tail_no_window) and chunk_rejects (window attempts: no_fit_chunk, interp_non_finite),
+    files_truncated; frozen_tail (the frozen_tail_cut threshold and rule, and per split the groups
+    cut, their draws that found no placement and the cut groups left with no window; src/main.py
+    refuses a build without it);
     raw_files (one row per file, by file_idx); split (seed, fractions, key definition, raw
     basenames); coverage ((T, log10 P) cells: groups that reached the drop_below test, drop_below
     and frozen_tail_no_window rejects, too_few_valid, windows per split; plus drop_below trigger
@@ -1773,6 +1888,8 @@ def write_summary(
         "windows_written_by_split": totals["windows_written_by_split"],
         "groups_seen": totals["groups_seen"],
         "groups_kept": totals["groups_kept"],
+        "groups_kept_by_split": totals["groups_kept_by_split"],
+        "raw_trajectories": {"train": totals["groups_kept_by_split"]["train"]},
         "group_rejects": totals["group_rejects"],
         "chunk_rejects": totals["chunk_rejects"],
         "files_truncated": sum(1 for r in rows if r["truncated"]),
@@ -1830,11 +1947,11 @@ def swap_in_outputs(stage: Path, processed_dir: Path, trash: Path) -> None:
     moved in last (after the summary): an interruption inside this function leaves no marker and
     the next launcher run rebuilds. Entries preprocessing does not own are never touched.
     """
-    owned = ("normalization.json", "preprocessing_summary.json", "train", "validation", "test")
+    owned = ("normalization.json", "preprocessing_summary.json", "train", "validation", "test", _RAW_DIR)
     for name in owned:
         if (processed_dir / name).exists():
             os.replace(processed_dir / name, trash / name)
-    for name in ("train", "validation", "test", "preprocessing_summary.json", "normalization.json"):
+    for name in ("train", "validation", "test", _RAW_DIR, "preprocessing_summary.json", "normalization.json"):
         os.replace(stage / name, processed_dir / name)
     stage.rmdir()
     shutil.rmtree(trash)
@@ -1961,6 +2078,7 @@ def _merge_totals(rows: List[Dict[str, Any]], aggs: List[Dict[str, Any]]) -> Dic
         "windows_written_by_split": {sp: sum(r["windows_written_by_split"][sp] for r in rows) for sp in _SPLITS},
         "groups_seen": sum(r["groups_seen"] for r in rows),
         "groups_kept": sum(r["groups_kept"] for r in rows),
+        "groups_kept_by_split": {sp: sum(r["groups_kept_by_split"][sp] for r in rows) for sp in _SPLITS},
         "group_rejects": {},
         "chunk_rejects": {},
         "frozen_tail": {
@@ -2155,6 +2273,7 @@ def _build_dataset(
         per_key_stats=per_key_stats,
         methods=methods,
         counts_total=counts_total,
+        train_groups_kept=totals["groups_kept_by_split"]["train"],
         descriptive=descriptive,
     )
     write_summary(

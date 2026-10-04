@@ -2,7 +2,8 @@
 # End-to-end smoke of the PRODUCTION configs on synthetic data: the integration gate.
 # Every step asserts its outcome; a failed assertion stops the smoke with "SMOKE CHECK FAILED".
 #   1. synthetic raw (the real time grid; one drop_below group, one all-NaN group) -> preprocessing,
-#      which must count both rejects
+#      which must count both rejects and write the train split's raw-trajectory store (one row per
+#      kept train group, loadable without pickle)
 #   2. stage 1 with the production compile settings, 2 epochs
 #   3. a deliberate extension: delete COMPLETED, resume in place with one more epoch (epoch, step and
 #      metrics.csv continue; last.ckpt holds the final epoch although no top-k checkpoint saved it)
@@ -90,6 +91,35 @@ def rejects(summary):
     if counts["drop_below"] < 1 or counts["non_finite"] < 1:
         fail(f"preprocessing group_rejects {counts}: expected >= 1 drop_below and >= 1 non_finite")
     print(f"OK preprocessing group_rejects {counts}")
+
+
+def raw_store(processed):
+    import numpy as np
+    processed = Path(processed)
+    summary = json.loads((processed / "preprocessing_summary.json").read_text())
+    kept = summary["groups_kept_by_split"]["train"]
+    manifest = json.loads((processed / "normalization.json").read_text())
+    n_species, n_globals = len(manifest["species_variables"]), len(manifest["global_variables"])
+    t_grid = np.load(processed / "raw_trajectories" / "t_grid.npy", allow_pickle=False)
+    with np.load(processed / "raw_trajectories" / "train.npz", allow_pickle=False) as z:
+        logy, end, g, name = (z[k] for k in ("logy", "end", "globals", "name"))
+    n = logy.shape[0]
+    if n != kept:
+        fail(f"raw_trajectories/train.npz holds {n} groups, train groups_kept {kept}")
+    layout = (logy.dtype, end.dtype, g.dtype, name.dtype.kind, logy.shape[1:], end.shape, g.shape, name.shape)
+    if layout != (np.float64, np.int16, np.float32, "U", (t_grid.shape[0], n_species), (n,), (n, n_globals), (n,)):
+        fail(f"raw_trajectories/train.npz layout {layout} (t_grid {t_grid.shape}, {n_species} species, "
+             f"{n_globals} globals)")
+    if np.unique(name).size != n:
+        fail(f"raw_trajectories/train.npz: {n - np.unique(name).size} repeated group names")
+    # The valid rows (t > 0) up to end must hold at least two times (the log-time interpolant).
+    lo, hi = int(np.flatnonzero(t_grid > 0)[1]), t_grid.shape[0] - 1
+    if end.min() < lo or end.max() > hi:
+        fail(f"raw_trajectories/train.npz end rows {end.min()}..{end.max()} outside {lo}..{hi}")
+    if not (np.isfinite(logy).all() and np.isfinite(g).all()):
+        fail("raw_trajectories/train.npz: non-finite logy or globals")
+    print(f"OK raw_trajectories/train.npz: {n} groups = train groups_kept, {t_grid.shape[0]} times x {n_species} "
+          f"species, end rows {end.min()}..{end.max()}, unique names, finite")
 
 
 def trained(work, epochs, log, s2_limit):
@@ -285,6 +315,7 @@ for name, c in cfgs.items():
 EOF
 run preprocess "${SCRATCH}/smoke_stage1.json" processing/preprocessing.py
 check rejects "${SCRATCH}/processed/preprocessing_summary.json"
+check raw_store "${SCRATCH}/processed"
 
 echo "=== [2/8] stage 1 (production compile settings, 2 epochs) ==="
 train stage1
