@@ -209,7 +209,7 @@ def save_artifact(final_path: Path, write: Any, *, verify: Any) -> None:
 
 
 def _resolve_path_like(raw: str, *, base: Path) -> Path:
-    """Resolve a possibly-relative path string against `base` (absolute paths pass through)."""
+    """Resolve a possibly-relative path string against `base`; absolute paths are resolved too (symlinks followed)."""
     p = Path(raw).expanduser()
     if not p.is_absolute():
         return (base / p).resolve()

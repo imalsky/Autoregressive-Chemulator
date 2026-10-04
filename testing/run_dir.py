@@ -4,7 +4,8 @@
 Same rule as src/main.py: AUTOCHEM_CONFIG_PATH names the training config (required; there is no
 default run), and the run directory is that config's paths.work_dir, resolved against the config
 file's directory. export.py, aoti_export.py, predictions.py, eval_rollout_error.py,
-training_logs.py and bench_speedup.py all use it, so one config selects the run (stage 1 or 2).
+training_logs.py, bench_speedup.py and efficiency_summary.py all use it, so one config selects
+the run (stage 1 or 2).
 """
 
 from __future__ import annotations

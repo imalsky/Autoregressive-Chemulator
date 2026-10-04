@@ -479,7 +479,7 @@ def parse_precision_config(cfg: Mapping[str, Any]) -> PrecisionConfig:
     if amp_mode == "mixed":
         # Mixed precision keeps fp32 master weights and fp32 inputs; autocast lowers only the matmuls.
         # bf16 weights would lose the small AdamW updates, and bf16 inputs quantize the z-space state
-        # (bf16 storage perturbed states by a median 3.1e-3 dex in the audit, above the ~7e-4 target).
+        # (bf16 storage perturbed states by a median 3.1e-3 dex).
         if model_dtype != torch.float32:
             raise ValueError("precision.model_dtype must be float32 when amp_mode=mixed (fp32 master weights)")
         if input_dtype != torch.float32:

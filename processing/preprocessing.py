@@ -54,8 +54,9 @@ records the threshold and the per-split counts.
 Randomness: split membership is a hash of (SPLIT_SEED, file basename, group name), independent of
 preprocessing.seed. Window draws (dt, start time) use one generator per trajectory, seeded with
 [preprocessing.seed, a hash of the group name], so they do not depend on the file's position in
-the file list or on which other groups were kept. The per-file generator (seeded with the file
-name) only shuffles the group pool.
+the file list or on which other groups were kept. The per-file generator (seeded with
+[preprocessing.seed, a hash of the file name]) draws the group pool (a reservoir sample when
+pool_size is set) and shuffles it.
 
 This script is intentionally strict:
 - Configuration must use the canonical schema (the file named by AUTOCHEM_CONFIG_PATH).

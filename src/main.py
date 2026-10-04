@@ -15,16 +15,16 @@ This script:
    (processed_dir/normalization.json), builds the model and loads weights_only weights (capping
    the peak LR at the source checkpoint's LR), all before the run directory is created.
 4) Creates and flocks work_dir (one training process per run directory), then checks its
-   contents (fresh: empty; resume: the run it continues) and opens work_dir/train.log. A resume
-   from the final checkpoint of a run that died before publishing publishes best.ckpt and
-   COMPLETED from it and exits 0, without training.
+   contents (fresh: empty or only train.log; resume: the run it continues) and opens
+   work_dir/train.log. A resume from the final checkpoint of a run that died before publishing
+   publishes best.ckpt and COMPLETED from it and exits 0, without training.
 5) Builds datasets/dataloaders sized for the rollouts actually used (memory budget first).
 6) Runs Lightning training using explicit checkpoint behavior.
 
 Notes:
-- system.device ('cpu' or 'cuda') selects ONLY the dataset preload device (every split
-  is preloaded). Training runs on runtime.accelerator ('cuda' or 'cpu') with exactly one
-  device; on CUDA the launcher picks the GPU with CUDA_VISIBLE_DEVICES.
+- system.device ('cpu' or 'cuda') selects ONLY the dataset preload device (the train and
+  validation splits are preloaded). Training runs on runtime.accelerator ('cuda' or 'cpu')
+  with exactly one device; on CUDA the launcher picks the GPU with CUDA_VISIBLE_DEVICES.
 """
 
 from __future__ import annotations
