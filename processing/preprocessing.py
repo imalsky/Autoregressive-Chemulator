@@ -106,9 +106,9 @@ if __name__ == "__main__":
 
 # These imports must stay below the thread-cap loop: the BLAS/OpenMP backends
 # read the env vars above at import time.
-import h5py  # noqa: E402
-import numpy as np  # noqa: E402
-from tqdm import tqdm  # noqa: E402
+import h5py
+import numpy as np
+from tqdm import tqdm
 
 
 # -----------------------------------------------------------------------------
