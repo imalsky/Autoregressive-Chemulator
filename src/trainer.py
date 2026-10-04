@@ -299,15 +299,12 @@ def build_loss_buffers(
 
 
 def _try_torch_compile(fn: Any, *, cfg: Mapping[str, Any]) -> Any:
-    """Optionally wrap a callable with torch.compile (strict; required keys only).
+    """Wrap a callable with torch.compile (strict; required keys only; the caller checks `enabled`).
 
     torch.compile is lazy: compilation happens at the first call, so compile errors surface there
     (the Trainer's sanity-validation batch runs the compiled eval path before epoch 0).
     """
     tc = cfg["runtime"]["torch_compile"]
-    if not bool(tc["enabled"]):
-        return fn
-
     backend = str(tc["backend"])
     mode = str(tc["mode"])
     dynamic = bool(tc["dynamic"])
@@ -1151,14 +1148,10 @@ class FlowMapRolloutModule(pl.LightningModule):
         tcfg = dict(self.hparams["training"])
         opt_cfg = dict(tcfg["optimizer"])
 
-        name = str(opt_cfg["name"]).lower()
         lr = float(opt_cfg["lr"]) if self.handoff_peak_lr is None else float(self.handoff_peak_lr)
         weight_decay = float(opt_cfg["weight_decay"])
         exclude_nd = bool(opt_cfg["exclude_norm_and_bias_from_weight_decay"])
         param_groups = _build_optimizer_param_groups(self, weight_decay=weight_decay, exclude_norm_and_bias=exclude_nd)
-
-        if name != "adamw":
-            raise ValueError("Unsupported optimizer; only 'adamw' is allowed")
 
         betas = opt_cfg["betas"]
         b0, b1 = float(betas[0]), float(betas[1])
@@ -1166,8 +1159,6 @@ class FlowMapRolloutModule(pl.LightningModule):
 
         use_fused = bool(opt_cfg["fused"])
         use_foreach = bool(opt_cfg["foreach"])
-        if use_fused and use_foreach:
-            raise ValueError("optimizer config invalid: fused and foreach cannot both be true")
 
         # Weight decay is handled by param groups, so pass 0 here.
         opt_wd_default = 0.0
