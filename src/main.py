@@ -869,8 +869,8 @@ def _check_build_matches_config(
     frozen_tail = summary.get("frozen_tail")
     if not isinstance(frozen_tail, Mapping) or "max_prechange_dex" not in frozen_tail:
         raise ValueError(
-            f"{spath} records no frozen_tail (built before the frozen-tail truncation of 2026-10-01, "
-            "docs/DECISIONS.md open item 17): rebuild required"
+            f"{spath} records no frozen_tail (built before the frozen-tail truncation of 2026-10-01): "
+            "rebuild required"
         )
     if summary.get("norm_sha256") != manifest_sha256:
         raise ValueError(
