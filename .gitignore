@@ -36,3 +36,7 @@ smoke_scratch/
 # Author-local files (not tracked)
 /CLAUDE.md
 /todo.md
+
+# Paper notes, kept outside the repository
+/notes.md
+/Notes_Data/
