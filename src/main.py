@@ -225,9 +225,7 @@ _REQUIRED_CONFIG_KEYS: Tuple[str, ...] = (
     "model.dropout",
     "model.layer_norm",
     "model.layer_norm_eps",
-    "model.predict_delta",
     "model.mlp.hidden_dims",
-    "model.mlp.residual",
     "training.batch_size",
     "training.max_epochs",
     "training.checkpoint_mode",
@@ -271,12 +269,6 @@ _REQUIRED_CONFIG_KEYS: Tuple[str, ...] = (
 
 # Optional keys accepted by schema validation.
 _OPTIONAL_CONFIG_KEYS: Tuple[str, ...] = (
-    # Optional fixed random-Fourier embedding of the normalized dt scalar
-    # (Tancik et al. 2020). Absent or enabled=false -> plain scalar dt (legacy).
-    "model.fourier_dt.enabled",
-    "model.fourier_dt.num_freqs",
-    "model.fourier_dt.sigma",
-    "model.fourier_dt.seed",
     # Optional per-step discount gamma^(k-skip) on the autoregressive rollout loss.
     # Default 1.0 (uniform) preserves current behavior; only relevant when
     # autoregressive_training.enabled=true.
@@ -1581,7 +1573,7 @@ def main() -> None:
         prec.lightning_precision,
     )
 
-    model = create_model(dict(cfg))
+    model = create_model(dict(cfg), manifest)
     model = model.to(dtype=prec.model_dtype)
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

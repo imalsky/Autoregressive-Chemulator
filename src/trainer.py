@@ -508,7 +508,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         # dataset.train_batches_per_epoch by construction (dataset.py _PreloadedStochasticBatchStream).
         self._train_batches_per_epoch = int(cfg["dataset"]["train_batches_per_epoch"])
 
-        # Validate model interface once at init (FlowMapMLP provides forward_step).
+        # Validate model interface once at init (RelaxationHead provides forward_step and delta).
         if not hasattr(self.model, "forward_step"):
             raise RuntimeError("Model must implement forward_step(y_t, dt, g) -> y_{t+1}.")
 

@@ -131,24 +131,11 @@
     "val_samples": 2621440
   },
   "model": {
-    "type": "mlp",
+    "type": "relax",
     "activation": "silu",
     "dropout": 0.0,
     "layer_norm": true,
     "layer_norm_eps": 1e-05,
-    "predict_delta": true,
-    "fourier_dt": {
-      "enabled": false,
-      "num_freqs": 16,
-      "sigma": 1.0,
-      "seed": 0,
-      "_comment": [
-        "Disabled 2026-06-11 per F1/F2 (see docs/DECISIONS.md): on the residual trunk,",
-        "Fourier-dt was harmful at ~130k params, replicated across 2 seeds (a trunk interaction;",
-        "scale dependence untested).",
-        "Must match the stage-1 model block exactly for the weights_only handoff."
-      ]
-    },
     "mlp": {
       "hidden_dims": [
         2048,
@@ -161,8 +148,7 @@
         2048,
         2048,
         2048
-      ],
-      "residual": true
+      ]
     }
   },
   "training": {

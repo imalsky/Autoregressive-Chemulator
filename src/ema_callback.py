@@ -94,7 +94,7 @@ class EMACallback(pl.Callback):
             live = pl_module.state_dict(keep_vars=True)  # live Parameter/buffer objects
             groups, other, size = [], [], 0
             for k, ema_t in self.ema_sd.items():
-                # Only parameters are averaged. Buffers (loss statistics, Fourier frequencies, any
+                # Only parameters are averaged. Buffers (loss statistics, the relaxation box, any
                 # non-float entry) are copied: averaging a constant drifts it (d*x + (1-d)*x != x
                 # in floating point).
                 if not (isinstance(live[k], torch.nn.Parameter) and ema_t.dtype.is_floating_point):

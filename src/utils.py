@@ -151,7 +151,7 @@ def require_same_model_block(saved: Any, expected: Mapping[str, Any], *, source:
     """Raise unless a checkpoint's saved model block equals the config's (comment keys ignored).
 
     Shape mismatches already fail in load_state_dict; this also catches the knobs that do not
-    change parameter shapes (predict_delta, activation, layer_norm_eps, dropout, ...).
+    change parameter shapes (activation, layer_norm_eps, dropout, ...).
     Returns the saved block without comment keys.
     """
     if not isinstance(saved, Mapping):
@@ -461,6 +461,13 @@ def parse_precision_config(cfg: Mapping[str, Any]) -> PrecisionConfig:
     loss_dtype = parse_torch_dtype(require(pcfg_raw, "loss_dtype"), key="precision.loss_dtype")
 
     # Cross-validation: avoid silent dtype mismatches.
+    # The relaxation head runs its network in float32 (forward_step casts its inputs), so the weights must
+    # stay float32: 64-true and bf16-true would cast them and fail at the first forward.
+    if compute_dtype == torch.float64 or (compute_dtype == torch.bfloat16 and amp_mode == "true"):
+        raise ValueError(
+            "precision.compute_dtype must be float32, or bfloat16 with amp_mode=mixed "
+            "(the relaxation head runs its network in float32)"
+        )
     if compute_dtype in (torch.float32, torch.float64):
         if amp_mode != "true":
             raise ValueError("precision.amp_mode must be 'true' when compute_dtype is float32/float64")
@@ -468,13 +475,6 @@ def parse_precision_config(cfg: Mapping[str, Any]) -> PrecisionConfig:
             raise ValueError("precision.model_dtype must equal precision.compute_dtype for float32/float64 compute")
         if input_dtype != compute_dtype:
             raise ValueError("precision.input_dtype must equal precision.compute_dtype for float32/float64 compute")
-
-    if compute_dtype == torch.bfloat16 and amp_mode == "true":
-        # Pure bf16: model + inputs must be bf16 to avoid dtype mismatches.
-        if model_dtype != torch.bfloat16:
-            raise ValueError("precision.model_dtype must be bfloat16 when compute_dtype=bfloat16 and amp_mode=true")
-        if input_dtype != torch.bfloat16:
-            raise ValueError("precision.input_dtype must be bfloat16 when compute_dtype=bfloat16 and amp_mode=true")
 
     if amp_mode == "mixed":
         # Mixed precision keeps fp32 master weights and fp32 inputs; autocast lowers only the matmuls.
@@ -484,13 +484,6 @@ def parse_precision_config(cfg: Mapping[str, Any]) -> PrecisionConfig:
             raise ValueError("precision.model_dtype must be float32 when amp_mode=mixed (fp32 master weights)")
         if input_dtype != torch.float32:
             raise ValueError("precision.input_dtype must be float32 when amp_mode=mixed (bf16 inputs quantize the state)")
-        predict_delta = as_bool(require(require(cfg, "model"), "predict_delta"), "model.predict_delta")
-        if not predict_delta:
-            raise ValueError(
-                "precision.amp_mode=mixed requires model.predict_delta=true: without the residual add the "
-                "whole next state comes out of the bf16 trunk, which carries the rollout state at bf16 "
-                "resolution and erases most per-step changes"
-            )
 
     # The loss is accumulated in at least float32: a bf16 loss rounds the per-step log10 errors
     # the training target is measured in.

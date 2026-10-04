@@ -261,7 +261,7 @@ def _load_weights_strict(
     - Its normalization fingerprint (hyper_parameters['norm_sha256']) must equal `norm_sha256`, the
       fingerprint of the normalization.json being baked (no fingerprint = refused).
     - Its saved model block must equal `expected_model` (comment keys ignored): shape mismatches
-      fail in load_state_dict anyway, this also catches predict_delta, activation, layer_norm_eps.
+      fail in load_state_dict anyway, this also catches activation, layer_norm_eps, dropout.
     - 'ema_state_dict' (saved by EMACallback; the weights that produced the checkpoint's
       val_loss) is used when present and required when the checkpoint's run had EMA enabled
       (mirrors src/main.py:_load_weights_only).
@@ -995,7 +995,7 @@ def build_export(
 
     species_vars, global_vars = _validate_manifest_vs_config(cfg, manifest)
 
-    base = create_model(cfg)
+    base = create_model(cfg, manifest)
     ckpt_record, model_block = _load_weights_strict(base, ckpt_path, expected_model=cfg["model"], norm_sha256=norm_sha)
     base = _freeze_for_inference(base.to(device=device))
 

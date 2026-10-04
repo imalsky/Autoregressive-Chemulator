@@ -13,9 +13,7 @@
 #   5. stage 2 default recipe (AR + BPTT, compiled) from stage 1's handoff checkpoint (the file name
 #      configs/stage2.json uses, best.ckpt)
 #   6. stage 2 fallback recipe (detached + backward_per_step + gamma 0.9), eager
-#   7. the Fourier-dt fallback pair (model.mlp.residual=false + model.fourier_dt.enabled=true in both
-#      stages), compiled
-#   8. export of both stage-2 runs (testing/export.py: CPU + CUDA, with its parity gate); each final
+#   7. export of the default stage-2 run (testing/export.py: CPU + CUDA, with its parity gate); each final
 #      .pt2 reloaded: ep.module() without .eval() under inference_mode, finite in-range rows, a NaN row
 #      for an out-of-range dt, units and ranges in the metadata, and the export gate re-run against eager
 # Every training run: COMPLETED, finite train/val losses at every epoch, the expected epoch count,
@@ -244,7 +242,7 @@ PY
 )"
 check() { "${PY}" - "$@" <<<"${CHECKS}"; }
 
-echo "=== [1/8] synthetic raw + preprocessing ==="
+echo "=== [1/7] synthetic raw + preprocessing ==="
 AUTOCHEM_SYNTH_OUT_DIR="${SCRATCH}/raw" "${PY}" processing/make_synthetic_raw.py
 "${PY}" - "${SCRATCH}" <<'EOF'
 import copy
@@ -262,7 +260,7 @@ VAL_SAMPLES = BATCH + BATCH // 4
 EXTEND_EPOCHS = 1  # the deliberate extension of the finished stage-1 run
 
 
-def smoke_ify(stage, *, work, source=None, fourier=False):
+def smoke_ify(stage, *, work, source=None):
     # The smoke config lives inside the scratch dir, so paths are plain names
     # (resolved relative to the config file's directory by src/main.py).
     c = copy.deepcopy(prod[stage])
@@ -282,9 +280,6 @@ def smoke_ify(stage, *, work, source=None, fourier=False):
         cur["ramp_epochs"] = 1
         # Epoch 0 trains at least two rollout steps past the skipped ones, so the recipes differ.
         cur["start_steps"] = c["training"]["autoregressive_training"]["skip_steps"] + 2
-    if fourier:  # the approved fallback pair, flipped together in both stages
-        c["model"]["mlp"]["residual"] = False
-        c["model"]["fourier_dt"]["enabled"] = True
     return c
 
 
@@ -306,8 +301,6 @@ ar["backward_per_step"] = True
 ar["loss_discount_gamma"] = 0.9
 det["runtime"]["torch_compile"]["enabled"] = False
 cfgs["stage2_detached"] = det
-cfgs["fourier_stage1"] = smoke_ify("stage1", work="fourier_stage1_work", fourier=True)
-cfgs["fourier_stage2"] = smoke_ify("stage2", work="fourier_stage2_work", source="fourier_stage1_work", fourier=True)
 for name, c in cfgs.items():
     out = scratch / f"smoke_{name}.json"
     out.write_text(json.dumps(c, indent=2))
@@ -317,18 +310,18 @@ run preprocess "${SCRATCH}/smoke_stage1.json" processing/preprocessing.py
 check rejects "${SCRATCH}/processed/preprocessing_summary.json"
 check raw_store "${SCRATCH}/processed"
 
-echo "=== [2/8] stage 1 (production compile settings, 2 epochs) ==="
+echo "=== [2/7] stage 1 (production compile settings, 2 epochs) ==="
 train stage1
 check trained "${SCRATCH}/stage1_work" 2 "${SCRATCH}/logs/stage1.log" "${GATE_S2_FORWARD_STEP_VARIANTS}"
 
-echo "=== [3/8] stage 1 deliberate extension (delete COMPLETED, resume with one more epoch) ==="
+echo "=== [3/7] stage 1 deliberate extension (delete COMPLETED, resume with one more epoch) ==="
 [ -f "${SCRATCH}/stage1_work/COMPLETED" ] || die "stage 1 wrote no COMPLETED"
 rm "${SCRATCH}/stage1_work/COMPLETED"
 train stage1_extend
 check trained "${SCRATCH}/stage1_work" 3 "${SCRATCH}/logs/stage1_extend.log" "${GATE_S2_FORWARD_STEP_VARIANTS}"
 check continued "${SCRATCH}/stage1_work" 3
 
-echo "=== [4/8] re-run of the finished stage 1 (must be refused), then the publish-only resume ==="
+echo "=== [4/7] re-run of the finished stage 1 (must be refused), then the publish-only resume ==="
 before="$(sha256sum "${SCRATCH}/stage1_work/checkpoints/best.ckpt" "${SCRATCH}/stage1_work/COMPLETED")"
 if run stage1_rerun "${SCRATCH}/smoke_stage1_extend.json" src/main.py; then die "re-running a finished run was not refused"; fi
 grep -q "this run finished" "${SCRATCH}/logs/stage1_rerun.log" || die "the re-run failed for another reason (see ${SCRATCH}/logs/stage1_rerun.log)"
@@ -346,26 +339,18 @@ if grep -q "epoch [0-9]*: K_train" "${SCRATCH}/logs/stage1_publish.log"; then di
 [ "$(sha256sum "${SCRATCH}/stage1_work/checkpoints/last.ckpt")" = "${last_before}" ] || die "the publish-only resume changed last.ckpt"
 echo "OK publish-only resume: best.ckpt and COMPLETED republished byte-identical, no epoch trained"
 
-echo "=== [5/8] stage 2 default recipe (AR + BPTT, compiled, handoff from stage-1 best.ckpt) ==="
+echo "=== [5/7] stage 2 default recipe (AR + BPTT, compiled, handoff from stage-1 best.ckpt) ==="
 train stage2
 check trained "${SCRATCH}/stage2_work" 2 "${SCRATCH}/logs/stage2.log" "${GATE_S2_FORWARD_STEP_VARIANTS}"
 check differ "${SCRATCH}/stage2_work/checkpoints/last.ckpt" state_dict "${SCRATCH}/stage1_work/checkpoints/best.ckpt" ema_state_dict
 
-echo "=== [6/8] stage 2 fallback recipe (detached + backward_per_step + gamma 0.9, eager) ==="
+echo "=== [6/7] stage 2 fallback recipe (detached + backward_per_step + gamma 0.9, eager) ==="
 train stage2_detached
 check trained "${SCRATCH}/stage2_detached_work" 2 "${SCRATCH}/logs/stage2_detached.log" "${GATE_S2_FORWARD_STEP_VARIANTS}"
 check differ "${SCRATCH}/stage2_work/checkpoints/last.ckpt" state_dict "${SCRATCH}/stage2_detached_work/checkpoints/last.ckpt" state_dict
 
-echo "=== [7/8] Fourier-dt fallback pair (residual=false + fourier_dt, both stages, compiled) ==="
-train fourier_stage1
-check trained "${SCRATCH}/fourier_stage1_work" 2 "${SCRATCH}/logs/fourier_stage1.log" "${GATE_S2_FORWARD_STEP_VARIANTS}"
-train fourier_stage2
-check trained "${SCRATCH}/fourier_stage2_work" 2 "${SCRATCH}/logs/fourier_stage2.log" "${GATE_S2_FORWARD_STEP_VARIANTS}"
-
-echo "=== [8/8] export (CPU + CUDA, gated) and reload checks ==="
-for name in stage2 fourier_stage2; do
-  run "export_${name}" "${SCRATCH}/smoke_${name}.json" testing/export.py
-  AUTOCHEM_CONFIG_PATH="${SCRATCH}/smoke_${name}.json" check exported
-done
+echo "=== [7/7] export of the default stage-2 run (CPU + CUDA, gated) and reload checks ==="
+run export_stage2 "${SCRATCH}/smoke_stage2.json" testing/export.py
+AUTOCHEM_CONFIG_PATH="${SCRATCH}/smoke_stage2.json" check exported
 
 echo "=== SMOKE PASSED ==="

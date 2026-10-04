@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-model.py - Model architecture for flow-map rollout prediction.
+model.py - The relaxation head for flow-map rollout prediction.
 
 This module defines the neural network used by the trainer. The core task is
 one-step evolution under variable timestep:
@@ -8,17 +8,25 @@ one-step evolution under variable timestep:
     y_{t+1} = F(y_t, dt_t, g)
 
 where:
-  - y_t: state vector at time t (shape [B, S])
+  - y_t: state vector at time t in z-space (standardized log10, shape [B, S])
   - dt_t: normalized timestep for that step (shape [B])
   - g: global conditioning parameters (shape [B, G])
 
-FlowMapMLP is the only model: a direct MLP (residual or plain trunk) that predicts
-y(t+dt) from concatenated (y(t), dt, g), with an optional fixed Fourier embedding of dt.
+RelaxationHead is the only model. Each species relaxes exponentially toward a bounded target:
+
+    z' = z + a (q - z),   a = -expm1(-k dt),   q = clamp(z + r(z, g), zlo, zhi),
+    log10 k = c + h tanh(s / h)
+
+A residual MLP trunk maps (z, g) to the target offset r and the rate logit s; it never sees dt,
+which enters only through a. So the update vanishes as dt -> 0, the fixed point (r = 0) does not
+depend on dt, and since a lies in [0, 1] and q in [zlo, zhi], the physical box
+[zlo, zhi] (epsilon <= y <= 1) is invariant up to rounding. zlo, zhi and the dt range come
+from normalization.json.
 
 Design goals:
   - Deterministic behavior: no silent fallbacks.
   - Strict interfaces: ambiguous shapes/config values are rejected early.
-  - Stable rollouts: optional delta prediction and conservative head init.
+  - Stable rollouts: a bounded target, a bounded rate and a near-identity output init.
   - Export-safe: no int() on dynamic tensor dimensions; uses torch._check for asserts.
 """
 
@@ -26,21 +34,22 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Sequence
 
+import numpy as np
 import torch
 import torch.nn as nn
 
-from utils import as_bool, as_float, as_int
+from utils import as_bool, as_float
 
 ActivationFactory = Callable[[], nn.Module]
 
-# Small output init for delta heads. This reduces early rollout blow-ups. Inherited (docs/DECISIONS.md).
-# The std is absolute, not scaled by fan-in, so the initial per-step delta std is about
-# 1e-3 * sqrt(fan_in) * RMS(head input): ~0.045 z-units for the production residual+LN trunk at width
-# 2048 (unit-RMS LayerNorm output) and ~0.027 for the non-residual fallback (post-SiLU RMS ~0.6;
-# audit measurement). A width change therefore rescales the initial step as sqrt(width).
-_DELTA_OUT_INIT_STD = 1e-3
+# Output-layer init std of the relaxation head's trunk: a near-identity start (r ~ 0, so q ~ z, and
+# log10 k ~ c, the middle of the rate range). The std is absolute, not scaled by fan-in, so the
+# initial outputs grow as sqrt(width).
+_OUT_INIT_STD = 1e-3
+# Range of log10 k (k in 1/s): log10 k = c + h tanh(s / h) with c, h the range's midpoint and half-width.
+_LOG10_RATE_RANGE = (-12.0, 3.0)
 # Fixed global set, in this order. src/main.py and testing/export.py
 # import it from here; the standalone processing/preprocessing.py and testing/predictions.py keep a copy.
 _REQUIRED_GLOBALS = ("P", "T")
@@ -152,70 +161,6 @@ def _as_int_list(value: Any, *, name: str) -> List[int]:
 # Building blocks
 # ==============================================================================
 
-class FourierDtFeatures(nn.Module):
-    """Fixed random-Fourier embedding of the normalized scalar dt (Tancik et al. 2020).
-
-    dt_norm [..., 1] -> [..., 1 + 2F]: the raw dt is kept (strict superset of the
-    plain input) and sin/cos(2*pi*b_f*dt) features are appended. The projection is
-    a seeded, non-trainable buffer (learned frequencies do not help for a 1-D
-    conditioner and add seed variance). Export-safe: fixed shapes, registered buffer.
-    """
-
-    def __init__(self, *, num_freqs: int, sigma: float, seed: int) -> None:
-        super().__init__()
-        # Positive-form checks so NaN fails too.
-        if not int(num_freqs) >= 1:
-            raise ValueError(f"fourier_dt.num_freqs must be >= 1, got {num_freqs}")
-        if not (math.isfinite(float(sigma)) and float(sigma) > 0.0):
-            raise ValueError(f"fourier_dt.sigma must be finite and > 0, got {sigma}")
-        gen = torch.Generator().manual_seed(int(seed))
-        freqs = torch.randn(int(num_freqs), generator=gen) * float(sigma)
-        self.register_buffer("freqs", freqs)
-        self.num_freqs = int(num_freqs)
-        self.out_dim = 1 + 2 * int(num_freqs)
-
-    def forward(self, dt: torch.Tensor) -> torch.Tensor:
-        """Embed dt [..., 1] -> [..., 1 + 2F] as [dt, sin(2*pi*B*dt), cos(2*pi*B*dt)]."""
-        torch._check(dt.shape[-1] == 1)
-        # Compute the projection and sin/cos in at least float32 (bf16 is upcast, float64 is kept):
-        # under bf16 the phase 2*pi*b_f*dt loses ~8 mantissa bits, aliasing the high-frequency
-        # features to noise. Cast back to the input dtype at the end.
-        ct = torch.promote_types(dt.dtype, torch.float32)
-        dtc = dt.to(ct)
-        proj = 2.0 * math.pi * dtc * self.freqs.to(ct)
-        feats = torch.cat([dtc, torch.sin(proj), torch.cos(proj)], dim=-1)
-        return feats.to(dt.dtype)
-
-
-def build_fourier_dt(fourier_cfg: Any) -> Optional[FourierDtFeatures]:
-    """Construct FourierDtFeatures from a model.fourier_dt config dict (or None).
-
-    Absent config or enabled=False -> None (plain scalar dt, current behavior).
-    """
-    if fourier_cfg is None:
-        return None
-    if not isinstance(fourier_cfg, dict):
-        raise TypeError("model.fourier_dt must be a dict.")
-    if "enabled" not in fourier_cfg:
-        raise KeyError(
-            "model.fourier_dt present but missing 'enabled' — set it explicitly "
-            "(a silent default would be a silent architecture change)."
-        )
-    enabled = fourier_cfg["enabled"]
-    if not isinstance(enabled, bool):
-        raise TypeError("model.fourier_dt.enabled must be a bool.")
-    if not enabled:
-        return None
-    for key in ("num_freqs", "sigma", "seed"):
-        if key not in fourier_cfg:
-            raise KeyError(f"model.fourier_dt.{key} required when fourier_dt.enabled=true.")
-    return FourierDtFeatures(
-        num_freqs=as_int(fourier_cfg["num_freqs"], "model.fourier_dt.num_freqs"),
-        sigma=as_float(fourier_cfg["sigma"], "model.fourier_dt.sigma"),
-        seed=as_int(fourier_cfg["seed"], "model.fourier_dt.seed"),
-    )
-
-
 def get_activation(name: str) -> ActivationFactory:
     """Return an activation factory by name."""
     key = str(name).lower().strip()
@@ -236,56 +181,6 @@ def _init_linear_xavier(linear: nn.Linear, *, scale: float = 1.0) -> None:
     if scale != 1.0:
         with torch.no_grad():
             linear.weight.mul_(float(scale))
-
-
-class MLP(nn.Module):
-    """Plain MLP: Linear -> (LayerNorm) -> Act -> (Dropout) -> ... -> Linear."""
-
-    def __init__(
-            self,
-            input_dim: int,
-            hidden_dims: Sequence[int],
-            output_dim: int,
-            activation_factory: ActivationFactory,
-            dropout_p: float = 0.0,
-            *,
-            layer_norm: bool,
-            layer_norm_eps: float,
-    ):
-        super().__init__()
-
-        dims = [int(input_dim)] + [int(d) for d in hidden_dims] + [int(output_dim)]
-        use_ln = bool(layer_norm)
-
-        layers: List[nn.Module] = []
-        for i in range(len(dims) - 2):
-            in_d, out_d = dims[i], dims[i + 1]
-            layers.append(nn.Linear(in_d, out_d))
-            layers.append(nn.LayerNorm(out_d, eps=float(layer_norm_eps)) if use_ln else nn.Identity())
-            # Dropout shares the activation's slot, so parameter keys do not depend on dropout (a
-            # separate Dropout entry would renumber every later Linear and break strict loading).
-            act = activation_factory()
-            layers.append(nn.Sequential(act, nn.Dropout(p=float(dropout_p))) if float(dropout_p) > 0.0 else act)
-
-        layers.append(nn.Linear(dims[-2], dims[-1]))
-        self.network = nn.Sequential(*layers)
-
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:  # type: ignore[override]
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                _init_linear_xavier(m)
-
-    def last_linear(self) -> nn.Linear:
-        # Final layer in the Sequential is always the output Linear.
-        out = self.network[-1]
-        if not isinstance(out, nn.Linear):
-            raise RuntimeError("MLP: last layer is not Linear.")
-        return out
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.network(x)
 
 
 class ResidualMLP(nn.Module):
@@ -343,12 +238,9 @@ class ResidualMLP(nn.Module):
 
         _init_linear_xavier(self.out)
 
-    def last_linear(self) -> nn.Linear:
-        return self.out
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Under autocast (bf16-mixed) the input block, which reads the raw state, dt, P and T, and the
-        # delta head run in fp32. Without autocast (fp32, bf16-true, torch.export) the plain loop runs.
+        # Under autocast (bf16-mixed) the input block, which reads the raw state, P and T, and the
+        # output layer run in fp32. Without autocast (fp32, torch.export) the plain loop runs.
         fp32_islands = torch.is_autocast_enabled(x.device.type)
         h = x
         for i, (lin, act, drop, proj, norm) in enumerate(zip(self.linears, self.acts, self.drops, self.projs, self.norms)):
@@ -366,11 +258,17 @@ class ResidualMLP(nn.Module):
 
 
 # ==============================================================================
-# Full models
+# Model
 # ==============================================================================
 
-class FlowMapMLP(nn.Module):
-    """Direct MLP flow-map: (y, dt, g) -> y_next."""
+class RelaxationHead(nn.Module):
+    """Per-species exponential relaxation toward a bounded target, in z-space.
+
+        z' = z + a (q - z),  a = -expm1(-k dt),  q = clamp(z + r(z, g), zlo, zhi),  log10 k = c + h tanh(s / h)
+
+    The trunk maps (z, g) to [r, s] (2S outputs) and never sees dt. dt_norm maps linearly to log10 dt
+    (seconds) between dt_log10_min and dt_log10_max and is not clamped (dt_norm -> -inf gives the identity).
+    """
 
     def __init__(
             self,
@@ -379,67 +277,67 @@ class FlowMapMLP(nn.Module):
             global_dim: int,
             hidden_dims: Sequence[int],
             activation_name: str,
-            dropout: float = 0.0,
-            residual: bool,
-            predict_delta: bool,
+            dropout: float,
             layer_norm: bool,
             layer_norm_eps: float,
-            fourier_dt: Optional[FourierDtFeatures] = None,
+            zlo: torch.Tensor,
+            zhi: torch.Tensor,
+            dt_log10_min: float,
+            dt_log10_max: float,
     ):
         super().__init__()
 
         self.S, self.G = int(state_dim), int(global_dim)
-        self.predict_delta = bool(predict_delta)
-        self.fourier_dt = fourier_dt
-
-        act_factory = get_activation(activation_name)
-        dt_dim = fourier_dt.out_dim if fourier_dt is not None else 1
-        input_dim = self.S + dt_dim + self.G
-
-        net_cls = ResidualMLP if bool(residual) else MLP
-        self.network = net_cls(
-            input_dim,
+        self.trunk = ResidualMLP(
+            self.S + self.G,
             [int(d) for d in hidden_dims],
-            self.S,
-            act_factory,
+            2 * self.S,
+            get_activation(activation_name),
             float(dropout),
             layer_norm=layer_norm,
             layer_norm_eps=layer_norm_eps,
         )
-
-        if self.predict_delta:
-            self._init_delta_head()
-
-    def _init_delta_head(self) -> None:
-        """Small-output init for stable delta rollouts."""
+        # Near-identity start (r ~ 0, log10 k ~ c), drawn after the trunk's Xavier init: a seed gives
+        # the same weights only while this order holds.
         with torch.no_grad():
-            out = self.network.last_linear()
-            nn.init.zeros_(out.bias)
-            nn.init.normal_(out.weight, mean=0.0, std=_DELTA_OUT_INIT_STD)
+            nn.init.normal_(self.trunk.out.weight, std=_OUT_INIT_STD)
+            nn.init.zeros_(self.trunk.out.bias)
+        # The box in z-space, persistent (checkpoints carry it; norm_sha256 ties it to normalization.json).
+        self.register_buffer("zlo", zlo.float().clone())
+        self.register_buffer("zhi", zhi.float().clone())
+        lo, hi = _LOG10_RATE_RANGE
+        # Plain Python floats, not buffers: the state_dict holds only the trunk and the box.
+        self.c, self.h = 0.5 * (lo + hi), 0.5 * (hi - lo)
+        self.dt_log10_min, self.dt_log10_max = float(dt_log10_min), float(dt_log10_max)
+
+    def delta(self, z: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        """Change of z over one step: fp32 z [B, S], dt_norm [B], g [B, G] -> fp32 [B, S]."""
+        o = self.trunk(torch.cat([z, g], dim=-1))
+        q = torch.clamp(z + o[:, :self.S], self.zlo, self.zhi)
+        log10k = self.c + self.h * torch.tanh(o[:, self.S:] / self.h)
+        ldt = self.dt_log10_min + (self.dt_log10_max - self.dt_log10_min) * dt_norm
+        return -torch.expm1(-torch.pow(10.0, log10k + ldt.reshape(-1, 1))) * (q - z)
 
     def forward_step(self, y_i: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-        """One step y_i -> y_next from concatenated (y_i, embedded dt, g) (+ y_i if predict_delta)."""
+        """One step y_i -> y_i + delta: the network always runs in fp32, the add in y_i's dtype (fp32 or fp64)."""
         B = y_i.shape[0]  # Keep as symbolic
-        _validate_g_shape(g, B, self.G, context="FlowMapMLP.forward_step")
-
-        dt = normalize_dt_step(dt_norm, B, context="FlowMapMLP.forward_step").to(y_i.dtype)
-        dt_feat = self.fourier_dt(dt) if self.fourier_dt is not None else dt
-        x = torch.cat([y_i, dt_feat, g], dim=-1)
-
-        y_pred = self.network(x)
-        return y_pred + y_i if self.predict_delta else y_pred
+        _validate_g_shape(g, B, self.G, context="RelaxationHead.forward_step")
+        dt = normalize_dt_step(dt_norm, B, context="RelaxationHead.forward_step").reshape(-1)
+        return y_i + self.delta(y_i.float(), dt.float(), g.float()).to(y_i.dtype)
 
 
 # ==============================================================================
 # Factory
 # ==============================================================================
 
-def create_model(config: Dict[str, Any]) -> nn.Module:
-    """Construct the model from config (dims from config.data).
+def create_model(config: Dict[str, Any], normalization_manifest: Mapping[str, Any]) -> nn.Module:
+    """Construct the relaxation head from config (dims from config.data) and the normalization manifest.
 
     Notes:
-      - Model selection is driven ONLY by model.type; "mlp" is the only supported type.
-      - Unknown model.type is a hard error.
+      - model.type must be "relax" (the only model); any other value is a hard error.
+      - The box is epsilon <= y <= 1 in z-space: zlo = (log10(epsilon) - mu) / sd and zhi = (0 - mu) / sd,
+        with mu, sd the species' log_mean, log_std, computed in float64 and stored as float32. The dt
+        log range is the manifest's dt.log_min, dt.log_max.
     """
     log = logging.getLogger(__name__)
 
@@ -470,12 +368,13 @@ def create_model(config: Dict[str, Any]) -> nn.Module:
     if model_type_raw is None:
         raise KeyError("model.type required.")
     model_type = str(model_type_raw).lower().strip()
+    if model_type != "relax":
+        raise ValueError(f"model.type unsupported: {model_type}")
 
     # Architecture knobs are schema-required (main.py checks presence only);
     # types are validated here, at the point of consumption.
     activation = str(mcfg["activation"]).lower().strip()
     dropout = as_float(mcfg["dropout"], "model.dropout")
-    predict_delta = as_bool(mcfg["predict_delta"], "model.predict_delta")
     layer_norm = as_bool(mcfg["layer_norm"], "model.layer_norm")
     layer_norm_eps = as_float(mcfg["layer_norm_eps"], "model.layer_norm_eps")
     # Positive-form range checks (as_float already rejects NaN/Inf).
@@ -483,30 +382,27 @@ def create_model(config: Dict[str, Any]) -> nn.Module:
         raise ValueError(f"model.dropout must be in [0, 1), got {dropout}")
     if not layer_norm_eps > 0.0:
         raise ValueError(f"model.layer_norm_eps must be > 0, got {layer_norm_eps}")
-    fourier_dt = build_fourier_dt(mcfg.get("fourier_dt"))  # optional feature block
-    if fourier_dt is not None:
-        log.info(
-            "fourier_dt enabled: num_freqs=%d sigma=%s (dt input dim 1 -> %d)",
-            fourier_dt.num_freqs, mcfg["fourier_dt"]["sigma"], fourier_dt.out_dim,
-        )
+    mlp_cfg = mcfg.get("mlp")
+    if not isinstance(mlp_cfg, dict):
+        raise KeyError("model.mlp required.")
+    hidden_dims = _as_int_list(mlp_cfg["hidden_dims"], name="model.mlp.hidden_dims")
 
-    if model_type == "mlp":
-        mlp_cfg = mcfg.get("mlp")
-        if not isinstance(mlp_cfg, dict):
-            raise KeyError("model.mlp required.")
-        hidden_dims = _as_int_list(mlp_cfg["hidden_dims"], name="model.mlp.hidden_dims")
-        residual = as_bool(mlp_cfg["residual"], "model.mlp.residual")
-        return FlowMapMLP(
-            state_dim=S,
-            global_dim=G,
-            hidden_dims=hidden_dims,
-            activation_name=activation,
-            dropout=dropout,
-            residual=residual,
-            predict_delta=predict_delta,
-            layer_norm=layer_norm,
-            layer_norm_eps=layer_norm_eps,
-            fourier_dt=fourier_dt,
-        )
-
-    raise ValueError(f"model.type unsupported: {model_type}")
+    stats = normalization_manifest["per_key_stats"]
+    mu = torch.tensor([stats[name]["log_mean"] for name in species_vars], dtype=torch.float64)
+    sd = torch.tensor([stats[name]["log_std"] for name in species_vars], dtype=torch.float64)
+    zlo = (np.log10(float(normalization_manifest["epsilon"])) - mu) / sd
+    zhi = (0.0 - mu) / sd
+    dt_range = normalization_manifest["dt"]
+    return RelaxationHead(
+        state_dim=S,
+        global_dim=G,
+        hidden_dims=hidden_dims,
+        activation_name=activation,
+        dropout=dropout,
+        layer_norm=layer_norm,
+        layer_norm_eps=layer_norm_eps,
+        zlo=zlo,
+        zhi=zhi,
+        dt_log10_min=dt_range["log_min"],
+        dt_log10_max=dt_range["log_max"],
+    )
