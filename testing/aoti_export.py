@@ -3,10 +3,12 @@
 """Build and validate a VULCAN-oriented CPU AOTInductor package.
 
 This script is validation-first:
-- it builds one CPU AOTInductor package from the run's best checkpoint (the run directory is
-  paths.work_dir of AUTOCHEM_CONFIG_PATH's config, testing/run_dir.py; it must hold COMPLETED)
+- it builds one CPU AOTInductor package from the checkpoint testing/export.py exports (CHECKPOINT,
+  the final epoch's; the run directory is paths.work_dir of AUTOCHEM_CONFIG_PATH's config,
+  testing/run_dir.py; it must hold COMPLETED)
 - it validates that package against a fresh raw export on real VULCAN column inputs (pass/fail) and
-  compares the installed raw VULCAN model with the fresh export (informational)
+  compares the installed raw VULCAN model with the fresh export (informational; only when the
+  installed model has the same metadata format)
 - it checks the host input guard (_check_step_inputs) on valid and invalid inputs
 - it benchmarks the direct model-call latency for the raw and AOTI paths
 - it writes a JSON report plus a markdown report into the run directory
@@ -15,7 +17,8 @@ Pass/fail: in every validation case (each benchmark batch size and dynamic_batch
 HOST_DT_SECONDS and dt_max from the export metadata, plus one batch with an out-of-range dt row;
 model inputs floored at the export's epsilon, the training floor) the AOTI package and the fresh
 export must return identical NaN rows, equal to the rows the inputs put outside the trained box; no
-+-inf; and max |log10(aoti) - log10(fresh)| <= MATCH_MAX_DLOG10 over the in-range rows (a case whose
++-inf; and max |aoti - fresh| <= MATCH_MAX_DLOG10 over the in-range rows (both outputs are log10
+increments, so the difference is in dex; a case whose
 rows are all out of range checks the NaN rows only); the cases together must hold at least one
 in-range row. Every invalid input must be refused by the guard and B=1 accepted. The package is
 compiled under <run_dir>/.partial/ and renamed into place only on a pass; on a failure both reports
@@ -78,13 +81,12 @@ INSTALLED_RAW_MODEL_PATH = (
     REPO_ROOT.parent / "Misc" / "VULCAN-0D" / "Emulator" / "model" / "model.pt2"
 ).resolve()
 # Outputs, written into the resolved run directory.
-OUTPUT_AOTI_PACKAGE_NAME = "export_cpu_dynB_1step_phys_aoti.pt2"
-OUTPUT_REPORT_NAME = "export_cpu_dynB_1step_phys_aoti_validation.md"
-OUTPUT_JSON_NAME = "export_cpu_dynB_1step_phys_aoti_validation.json"
+OUTPUT_AOTI_PACKAGE_NAME = "export_cpu_dynB_1step_dlog10_aoti.pt2"
+OUTPUT_REPORT_NAME = "export_cpu_dynB_1step_dlog10_aoti_validation.md"
+OUTPUT_JSON_NAME = "export_cpu_dynB_1step_dlog10_aoti_validation.json"
 AOTI_EXAMPLE_BATCH: int | None = None  # None => the reference column's nz (floored at MIN_EXAMPLE_BATCH)
 BENCHMARK_BATCH_SIZES: tuple[int | str, ...] = (1, "nz", "2*nz")
-# The deployment-like validation dt (inherited: Canoe's coupling dt, docs/DECISIONS.md); dt_min and
-# dt_max come from the export metadata.
+# A deployment-like validation dt (inherited value); dt_min and dt_max come from the export metadata.
 HOST_DT_SECONDS = 6.4
 # The out-of-range validation row: one decade above dt_max, unambiguously outside the box.
 OOR_PROBE_DT_FACTOR = 10.0
@@ -97,8 +99,8 @@ TOTAL_DENSITY_FLOOR = 1.0e-30
 BENCHMARK_WARMUP_ITERS = 3
 BENCHMARK_ITERS = 20
 # AOTI-vs-fresh tolerance in dex: about 10x the float32 AOTI-vs-eager noise measured on a 10x2048
-# random-weight proxy (9.5e-6 dex) and far below any physically meaningful error; re-check on the
-# first trained model.
+# random-weight proxy (9.5e-6 dex, on the former next-state output) and far below any physically
+# meaningful error; re-check on the first trained model.
 MATCH_MAX_DLOG10 = 1.0e-4
 # Build-target record: the compiler inductor's -march=native resolves through, and the /proc/cpuinfo
 # flag prefixes that matter for the generated kernels.
@@ -111,7 +113,8 @@ HOST_INPUT_CONTRACT = (
     "dt_seconds [B], g_phys [B, G] (S, G from species_variables / global_variables), the same B for all "
     "three, dynamic_batch.min <= B <= dynamic_batch.max. Call through testing/aoti_export.py "
     "_check_step_inputs (copied into the host) or convert with np.ascontiguousarray(x, dtype=np.float32) "
-    "and apply the same shape and B checks. Out-of-range dt/P/T rows return NaN (oor_policy)."
+    "and apply the same shape and B checks. Out-of-range dt/P/T rows return NaN (oor_policy). The output "
+    "is the log10 increment dlog10_y [B, S], applied to the host state as metadata update_rule says."
 )
 
 
@@ -151,7 +154,7 @@ class ModelCallCase:
 
 @dataclass(frozen=True)
 class ValidationMetrics:
-    """One reference-vs-candidate comparison: NaN-row agreement and the log10 difference."""
+    """One reference-vs-candidate comparison: NaN-row agreement and the difference of the log10 increments."""
 
     comparison_name: str
     batch_size: int
@@ -551,17 +554,16 @@ def _compute_validation_metrics(
     case: ModelCallCase,
     reference_output: np.ndarray,
     candidate_output: np.ndarray,
-    eps: float,
     expected_nan_rows: np.ndarray,
 ) -> ValidationMetrics:
-    """NaN-aware comparison in float64: |log10(max(c, eps)) - log10(max(r, eps))| over the rows finite in r."""
+    """NaN-aware comparison in float64: |c - r| (log10 increments, so dex) over the rows finite in r."""
 
     ref = reference_output.astype(np.float64)
     cand = candidate_output.astype(np.float64)
     nan_ref, nan_cand = np.isnan(ref), np.isnan(cand)
     rows = np.isfinite(ref).all(axis=1)
     if rows.any():
-        d = np.abs(np.log10(np.maximum(cand[rows], eps)) - np.log10(np.maximum(ref[rows], eps)))
+        d = np.abs(cand[rows] - ref[rows])
         max_dlog10 = float(np.max(d))
     else:
         max_dlog10 = float("nan")
@@ -667,7 +669,8 @@ def _validate_package(
     meta = fresh_export.metadata
     S, G = len(meta["species_variables"]), len(meta["global_variables"])
     b_min, b_max = int(meta["dynamic_batch"]["min"]), int(meta["dynamic_batch"]["max"])
-    eps = float(meta["epsilon"])
+    # An installed model of another format returns another quantity (e.g. a next state): not compared.
+    installed_same_format = installed_metadata.get("format") == meta["format"]
     compiled_model = _inductor.aoti_load_package(str(package_path))
 
     aoti_rows: list[ValidationMetrics] = []
@@ -681,12 +684,13 @@ def _validate_package(
         fresh_output = _call_model(fresh_export.fresh_raw_model, case)
         aoti_rows.append(_compute_validation_metrics(
             comparison_name="aoti_vs_fresh_raw", case=case, reference_output=fresh_output,
-            candidate_output=_call_model(compiled_model, case), eps=eps, expected_nan_rows=expected))
-        if case.batch_size == b_max:  # the B_MAX case checks the package; the installed model may predate it
+            candidate_output=_call_model(compiled_model, case), expected_nan_rows=expected))
+        # The B_MAX case checks the package; the installed model may predate it.
+        if case.batch_size == b_max or not installed_same_format:
             continue
         installed_rows.append(_compute_validation_metrics(
             comparison_name="installed_raw_vs_fresh_raw", case=case, reference_output=fresh_output,
-            candidate_output=_call_model(installed_raw_model, case), eps=eps, expected_nan_rows=expected))
+            candidate_output=_call_model(installed_raw_model, case), expected_nan_rows=expected))
 
     guard = _guard_checks(guard_case, b1_case, S=S, G=G, b_min=b_min, b_max=b_max)
 
@@ -705,8 +709,7 @@ def _validate_package(
         "benchmark_rows": benchmark_rows,
         "failing": failing,
         "passed": passed,
-        # A pre-NaN-row installed model clamps out-of-range rows instead of NaN-marking them.
-        "installed_has_nan_row_contract": installed_metadata.get("oor_policy") == "nan_row",
+        "installed_same_format": installed_same_format,
     }
 
 
@@ -795,8 +798,9 @@ def main() -> None:
     benchmark_rows: list[BenchmarkMetrics] = outcome["benchmark_rows"]
     at_nz = {r.model_label: r for r in benchmark_rows if r.batch_size == reference_column.nz}
     installed_matches = (
-        _all_pass(installed_rows) if outcome["installed_has_nan_row_contract"]
-        else "not comparable: the installed model predates the NaN-row contract (it clamps out-of-range rows)"
+        _all_pass(installed_rows) if outcome["installed_same_format"]
+        else f"not comparable: the installed model's metadata format is {installed_metadata.get('format')!r}, "
+             f"not {meta['format']!r} (another output)"
     )
     worst = max(aoti_rows, key=lambda r: (not _row_passes(r), r.max_dlog10 if r.max_dlog10 == r.max_dlog10 else math.inf))
 
@@ -839,7 +843,7 @@ def main() -> None:
         "decisions": {
             "match_decision_rule": (
                 "per case: identical NaN entries, NaN rows equal to the inputs' out-of-range rows, no +-inf, "
-                f"max |dlog10| <= {MATCH_MAX_DLOG10:.1e} over the in-range rows (eps = metadata epsilon); >= 1 in-range "
+                f"max |aoti - fresh| <= {MATCH_MAX_DLOG10:.1e} dex over the in-range rows (log10 increments); >= 1 in-range "
                 "row over all cases; plus every invalid input refused by the guard and B=1 accepted"
             ),
             "aoti_matches_fresh_raw_on_vulcan_inputs": outcome["passed"],

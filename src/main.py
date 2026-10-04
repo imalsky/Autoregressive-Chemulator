@@ -133,7 +133,8 @@ _BYTES_PER_MB = 1e6
 # with patience exhausted, with a finite last val_loss and best score. run_daw.sh gates on it; a
 # resume refuses a run that has it, and weights_only refuses a source run without it.
 _COMPLETED_NAME = "COMPLETED"
-# The stable-name copy of a finished run's best-val_loss checkpoint (export and the stage-2 handoff).
+# The stable-name copy of a finished run's best-val_loss checkpoint (the stage-2 handoff; export reads
+# the final epoch's last.ckpt).
 _BEST_CKPT_NAME = "best.ckpt"
 # One JSON line per invocation (append-only): environment, code, data and init-checkpoint identity.
 _PROVENANCE_NAME = "provenance.jsonl"
@@ -1482,8 +1483,7 @@ def _publish_completion(work_dir: Path, completed: Dict[str, Any]) -> None:
     """Publish a finished run: copy its best checkpoint to checkpoints/best.ckpt (checkpointing on), then
     write COMPLETED last. The end of fit and a terminal resume checkpoint both publish through here.
     """
-    # The stable name is what export tooling (testing/export.py, testing/aoti_export.py) and the
-    # stage-2 handoff consume.
+    # The stable name is what the stage-2 handoff consumes (export tooling reads last.ckpt).
     if completed["best"] is not None:
         best_src = completed["best"]["source"].strip()
         if not best_src:

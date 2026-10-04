@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 """Rollout-error curves of an exported 1-step model over a seeded sample of one split (diagnostic).
 
-Rolls the run's exported CPU model (export_cpu_dynB_1step_phys.pt2 in the run directory named by
+Rolls the run's exported CPU model (export_cpu_dynB_1step_dlog10.pt2 in the run directory named by
 AUTOCHEM_CONFIG_PATH, testing/run_dir.py) autoregressively at each window's own fixed dt over a
 reproducible sample of EVAL_SPLIT: EVAL_N_SOURCES source trajectories drawn with EVAL_SEED, one
-seeded window per source. The windows are the processed random-dt shards (dt log-uniform in the
-trained range), so K <= T - 1 - ROLLOUT_START_INDEX (98 today) and every row is labelled
-"random-dt, K <= 98": no fixed-dt evaluation set exists yet.
+seeded window per source. Each step applies the export's log10 increment to a predictions.HOST_DTYPE
+host state with testing/export.py host_step. The windows are the processed random-dt shards (dt
+log-uniform in the trained range), so K <= T - 1 - ROLLOUT_START_INDEX (98 today) and every row is
+labelled "random-dt, K <= 98": no fixed-dt evaluation set exists yet.
 
-Reported per rollout step, for the model and for persistence (y_next = y, the start state carried
-forward):
+Reported per rollout step, for the model and for persistence (a zero increment through host_step:
+y_next = max(y, epsilon), the start state carried forward):
 - per-species |log10(yp) - log10(yt)| p50 / p90 in dex (recommended headline; the author confirms
   the paper target) and the median / mean signed log10(yp / yt) (bias); 10% fractional error is
   about 0.041 dex for an overshoot and 0.046 dex for an undershoot. The headline states its rollout
   step and its dt (each window's own constant dt; there is no fixed-dt set yet);
 - the legacy pooled fractional-error percentiles |yp - yt| / (|yt| + FRAC_ERR_FLOOR) for continuity
   (the floor hides trace-species error; the share of scored truth below 1e-12 and 1e-20 is printed);
-- n_finite. Percentiles keep a fixed population: a diverged (non-finite) entry ranks as +inf error,
-  so an inf percentile means more than that tail fraction diverged.
+- n_finite and n_refused: host_step keeps a row's previous state when its update is not finite or
+  leaves the log10 y envelope, so a diverging row stays finite and is counted in n_refused (rows whose
+  update was refused at that step) instead. Percentiles keep a fixed population: a non-finite entry
+  ranks as +inf error.
 Strata: a window is steady state when its truth stays within STEADY_STATE_MAX_DEX of its start
 state at every step and species (persistence is nearly exact there); the others are evolving. The
 headline rows and the pooled dex p90 at the report steps are also reported for each stratum, the
@@ -27,7 +30,7 @@ pool all windows. The loss against persistence and gate 1 are judged on the evol
 apart by the model's absolute log10 error.
 Loss against persistence: the run's val_loss definition (training.rollout_steps from the rollout
 start, steps >= skip_steps for an AR run, the run's loss weights), recomputed in float64 from the
-export's physical outputs (values clipped at epsilon), for the model and for persistence, as a ratio
+host states (values clipped at epsilon), for the model and for persistence, as a ratio
 of means and skill = 1 - ratio, overall and by window-start decade, over the evolving windows (the
 all-window pooled ratio, training's val_skill population, is printed as a diagnostic). The
 window-start time is t_start + ROLLOUT_START_INDEX * dt; the shards hold no time, so t_start is
@@ -66,7 +69,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "testing"))
 sys.path.insert(0, str(ROOT / "processing"))
 
-import export as E  # noqa: E402  (export's baked normalizer: the round-trip check; src/utils fingerprint)
+import export as E  # noqa: E402  (export's baked normalizer: the round-trip check; host_step; src/utils fingerprint)
 import predictions as P  # noqa: E402  (its independent numpy inverse normalization and loaders)
 import preprocessing as PP  # noqa: E402  (its own window draws: the window-start time replay)
 from run_dir import resolve_run_dir  # noqa: E402
@@ -287,26 +290,33 @@ def _loss_definition(cfg: Dict[str, Any], manifest: Dict[str, Any], species_keys
 @torch.inference_mode()
 def _rollout_stats(model, y0_phys, g_phys, dt_seconds, y_true, *, eps: float, b_max: int, report_idx: List[int],
                    loss_def: Dict[str, Any]):
-    """Steps in the outer loop, row chunks of at most b_max in the inner loop; keep only the [N, S] state.
+    """Steps in the outer loop, row chunks of at most b_max in the inner loop; keep only the [N, S] state
+    (P.HOST_DTYPE, advanced by E.host_step).
 
     Returns per-step pooled frac percentiles, pooled dex p90, per-species dex percentiles and bias,
-    n_finite, the truth-below-level shares, the per-source dex at the report steps, the per-source
-    loss under loss_def (lambda_log10_mae * mean |dlog10| + lambda_z_mse * mean (dlog10 / log_std)^2
-    over species, weighted over the first loss_def["k"] steps; +inf for a diverged source) and the
-    per-source absolute log10 error (mean |dlog10| over species, same step weights; +inf if diverged).
+    n_finite, n_refused, the per-source refusal flags (sources_refused: any step refused), the
+    truth-below-level shares, the per-source dex at the report steps, the per-source loss under loss_def
+    (lambda_log10_mae * mean |dlog10| + lambda_z_mse * mean (dlog10 / log_std)^2 over species, weighted
+    over the first loss_def["k"] steps; +inf for a non-finite source) and the per-source absolute log10
+    error (mean |dlog10| over species, same step weights; +inf if non-finite).
     """
     N, K, S = y_true.shape
-    state = torch.from_numpy(y0_phys.astype(np.float32))
+    state = torch.from_numpy(y0_phys).to(P.HOST_DTYPE)
     g = torch.from_numpy(g_phys.astype(np.float32))
     dt = torch.from_numpy(dt_seconds.astype(np.float32))
     out: Dict[str, Any] = {"frac": [], "dex_p90": [], "species_dex": [], "bias_median": [], "bias_mean": [],
-                           "n_finite": [], "dex_at_report": []}
+                           "n_finite": [], "n_refused": [], "dex_at_report": []}
+    refused_any = np.zeros(N, dtype=bool)
     window_loss = np.zeros(N)
     window_abs_dex = np.zeros(N)
     below = {lvl: 0 for lvl in TRUTH_DISCLOSURE_LEVELS}
     for k in range(K):
-        nxt = [model(state[i:i + b_max], dt[i:i + b_max, k], g[i:i + b_max]) for i in range(0, N, b_max)]
-        state = torch.cat(nxt, dim=0)
+        nxt = [E.host_step(model, state[i:i + b_max], dt[i:i + b_max, k], g[i:i + b_max], epsilon=eps)
+               for i in range(0, N, b_max)]
+        state = torch.cat([s for s, _ in nxt], dim=0)
+        refused = torch.cat([r for _, r in nxt], dim=0).numpy()
+        refused_any |= refused
+        out["n_refused"].append(int(refused.sum()))
         yp = state.to(torch.float64).numpy()
         yt = y_true[:, k, :]
         for lvl in below:
@@ -333,6 +343,7 @@ def _rollout_stats(model, y0_phys, g_phys, dt_seconds, y_true, *, eps: float, b_
                         + loss_def["lambda_z_mse"] * np.square(dex / loss_def["log_std"]).mean(axis=1))
             window_loss += loss_def["weights"][k] * np.where(np.isfinite(term), term, np.inf)
             window_abs_dex += loss_def["weights"][k] * np.where(np.isfinite(mae), mae, np.inf)
+    out["sources_refused"] = refused_any
     out["truth_share_below"] = {f"{lvl:g}": below[lvl] / float(N * K * S) for lvl in below}
     out["window_loss"] = window_loss / loss_def["weights"].sum()
     out["window_abs_dex"] = window_abs_dex / loss_def["weights"].sum()
@@ -405,7 +416,7 @@ def main() -> None:
     global_keys = list(manifest["global_variables"])
     eps = float(manifest["epsilon"])
     b_max = int(meta["dynamic_batch"]["max"])
-    print(f"[model] {export_path}  (CPU float32; TF32 does not apply)")
+    print(f"[model] {export_path}  (CPU float32 calls, TF32 does not apply; host state {P.HOST_DTYPE})")
     print(f"[data]  {shard_root}/{EVAL_SPLIT}  ({DATA_LABEL})")
 
     shards = sorted((shard_root / EVAL_SPLIT).glob("shard_*.npz"))
@@ -456,7 +467,7 @@ def main() -> None:
         raise ValueError(f"training.rollout_steps={loss_def['k']} exceeds the K={K} evaluated steps")
     stats = _rollout_stats(model, y0_phys, g_phys, dt_seconds, y_true, eps=eps, b_max=b_max,
                            report_idx=[s - 1 for s in report], loss_def=loss_def)
-    pstats = _rollout_stats(lambda y, _dt, _g: y, y0_phys, g_phys, dt_seconds, y_true, eps=eps, b_max=b_max,
+    pstats = _rollout_stats(lambda y, _dt, _g: torch.zeros_like(y), y0_phys, g_phys, dt_seconds, y_true, eps=eps, b_max=b_max,
                             report_idx=[s - 1 for s in report], loss_def=loss_def)
     n_kept = int(keep.sum())
     # Steady state: persistence's error stays within STEADY_STATE_MAX_DEX at every step and species.
@@ -464,7 +475,9 @@ def main() -> None:
     steady = pers_dex.max(axis=(1, 2)) <= STEADY_STATE_MAX_DEX
     strata = {"evolving": np.logical_not(steady), "steady_state": steady}
     n_steady = int(steady.sum())
-    print(f"non-finite (diverged) sources at the last step: {n_kept - stats['n_finite'][-1]}/{n_kept}")
+    print(f"non-finite sources at the last step: {n_kept - stats['n_finite'][-1]}/{n_kept}; host_step refused the "
+          f"update of {int(stats['sources_refused'].sum())}/{n_kept} sources at least once ({sum(stats['n_refused'])} "
+          "refusals; a refused row keeps its previous state)")
     print(f"definitions: values clipped at epsilon={eps:g}; dex = |log10(yp) - log10(yt)|; "
           f"frac = |yp - yt| / (|yt| + {FRAC_ERR_FLOOR:g}) (legacy, for continuity)")
     print("share of scored truth below " + ", ".join(f"{k}: {100 * v:.1f}%" for k, v in stats["truth_share_below"].items())
@@ -472,11 +485,11 @@ def main() -> None:
 
     names = [s.replace("_evolution", "") for s in species_keys]
     i90 = SPECIES_PCTLS.index(90)
-    print(f"\n{'step':>5} " + " ".join(f"frac_p{p:<2}" for p in PCTLS) + "   dex_p90  persistence_dex_p90  n_finite")
+    print(f"\n{'step':>5} " + " ".join(f"frac_p{p:<2}" for p in PCTLS) + "   dex_p90  persistence_dex_p90  n_finite  n_refused")
     for k in range(K):
         if (k + 1) in report:
             print(f"{k + 1:>5} " + " ".join(f"{v:7.1f}%" for v in stats["frac"][k])
-                  + f"   {stats['dex_p90'][k]:6.3f}  {pstats['dex_p90'][k]:19.3f}  {stats['n_finite'][k]}")
+                  + f"   {stats['dex_p90'][k]:6.3f}  {pstats['dex_p90'][k]:19.3f}  {stats['n_finite'][k]:8d}  {stats['n_refused'][k]:9d}")
     dt_w = dt_seconds[:, 0]
     dt_rule = (f"each window's own constant dt (log-uniform in [{pcfg.dt_min:g}, {pcfg.dt_max:g}] s; no fixed-dt set yet); "
                f"this selection: min {dt_w.min():.4g} s, median {np.median(dt_w):.4g} s, max {dt_w.max():.4g} s")
@@ -616,14 +629,15 @@ def main() -> None:
     split = EVAL_SPLIT
     curve = run_dir / f"rollout_error_curve_{split}.csv"
     with open(curve, "w") as f:
-        f.write("step," + ",".join(f"frac_p{p}" for p in PCTLS) + ",dex_p90,n_finite,"
+        f.write("step," + ",".join(f"frac_p{p}" for p in PCTLS) + ",dex_p90,n_finite,n_refused,"
                 + ",".join(f"dex_p90_{n}" for n in names) + ",persistence_dex_p90,"
                 + ",".join(f"persistence_dex_p90_{n}" for n in names) + "\n")
         for k in range(K):
             sp90 = stats["species_dex"][k][i90]
             pp90 = pstats["species_dex"][k][i90]
             f.write(f"{k + 1}," + ",".join(f"{v:.6f}" for v in stats["frac"][k])
-                    + f",{stats['dex_p90'][k]:.6f},{stats['n_finite'][k]}," + ",".join(f"{v:.6f}" for v in sp90)
+                    + f",{stats['dex_p90'][k]:.6f},{stats['n_finite'][k]},{stats['n_refused'][k]},"
+                    + ",".join(f"{v:.6f}" for v in sp90)
                     + f",{pstats['dex_p90'][k]:.6f}," + ",".join(f"{v:.6f}" for v in pp90) + "\n")
     long = run_dir / f"rollout_error_species_{split}.csv"
     with open(long, "w") as f:
@@ -691,7 +705,9 @@ def main() -> None:
         "gate1": gate1,
         "clip_eps": eps, "frac_err_floor": FRAC_ERR_FLOOR,
         "truth_share_below": stats["truth_share_below"],
-        "infer_dtype": str(infer_dtype), "torch": torch.__version__, "numpy": np.__version__,
+        "infer_dtype": str(infer_dtype), "host_dtype": str(P.HOST_DTYPE), "host_update": "testing/export.py host_step",
+        "host_step_refusals": {"total": sum(stats["n_refused"]), "sources": int(stats["sources_refused"].sum())},
+        "torch": torch.__version__, "numpy": np.__version__,
         "preprocessing": {k: summary.get(k) for k in ("windows_written_by_split", "groups_kept", "group_rejects", "chunk_rejects")},
         "bootstrap": {"n": EVAL_BOOTSTRAP_N, "seed": EVAL_BOOTSTRAP_SEED, "level": EVAL_CI_LEVEL,
                       "species_pctls": list(SPECIES_PCTLS), "species": names, **_bootstrap_ci(dex_at_report)},

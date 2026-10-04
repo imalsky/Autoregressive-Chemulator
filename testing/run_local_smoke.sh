@@ -17,9 +17,12 @@
 #      z + delta inside [zlo, zhi] and is the identity at dt_norm -10, on best.ckpt and on random weights
 #   6. the same stage 2 with training.loss.jump_weight 0.0 (compiled): no train_jump_loss, and weights that
 #      differ from step 5's (the jump pairs have their own generator, so both runs see the same windows)
-#   7. export of the default stage-2 run (testing/export.py: CPU + CUDA, with its parity gate); each final
-#      .pt2 reloaded: ep.module() without .eval() under inference_mode, finite in-range rows, a NaN row
-#      for an out-of-range dt, units and ranges in the metadata, and the export gate re-run against eager
+#   7. export of the default stage-2 run's last.ckpt (testing/export.py: CPU + CUDA, with its parity gate); each
+#      final .pt2 reloaded: format 1step_dlog10_dynB, metadata_version 3 and update_rule in the metadata, its
+#      .pt2.sha256 matching, and ep.module() without .eval() under inference_mode giving finite in-range rows
+#      and rows at the four box edges (P and T at their oor_box lo and hi), a NaN row for dt > dt_max, one
+#      host_step (float64 state) to finite in-box states that keeps only the NaN row, units and ranges in the
+#      metadata, and the export gate re-run against eager
 # Every training run: COMPLETED, finite train/val losses at every epoch, the expected epoch count,
 # last.ckpt at the final epoch, a ragged last validation batch (as production stage 1 has; stage 2's
 # validation set is a whole number of batches), and the
@@ -179,7 +182,8 @@ def jump_loss(work, expect):
 
 def relax_head(work, processed):
     # z + delta stays inside the box [zlo, zhi] at dt_norm 0, 0.5, 1, 2 and delta vanishes at dt_norm -10, for
-    # the weights step 7 exports (best.ckpt, its ema_state_dict when present) and for random output weights.
+    # the published best.ckpt (its ema_state_dict when present; step 7 exports last.ckpt) and for random
+    # output weights.
     sys.path[:0] = ["src"]
     import torch
     from model import create_model
@@ -252,10 +256,16 @@ def exported():
     from run_dir import resolve_run_dir
     run_dir = resolve_run_dir()
     for dev in ("cpu", "cuda"):
-        path = run_dir / f"export_{dev}_dynB_1step_phys.pt2"
+        path = run_dir / f"export_{dev}_dynB_1step_dlog10.pt2"
         extra = {"metadata.json": ""}
         ep = torch.export.load(str(path), extra_files=extra)
         meta = json.loads(extra["metadata.json"])
+        head = (meta.get("format"), meta.get("metadata_version"), meta.get("output"))
+        if head != ("1step_dlog10_dynB", 3, "dlog10_y") or not meta.get("update_rule"):
+            fail(f"{path}: metadata format/version/output {head}, update_rule {meta.get('update_rule')!r}")
+        sha = run_dir / f"{path.name}.sha256"
+        if sha.read_text() != f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n":
+            fail(f"{sha} does not match {path.name}: {sha.read_text()!r}")
         units = meta["units"]
         if (units["P"], units["T"], units["dt"]) != ("dyn/cm^2 (barye)", "K", "s") or not units.get("species"):
             fail(f"{path}: metadata units {units}")
@@ -275,18 +285,38 @@ def exported():
             cols.append(10.0 ** u if box["coordinate"] == "log10" else u)
         g = np.stack(cols, axis=1)
         dt[0] = 10.0 * meta["dt_max_seconds"]  # out of range: must come back as a NaN row
+        row = 4  # rows 4..7: one global exactly at each edge of its box; in range, so finite
+        for j, name in enumerate(meta["global_variables"]):
+            box = meta["oor_box"][name]
+            for edge in (box["lo"], box["hi"]):
+                g[row, j] = 10.0 ** edge if box["coordinate"] == "log10" else edge
+                row += 1
         bad = E.input_out_of_range_rows(y, dt, g, meta)
         if bad.tolist() != [True] + [False] * (B - 1):
             fail(f"{path}: input out-of-range rows {bad.tolist()}, expected row 0 only")
+        y_t, dt_t, g_t = (torch.as_tensor(a, dtype=torch.float32, device=dev) for a in (y, dt, g))
         with torch.inference_mode():
-            out = module(*(torch.as_tensor(a, dtype=torch.float32, device=dev) for a in (y, dt, g))).cpu().numpy()
+            out = module(y_t, dt_t, g_t).cpu().numpy()
+            y64 = torch.as_tensor(y, dtype=torch.float64, device=dev)
+            state, kept = E.host_step(module, y64, dt_t, g_t, epsilon=meta["epsilon"])
         if np.isnan(out).all(axis=1).tolist() != bad.tolist() or not np.isfinite(out[~bad]).all():
-            fail(f"{path}: NaN rows {np.isnan(out).all(axis=1).tolist()} (expected {bad.tolist()}), in-range rows finite: "
-                 f"{bool(np.isfinite(out[~bad]).all())}")
-        # The export gate on the final file: eager parity at B = 1, 7, B_MAX, B_MAX + 1 refused, NaN rows.
+            fail(f"{path}: NaN rows {np.isnan(out).all(axis=1).tolist()} (expected {bad.tolist()}), in-range rows "
+                 f"(box edges included) finite: {bool(np.isfinite(out[~bad]).all())}")
+        # host_step: the NaN row keeps its state exactly; the others move to finite states inside the box
+        # [epsilon, 1] (tolerance as relax_head's, in dex).
+        ly = torch.log10(state).cpu().numpy()
+        tol = 1e-5 * max(1.0, abs(math.log10(meta["epsilon"])))
+        in_box = (ly[~bad] >= math.log10(meta["epsilon"]) - tol).all() and (ly[~bad] <= tol).all()
+        if kept.tolist() != bad.tolist() or not torch.equal(state[0], y64[0]) or not np.isfinite(ly).all() or not in_box:
+            fail(f"{path}: host_step kept rows {kept.tolist()} (expected {bad.tolist()}), log10 y in "
+                 f"[{ly.min():.4g}, {ly.max():.4g}], in box: {bool(in_box)}")
+        # The export gate on the final file: eager parity at B = 1, 7, B_MAX, B_MAX + 1 refused, NaN rows,
+        # rows BOX_EDGE_SLACK outside every box edge admitted, a host_step round.
         _, _, verify = E.build_export(run_dir, E.CHECKPOINT, torch.device(dev), E.EXAMPLE_BATCH)
         verify(module)
-        print(f"OK {path.relative_to(run_dir.parent)}: units, ranges, NaN row for dt > dt_max, gate vs eager")
+        print(f"OK {path.relative_to(run_dir.parent)}: format {head[0]} v{head[1]}, update_rule, sha256 file, units, "
+              f"ranges, NaN row for dt > dt_max, finite rows at the 4 box edges, host_step float64 in box "
+              f"(log10 y {ly[~bad].min():.3f}..{ly[~bad].max():.3g}, kept only the NaN row), gate vs eager")
 
 
 globals()[sys.argv[1]](*sys.argv[2:])

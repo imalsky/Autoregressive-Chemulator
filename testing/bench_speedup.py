@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """ML-vs-mini-chem speed comparison for the Auto-Chem ApJ paper (diagnostic).
 
-Measures the per-cell inference latency of the run's exported 1-step flow map
-(export_{cpu,cuda}_dynB_1step_phys.pt2 in the run directory named by AUTOCHEM_CONFIG_PATH,
+Measures the per-cell inference latency of the run's exported 1-step model
+(export_{cpu,cuda}_dynB_1step_dlog10.pt2 in the run directory named by AUTOCHEM_CONFIG_PATH,
 testing/run_dir.py; each timed on its own export device, the CUDA export only when a GPU is
 visible) across batch sizes and CPU thread counts, and compares it with the IN-PROCESS mini-chem
 dlsode per-cell cost (MINICHEM_US_PER_CELL, measured separately by
-mini_chem/src_mini_chem_dlsode/bench_dlsode.f90; not part of this repo).
+mini_chem/src_mini_chem_dlsode/bench_dlsode.f90; not part of this repo). The export returns a
+per-row log10 increment; the timed call is the module alone, without the host's update of its
+state (testing/export.py host_step: a few elementwise operations per cell).
 
 Inputs are drawn inside the export's trained box (species log range, dt range, P/T box from the
 metadata; seeded), so no row is NaN-marked. ML latency does not depend on the input values (dense
@@ -46,7 +48,9 @@ MINICHEM_THREADS = 1
 # every ratio is cross-host.
 MINICHEM_HOST = "unrecorded (author to supply)"
 
-EXPORT_FILES = {"cpu": "export_cpu_dynB_1step_phys.pt2", "cuda": "export_cuda_dynB_1step_phys.pt2"}
+EXPORT_FILES = {"cpu": "export_cpu_dynB_1step_dlog10.pt2", "cuda": "export_cuda_dynB_1step_dlog10.pt2"}
+# The metadata format these files must carry (testing/export.py EXPORT_FORMAT; this script stays standalone).
+EXPORT_FORMAT = "1step_dlog10_dynB"
 WARMUP = 30            # untimed calls per batch size, after every thread-count change
 ITERS = 200            # timed calls per batch size up to ITERS_REF_BATCH ...
 ITERS_REF_BATCH = 64   # ... above it the count scales as ITERS * ITERS_REF_BATCH / B ...
@@ -69,10 +73,14 @@ def _sync(dev: str) -> None:
 
 
 def _load_export(path: Path) -> tuple[torch.nn.Module, dict]:
-    """Load one .pt2 export: (module on its export device, embedded metadata)."""
+    """Load one .pt2 export: (module on its export device, embedded metadata); refuses another format."""
     extra = {"metadata.json": ""}
     ep = torch.export.load(str(path), extra_files=extra)
-    return ep.module(), json.loads(extra["metadata.json"])
+    meta = json.loads(extra["metadata.json"])
+    if meta.get("format") != EXPORT_FORMAT:
+        raise ValueError(f"{path}: metadata format {meta.get('format')!r}, expected {EXPORT_FORMAT!r}; "
+                         "re-export the run with testing/export.py")
+    return ep.module(), meta
 
 
 def _in_box_inputs(meta: dict, B: int, dev: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

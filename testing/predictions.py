@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-Autoregressive rollout evaluation for exported 1-step physical-space models.
+Autoregressive rollout evaluation for exported 1-step models (log10-increment output).
 
 Export signature:
-    y_next_phys = model(y_phys, dt_seconds, g_phys)
+    dlog10_y = model(y_phys, dt_seconds, g_phys)
+
+Each step applies the increment to a HOST_DTYPE host state with testing/export.py host_step (the
+reference host update; a refused update keeps the row's previous state and is counted).
 
 Run (the run directory is paths.work_dir of the config, testing/run_dir.py):
     AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u testing/predictions.py
 
-The CPU export runs at full float32 (TF32 does not apply on CPU). This script imports nothing from
-src/ (standalone), so it keeps its own normalization helpers.
+The CPU export runs at full float32 (TF32 does not apply on CPU). Only host_step and the format
+string come from testing/export.py; the normalization helpers here are this script's own numpy
+inverse, independent of the export's.
 """
 
 from __future__ import annotations
@@ -35,18 +39,21 @@ from matplotlib.lines import Line2D
 
 ROOT = Path(__file__).resolve().parents[1]
 
-from run_dir import resolve_run_dir  # noqa: E402  (testing/ is this script's directory)
+import export as E  # noqa: E402  (host_step and the export format; testing/ is this script's directory)
+from run_dir import resolve_run_dir  # noqa: E402
 
 # -----------------------------------------------------------------------------
 # User-editable settings
 # -----------------------------------------------------------------------------
 
 # Model/artifact selection: the run comes from AUTOCHEM_CONFIG_PATH (testing/run_dir.py).
-MODEL_EXPORT_FILE: str = "export_cpu_dynB_1step_phys.pt2"
+MODEL_EXPORT_FILE: str = "export_cpu_dynB_1step_dlog10.pt2"
 
 # Inference settings.
 INFER_DEVICE: torch.device = torch.device("cpu")
 INFER_DTYPE: torch.dtype | None = None  # None => use export metadata dtype exactly
+# Precision of the host state the increments are applied to (the export's inputs stay float32).
+HOST_DTYPE: torch.dtype = torch.float64
 
 # Data selection. Validation: this script runs after every training (diagnostics and decisions use
 # the validation split); the test split is for the single final paper evaluation.
@@ -157,6 +164,11 @@ def _load_export_module(export_path: Path) -> Tuple[torch.nn.Module, Dict[str, A
     meta = json.loads(meta_raw)
     if not isinstance(meta, dict):
         raise TypeError("embedded metadata.json must be a JSON object")
+    if meta.get("format") != E.EXPORT_FORMAT:
+        raise ValueError(
+            f"{export_path}: metadata format {meta.get('format')!r}, expected {E.EXPORT_FORMAT!r} (a per-row "
+            "log10 increment); re-export the run with testing/export.py"
+        )
     infer_dtype = _select_infer_dtype(meta)
     model = ep.module().to(device=INFER_DEVICE, dtype=infer_dtype)
     return model, meta, infer_dtype
@@ -314,20 +326,23 @@ def _rollout(
     y0_phys: np.ndarray,
     g_phys: np.ndarray,
     dt_seconds: np.ndarray,
-    infer_dtype: torch.dtype,
-) -> np.ndarray:
+    epsilon: float,
+) -> Tuple[np.ndarray, int]:
+    """Roll the HOST_DTYPE state through host_step; returns (states [K, S], steps whose update was refused)."""
     if g_phys.shape != (len(REQUIRED_GLOBALS),):
         raise ValueError(f"g_phys must have shape ({len(REQUIRED_GLOBALS)},), got {g_phys.shape}")
 
-    y = torch.from_numpy(y0_phys.astype(np.float32, copy=False)).to(device=INFER_DEVICE, dtype=infer_dtype).unsqueeze(0)
-    g = torch.from_numpy(g_phys.astype(np.float32, copy=False)).to(device=INFER_DEVICE, dtype=infer_dtype).unsqueeze(0)
-    dt_all = torch.from_numpy(dt_seconds.astype(np.float32, copy=False)).to(device=INFER_DEVICE, dtype=infer_dtype)
+    y = torch.from_numpy(y0_phys).to(device=INFER_DEVICE, dtype=HOST_DTYPE).unsqueeze(0)
+    g = torch.from_numpy(g_phys.astype(np.float32, copy=False)).to(device=INFER_DEVICE).unsqueeze(0)
+    dt_all = torch.from_numpy(dt_seconds.astype(np.float32, copy=False)).to(device=INFER_DEVICE)
 
     preds: List[torch.Tensor] = []
+    n_refused = 0
     for k in range(int(dt_all.shape[0])):
-        y = model(y, dt_all[k : k + 1], g)
+        y, kept = E.host_step(model, y, dt_all[k : k + 1], g, epsilon=epsilon)
+        n_refused += int(kept.sum())
         preds.append(y[0].detach().cpu())
-    return torch.stack(preds, dim=0).numpy().astype(np.float64, copy=False)
+    return torch.stack(preds, dim=0).numpy().astype(np.float64, copy=False), n_refused
 
 
 def _tint(color: str) -> Tuple[float, float, float]:
@@ -499,13 +514,15 @@ def main() -> None:
     g_phys = _denormalize_globals(g_z, global_keys, manifest)
     dt_seq_seconds = _dt_norm_to_seconds(dt_seq_norm, manifest)
 
-    y_pred_phys = _rollout(
+    y_pred_phys, n_refused = _rollout(
         model,
         y0_phys=y0_phys,
         g_phys=g_phys,
         dt_seconds=dt_seq_seconds,
-        infer_dtype=infer_dtype,
+        epsilon=float(manifest["epsilon"]),
     )
+    print(f"[rollout] host state {str(HOST_DTYPE).replace('torch.', '')}; host_step refused {n_refused} of "
+          f"{ROLLOUT_STEPS} updates (the state was kept)")
     t_eval = np.cumsum(dt_seq_seconds, dtype=np.float64)
 
     run_stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")

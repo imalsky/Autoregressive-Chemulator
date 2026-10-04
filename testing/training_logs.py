@@ -16,7 +16,8 @@ Saves:
   <run_dir>/plots/loss_curves.png
 
 The legend gives the best val_loss and its epoch (the val_loss argmin over every segment, the epoch
-best.ckpt holds, which export and the stage-2 handoff use) and the last value of each curve. When the
+best.ckpt holds, which the stage-2 handoff uses; export uses the final epoch's last.ckpt) and the last
+value of each curve. When the
 training rollout horizon changes (a stage-2 curriculum), it is drawn on the right axis: train_loss is
 averaged over that horizon, val_loss always over training.rollout_steps from config.resolved.json.
 """
