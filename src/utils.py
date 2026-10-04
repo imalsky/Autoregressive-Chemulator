@@ -296,7 +296,7 @@ def non_finite_tensor_keys(state: Mapping[str, Any]) -> List[str]:
     ]
 
 
-def _fsync_dirbest_effort(directory: Path) -> None:
+def _fsync_dir_best_effort(directory: Path) -> None:
     """Best-effort fsync of a directory entry (helps durability after rename)."""
     flags = getattr(os, "O_DIRECTORY", 0)
     try:
@@ -330,7 +330,7 @@ def atomic_write_json(path: Union[str, os.PathLike], obj: Any, *, indent: int = 
 
         # Atomic on POSIX when src/dst are on same filesystem.
         os.replace(tmp, out_path)
-        _fsync_dirbest_effort(out_path.parent)
+        _fsync_dir_best_effort(out_path.parent)
 
     finally:
         # If anything failed before os.replace, clean up the temp file.
