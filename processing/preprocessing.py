@@ -136,7 +136,7 @@ log = logging.getLogger(__name__)
 _REQUIRED_GLOBALS: Tuple[str, str] = ("P", "T")
 # Physical units of the raw inputs, written to normalization.json. The raw files carry no unit
 # attributes and preprocessing applies no conversion, so these declare the VULCAN source's units
-# (re-checked 2026-10-01; species convention and helium: docs/DECISIONS.md open item 25).
+# (the species entry states the mixing-ratio convention and the helium limit).
 UNITS: Dict[str, str] = {
     "P": "dyn/cm^2 (barye)",
     "T": "K",
@@ -152,8 +152,8 @@ UNITS: Dict[str, str] = {
     ),
 }
 # Split membership: a fixed constant, not preprocessing.seed, so a sampling replicate (another
-# preprocessing.seed) keeps the same train/validation/test trajectories. 1234 is the historical
-# preprocessing.seed, so today's splits are unchanged.
+# preprocessing.seed) keeps the same train/validation/test trajectories. 1234 equals the configs'
+# preprocessing.seed, so the splits match earlier builds.
 SPLIT_SEED = 1234
 # split_for_trajectory keys on 64 bits of SHA-1, mapped to a uniform in (0, 1) as (u + 0.5) / 2**64.
 _SPLIT_HASH_BYTES = 8
@@ -168,7 +168,7 @@ SPLIT_KEY_DEFINITION = (
 _SEED_WORD_BYTES = 8
 # (T, log10 P) coverage cells, floor-based and open-ended (no fixed box: the synthetic smoke data
 # reaches log10 P = -2). 100 K x 1 dex resolves the drop_below skew (>= 144 kept groups per cell on
-# the 4-file set, audit R1-018).
+# the 4-file set).
 _COVERAGE_T_BIN_K = 100.0
 _COVERAGE_LOG10P_BIN_DEX = 1.0
 # Histograms of the written windows' log10 start time and log10 dt (floor-based, open-ended bins):
@@ -184,7 +184,7 @@ _SPECIES_SUM_QUANTILE_LEVELS: Tuple[float, ...] = (0.001, 0.01, 0.05, 0.5)
 _GIT_TIMEOUT_S = 10.0
 # Frozen raw tails (frozen_tail_cut; docs/DECISIONS.md open item 17): a repeated-state tail is cut when
 # the step into it still moves a species by more than this (dex). Species >= 1e-12 never exceed
-# 7.2e-4 dex there on the 4 raw files (audit R2-006); recheck on new data.
+# 7.2e-4 dex there on the 4 raw files; recheck on new data.
 _FROZEN_TAIL_MAX_PRECHANGE_DEX = 1e-3
 _SPLITS: Tuple[str, str, str] = ("train", "validation", "test")
 # The manifest keys that define the z-space; their canonical-JSON sha256 is the normalization

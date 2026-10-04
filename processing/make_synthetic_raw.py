@@ -5,7 +5,7 @@ Purpose: local end-to-end smoke testing of preprocessing + training configs
 (see testing/run_local_smoke.sh) on machines that do not hold the
 real raw dataset. NOT for science: species curves are smooth synthetic decays.
 
-Schema produced (the layout of the real raw files in data/raw, checked on daw 2026-09-30):
+Schema produced (the layout of the real raw files in data/raw):
   file.h5
     run_NNN_NNNN/              one group per trajectory
       t_time                   [T] float64: t = 0, then T-1 log-spaced times (the real save grid)

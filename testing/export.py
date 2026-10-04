@@ -120,11 +120,11 @@ EXPORT_PARITY_RTOL = 1e-6
 # Out-of-range rule (see the module docstring): allowed excursion outside the train-split range, as
 # a fraction of each input's normalized range; absorbs the float32 round trip at the exact edges.
 OOR_TOL = 1e-6
-# metadata_version 2 (2026-09-30): units, trained box and NaN-row policy, fingerprints and
-# provenance added; cuda_visible_devices removed. 'format' is unchanged. 2026-10-01: the additive key
-# 'dt_validity' (DT_VALIDITY) and the reworded units 'species' string (processing/preprocessing.py
-# UNITS, copied from the build's normalization.json, so a build made before 2026-10-01 still carries
-# the older wording); no key removed or changed in meaning, so the version stays 2.
+# metadata_version 2 added units, the trained box and NaN-row policy, fingerprints and provenance,
+# and removed cuda_visible_devices; 'format' is unchanged. Bump it only when a key is removed or
+# changes meaning: an added key (dt_validity) keeps the version. The units 'species' string is copied
+# from the build's normalization.json (processing/preprocessing.py UNITS), so an older build carries
+# the wording it was built with.
 METADATA_VERSION = 2
 # What the one-step export's dt input is validated for (docs/DECISIONS.md open item 21, decision (b)).
 DT_VALIDITY = (
@@ -145,7 +145,7 @@ _MONITOR_METRIC = "val_loss"
 _PARTIAL_DIR_NAME = ".partial"
 # Written by src/main.py only when a run finished; export refuses a run without it.
 _COMPLETED_NAME = "COMPLETED"
-# Manifest keys added on 2026-09-30 that the metadata copies; an older processed dir must be rebuilt.
+# Manifest keys the metadata copies; a processed dir without them must be rebuilt.
 _REQUIRED_MANIFEST_KEYS = ("units", "window_start_time_s", "coverage")
 
 
@@ -916,7 +916,7 @@ def _default_out_for(run_dir: Path, device_tag: str) -> Path:
 
 
 def _require_manifest_keys(manifest: Mapping[str, Any], path: Path) -> None:
-    """The keys the metadata copies must exist (processed dirs built before 2026-09-30 lack them)."""
+    """The keys the metadata copies must exist in the manifest."""
     missing = [k for k in _REQUIRED_MANIFEST_KEYS if k not in manifest]
     if missing:
         raise KeyError(

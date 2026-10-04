@@ -78,7 +78,7 @@ EVAL_SPLIT = "validation"
 # same shard schema and normalization (checked by norm_sha256), built by preprocessing.py: the
 # window-start replay reads its preprocessing_summary.json and the raw files it records.
 EVAL_SHARD_ROOT: str | None = None
-EVAL_N_SOURCES = 4000          # inherited (the former trajectory cap); one window per source
+EVAL_N_SOURCES = 4000          # inherited value; one window per source
 EVAL_SEED = 0                  # source and window selection
 EVAL_BOOTSTRAP_N = 1000        # resamples of the sources for the CIs
 EVAL_BOOTSTRAP_SEED = 0
@@ -97,14 +97,13 @@ TRUTH_DISCLOSURE_LEVELS = (1e-12, 1e-20)
 # (4.8e-7); a wrong statistic shows up as a much larger error.
 NORM_ROUNDTRIP_TOL_Z = 1e-5
 DATA_LABEL = "random-dt, K <= 98 (processed shards; no fixed-dt evaluation set yet)"
-# Gate 1, the stage-1 accuracy gate (PROVISIONAL, author 2026-10-01; revisit after the first trained
-# model): skill against persistence, because persistence already scores the stage-1 validation loss
-# at ~16x the old ~7e-4 threshold and its loss falls ~1000x from early to late window starts.
-# Pass, on the evolving windows only (2026-10-01; steady-state windows, where persistence is nearly
-# exact, are reported apart by absolute log10 error): overall loss <= GATE1_MAX_LOSS_RATIO x
-# persistence, and loss < persistence in every window-start decade that has evolving windows (ratio <
-# GATE1_MAX_DECADE_RATIO); the decades from GATE1_LATE_START_S on (the author's "especially") also get
-# their own line.
+# Gate 1, the stage-1 accuracy gate (PROVISIONAL; revisit after the first trained model): skill
+# against persistence, because persistence already scores a stage-1 validation loss of ~1.1e-2 and
+# its loss falls ~1000x from early to late window starts.
+# Pass, on the evolving windows only (steady-state windows, where persistence is nearly exact, are
+# reported apart by absolute log10 error): overall loss <= GATE1_MAX_LOSS_RATIO x persistence, and
+# loss < persistence in every window-start decade that has evolving windows (ratio <
+# GATE1_MAX_DECADE_RATIO); the decades from GATE1_LATE_START_S on also get their own line.
 GATE1_MAX_LOSS_RATIO = 0.5
 GATE1_MAX_DECADE_RATIO = 1.0
 GATE1_LATE_START_S = 1e3

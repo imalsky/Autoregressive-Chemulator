@@ -260,7 +260,7 @@ def smoke_ify(stage, *, work, source=None, fourier=False):
 
 cfgs = {"stage1": smoke_ify("stage1", work="stage1_work")}
 # Top-k checkpoints every 2 epochs: the extension epoch is then never a top-k save, so last.ckpt
-# holding it shows the separate last-checkpoint callback works (audit R1-036).
+# holding it shows the separate last-checkpoint callback works.
 cfgs["stage1"]["runtime"]["checkpointing"]["every_n_epochs"] = 2
 ext = copy.deepcopy(cfgs["stage1"])
 ext["training"]["checkpoint_mode"] = "resume"

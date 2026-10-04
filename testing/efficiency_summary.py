@@ -9,7 +9,7 @@ power, and the achieved TFLOP/s as a fraction of the matmul peak AT THE MEASURED
 
 Why clock-adjusted: an RTX 6000 Ada under sustained matmul load sits at its 300 W power cap and
 runs ~1.2-2.2 GHz instead of the 2505 MHz boost that datasheet peaks assume, so the datasheet number
-is not an attainable ceiling (audit efficiency study, 2026-09).
+is not an attainable ceiling.
 
 Inputs:
   run directory  paths.work_dir of AUTOCHEM_CONFIG_PATH's config (testing/run_dir.py)

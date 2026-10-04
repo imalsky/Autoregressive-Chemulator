@@ -87,7 +87,7 @@ _DEFAULT_LOSS_DISCOUNT_GAMMA = 1.0
 # Validation weights every step >= skip_steps equally, so val_loss is comparable across gamma
 # settings, not across skip_steps.
 _VAL_STEP_GAMMA = 1.0
-# ReduceLROnPlateau threshold mode (torch's default, now explicit): val_loss counts as an improvement
+# ReduceLROnPlateau threshold mode (torch's default, set explicitly): val_loss counts as an improvement
 # only when it beats the best by the relative fraction training.scheduler.threshold (1e-3 stage 1,
 # 1e-4 stage 2); `patience` epochs without one cut the LR.
 _PLATEAU_THRESHOLD_MODE = "rel"
@@ -109,7 +109,7 @@ _TRAIN_FLOPS_PER_FORWARD = 3    # forward + backward (input and weight gradients
 _BYTES_PER_GB = 1e9
 _MS_PER_S = 1e3
 _FLOPS_PER_TFLOP = 1e12
-# Float format of the per-epoch INFO line (val_loss near the former ~7e-4 stage-1 gate needs more than the
+# Float format of the per-epoch INFO line (val_loss values of order 1e-3 and below need more than the
 # 3 decimals EarlyStopping prints).
 _EPOCH_LOG_FLOAT_FMT = "%.6e"
 log = logging.getLogger(__name__)

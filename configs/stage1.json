@@ -87,8 +87,7 @@
       "logged at WARNING and recorded per file in preprocessing_summary.json.",
       "samples_per_source_trajectory=4 draws 4 (dt, t_start) chunks per source trajectory",
       "(draw 0 anchored at the first positive raw time, draws 1-3 log-uniform; dt log-uniform",
-      "in every draw) - dt-diversity per state is the load-bearing robustness ingredient found",
-      "in E2 (see docs/DECISIONS.md)."
+      "in every draw) - per-state dt diversity was the main robustness lever in early small-scale tests."
     ],
     "raw_file_patterns": [
       "*.h5",
