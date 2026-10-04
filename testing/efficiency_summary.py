@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""efficiency_summary.py - GPU-efficiency summary of one training run (the daw launcher runs it after each stage).
+"""efficiency_summary.py - GPU-efficiency summary of one training run (run_daw.sh runs it after each stage).
 
 Reads the run's per-epoch perf metrics (the perf_* columns of metrics.csv and of every
 metrics.pre_restart*.csv segment of a resumed run, merged as testing/training_logs.py merges them)
@@ -46,7 +46,7 @@ GPU_LOG_SUFFIX = "_gpu_util.csv"
 # Dense FLOPs per SM per clock of the matmul unit in use (Ada pro parts): tensor cores for TF32 and
 # BF16, CUDA cores for FP32 (128 lanes x 2 per FMA). RTX 6000 Ada: 142 SMs x 2505 MHz x 512 = 182.1
 # TFLOPS TF32 and x 1024 = 364.2 TFLOPS BF16, consistent with NVIDIA's 1,457 TFLOPS
-# FP8-with-sparsity datasheet figure (2:1 ratios). Measured on daw (2048^3 GEMM against the logged
+# FP8-with-sparsity datasheet figure (2:1 ratios). Measured on an RTX 6000 Ada (2048^3 GEMM against the logged
 # SM clock): 435 TF32, 814 BF16 and 160 FP32 FLOP per SM per clock.
 FLOP_PER_SM_PER_CLOCK = {"tf32": 512, "bf16": 1024, "fp32": 256}
 POWER_CAP_REASON_BIT = 0x4  # clocks_event_reasons: SW power cap (NVML)

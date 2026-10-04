@@ -89,9 +89,9 @@ log = logging.getLogger(__name__)
 # SIGTERMException, a SystemExit(None), which would otherwise exit 0.
 _EXIT_STATUS_SIGTERM = 128 + int(signal.SIGTERM)
 
-# Host-RAM budget for the dataset preload: daw is shared by ~22 users, so one training job may
-# take at most half of the memory the kernel reports available at startup (value pending the
-# author; MemAvailable is a snapshot on a shared host, not a guarantee).
+# Host-RAM budget for the dataset preload: on a shared host one training job may take at most half
+# of the memory the kernel reports available at startup (a provisional value; MemAvailable is a
+# snapshot on a shared host, not a guarantee).
 _PRELOAD_MAX_FRACTION_OF_MEM_AVAILABLE = 0.5
 _MEMINFO_PATH = Path("/proc/meminfo")
 _BYTES_PER_KIB = 1024
@@ -990,7 +990,7 @@ def max_rollout_steps_for_eval(tcfg: Mapping[str, Any]) -> int:
 
 
 def _mem_available_bytes() -> int:
-    """MemAvailable from /proc/meminfo, in bytes (Linux; daw is the only host)."""
+    """MemAvailable from /proc/meminfo, in bytes (Linux only)."""
     for line in _MEMINFO_PATH.read_text(encoding="utf-8").splitlines():
         if line.startswith("MemAvailable:"):
             return int(line.split()[1]) * _BYTES_PER_KIB
