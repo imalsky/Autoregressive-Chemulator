@@ -10,9 +10,12 @@
 #   4. a re-run of the finished stage 1, which src/main.py must refuse, leaving best.ckpt unchanged;
 #      then, with best.ckpt and COMPLETED deleted (a crash after the final last.ckpt), the same
 #      resume must publish both again without training: byte-identical, last.ckpt untouched
-#   5. stage 2 default recipe (AR + BPTT, compiled) from stage 1's handoff checkpoint (the file name
-#      configs/stage2.json uses, best.ckpt)
-#   6. stage 2 fallback recipe (detached + backward_per_step + gamma 0.9), eager
+#   5. stage 2 default recipe (AR + BPTT + the long-jump term, 16 pairs per batch, compiled) from stage 1's
+#      handoff checkpoint (the file name configs/stage2.json uses, best.ckpt); train_jump_loss finite and > 0
+#      every epoch (the training step refuses jump pairs that are not float64); the relaxation head keeps
+#      z + delta inside [zlo, zhi] and is the identity at dt_norm -10, on best.ckpt and on random weights
+#   6. the same stage 2 with training.loss.jump_weight 0.0 (compiled): no train_jump_loss, and weights that
+#      differ from step 5's (the jump pairs have their own generator, so both runs see the same windows)
 #   7. export of the default stage-2 run (testing/export.py: CPU + CUDA, with its parity gate); each final
 #      .pt2 reloaded: ep.module() without .eval() under inference_mode, finite in-range rows, a NaN row
 #      for an out-of-range dt, units and ranges in the metadata, and the export gate re-run against eager
@@ -21,7 +24,7 @@
 # recipe-R validation set is a whole number of batches), and the
 # compiled-function variant counts (TORCH_LOGS); a ragged-batch graph must have been compiled and
 # stage 2's forward_step may not exceed the latest compile gate's count. Stage-2 live weights must
-# differ from the handoff weights and between the two recipes.
+# differ from the handoff weights and between the runs with and without the long-jump term.
 # Scratch lives under smoke_scratch/ (gitignored; recreated on every run).
 #
 # Usage:  bash run_daw.sh smoke     (one pinned GPU and capped threads, as for training)
@@ -35,10 +38,11 @@ esac
 [ -n "${OMP_NUM_THREADS:-}" ] || { echo "ERROR: OMP_NUM_THREADS is not set; run: bash run_daw.sh smoke" >&2; exit 1; }
 
 SCRATCH="smoke_scratch"
-# Stage-2 forward_step graph variants recorded by the latest compile gate (audit T7, 2026-09-30;
-# unchanged in the T9 re-run, 2026-10-01: train/no-grad x full/ragged batch, incl. the weights_only
-# init validation); a fullgraph compile hard-fails at the 9th variant (recompile limit 8).
-GATE_S2_FORWARD_STEP_VARIANTS=4
+# Stage-2 forward_step graph variants: no-grad full and ragged batch (validation, the weights_only init
+# validation and the pushforward warmup), the two BPTT inputs (the warmup output, then a state with grad)
+# and the float64 long-jump batch (step 5; step 6 has 4); a fullgraph compile hard-fails at the 9th variant
+# (recompile limit 8).
+GATE_S2_FORWARD_STEP_VARIANTS=5
 SMOKE_TORCH_LOGS="recompiles,dynamo"  # dynamo: one "start tracing <fn>" line per compiled variant
 
 rm -rf "${SCRATCH}"
@@ -80,7 +84,7 @@ def metrics_by_epoch(work):
             for r in csv.DictReader(f):
                 if r["epoch"]:
                     row = rows.setdefault(int(r["epoch"]), {})
-                    row.update({k: float(v) for k, v in r.items() if k in ("train_loss", "val_loss") and v})
+                    row.update({k: float(v) for k, v in r.items() if k in ("train_loss", "val_loss", "train_jump_loss") and v})
     return rows
 
 
@@ -159,6 +163,53 @@ def trained(work, epochs, log, s2_limit):
     print(f"OK {work.name}: {epochs} epochs, val_loss {['%.6g' % v for v in val]}, non-improving epochs "
           f"{non_improving or 'none'}, last.ckpt epoch {last['epoch']}, validation windows {counts} "
           f"(batch {batch}), compile {'on' if tc['enabled'] else 'off'}, variants {traced or 'none'}")
+
+
+def jump_loss(work, expect):
+    # expect "on": train_jump_loss finite and > 0 in every epoch; "off": never logged (the term did not run).
+    work = Path(work)
+    vals = {e: r.get("train_jump_loss") for e, r in sorted(metrics_by_epoch(work).items())}
+    if expect == "on" and not all(v is not None and math.isfinite(v) and v > 0.0 for v in vals.values()):
+        fail(f"{work}: train_jump_loss must be finite and > 0 in every epoch, got {vals}")
+    if expect == "off" and any(v is not None for v in vals.values()):
+        fail(f"{work}: jump_weight is 0 but train_jump_loss was logged: {vals}")
+    print(f"OK {work.name}: train_jump_loss {vals if expect == 'on' else 'not logged'}")
+
+
+def relax_head(work, processed):
+    # z + delta stays inside the box [zlo, zhi] at dt_norm 0, 0.5, 1, 2 and delta vanishes at dt_norm -10, for
+    # the weights step 7 exports (best.ckpt, its ema_state_dict when present) and for random output weights.
+    sys.path[:0] = ["src"]
+    import torch
+    from model import create_model
+    work = Path(work)
+    cfg = json.loads((work / "config.resolved.json").read_text())
+    manifest = json.loads((Path(processed) / "normalization.json").read_text())
+    ckpt = torch.load(work / "checkpoints" / "best.ckpt", map_location="cpu", weights_only=True)
+    state = ckpt["ema_state_dict" if "ema_state_dict" in ckpt else "state_dict"]
+    published = create_model(cfg, manifest)
+    published.load_state_dict({k[len("model."):]: v for k, v in state.items() if k.startswith("model.")}, strict=True)
+    gen = torch.Generator().manual_seed(0)
+    rand = create_model(cfg, manifest)
+    with torch.no_grad():
+        rand.trunk.out.weight.normal_(std=1.0, generator=gen)  # the near-identity init would pass trivially
+    for label, m in (("best.ckpt", published), ("random weights", rand)):
+        m.eval()
+        B = 4096
+        z = m.zlo + (m.zhi - m.zlo) * torch.rand(B, m.S, generator=gen)
+        g = torch.rand(B, m.G, generator=gen)
+        tol = 1e-5 * max(1.0, float(torch.cat([m.zlo, m.zhi]).abs().max()))
+        with torch.no_grad():
+            for dtn in (0.0, 0.5, 1.0, 2.0):
+                zz = z + m.delta(z, torch.full((B,), dtn), g)
+                out = float(torch.maximum(m.zlo - zz, zz - m.zhi).max())
+                if out > tol:
+                    fail(f"{work} {label}: z + delta leaves the box by {out:.3e} at dt_norm {dtn}")
+            ident = float(m.delta(z, torch.full((B,), -10.0), g).abs().max())
+        if not ident < 1e-6:
+            fail(f"{work} {label}: |delta| {ident:.3e} at dt_norm -10, expected < 1e-6")
+        print(f"OK relax_head {label}: z + delta inside [zlo, zhi] at dt_norm 0/0.5/1/2, "
+              f"max |delta| {ident:.1e} at dt_norm -10")
 
 
 def continued(work, epochs):
@@ -278,8 +329,9 @@ def smoke_ify(stage, *, work, source=None):
         c["runtime"]["checkpoint"] = f"{source}/checkpoints/{HANDOFF}"
         cur = c["training"]["curriculum"]
         cur["ramp_epochs"] = 1
-        # Epoch 0 trains at least two rollout steps past the skipped ones, so the recipes differ.
+        # Epoch 0 trains at least two rollout steps past the skipped ones.
         cur["start_steps"] = c["training"]["autoregressive_training"]["skip_steps"] + 2
+        c["training"]["loss"]["jump_batch_size"] = 16
     return c
 
 
@@ -293,14 +345,9 @@ ext["runtime"]["checkpoint"] = "stage1_work/checkpoints/last.ckpt"
 ext["training"]["max_epochs"] += EXTEND_EPOCHS
 cfgs["stage1_extend"] = ext
 cfgs["stage2"] = smoke_ify("stage2", work="stage2_work", source="stage1_work")
-det = smoke_ify("stage2", work="stage2_detached_work", source="stage1_work")
-# The documented fallback recipe (DECISIONS.md): detached + gamma=0.9, eager (the one uncompiled run).
-ar = det["training"]["autoregressive_training"]
-ar["detach_between_steps"] = True
-ar["backward_per_step"] = True
-ar["loss_discount_gamma"] = 0.9
-det["runtime"]["torch_compile"]["enabled"] = False
-cfgs["stage2_detached"] = det
+nojump = smoke_ify("stage2", work="stage2_nojump_work", source="stage1_work")
+nojump["training"]["loss"]["jump_weight"] = 0.0
+cfgs["stage2_nojump"] = nojump
 for name, c in cfgs.items():
     out = scratch / f"smoke_{name}.json"
     out.write_text(json.dumps(c, indent=2))
@@ -339,15 +386,18 @@ if grep -q "epoch [0-9]*: K_train" "${SCRATCH}/logs/stage1_publish.log"; then di
 [ "$(sha256sum "${SCRATCH}/stage1_work/checkpoints/last.ckpt")" = "${last_before}" ] || die "the publish-only resume changed last.ckpt"
 echo "OK publish-only resume: best.ckpt and COMPLETED republished byte-identical, no epoch trained"
 
-echo "=== [5/7] stage 2 default recipe (AR + BPTT, compiled, handoff from stage-1 best.ckpt) ==="
+echo "=== [5/7] stage 2 default recipe (AR + BPTT + long-jump term, compiled, handoff from stage-1 best.ckpt) ==="
 train stage2
 check trained "${SCRATCH}/stage2_work" 2 "${SCRATCH}/logs/stage2.log" "${GATE_S2_FORWARD_STEP_VARIANTS}"
+check jump_loss "${SCRATCH}/stage2_work" on
+check relax_head "${SCRATCH}/stage2_work" "${SCRATCH}/processed"
 check differ "${SCRATCH}/stage2_work/checkpoints/last.ckpt" state_dict "${SCRATCH}/stage1_work/checkpoints/best.ckpt" ema_state_dict
 
-echo "=== [6/7] stage 2 fallback recipe (detached + backward_per_step + gamma 0.9, eager) ==="
-train stage2_detached
-check trained "${SCRATCH}/stage2_detached_work" 2 "${SCRATCH}/logs/stage2_detached.log" "${GATE_S2_FORWARD_STEP_VARIANTS}"
-check differ "${SCRATCH}/stage2_work/checkpoints/last.ckpt" state_dict "${SCRATCH}/stage2_detached_work/checkpoints/last.ckpt" state_dict
+echo "=== [6/7] the same stage 2 without the long-jump term (jump_weight 0.0, compiled) ==="
+train stage2_nojump
+check trained "${SCRATCH}/stage2_nojump_work" 2 "${SCRATCH}/logs/stage2_nojump.log" "${GATE_S2_FORWARD_STEP_VARIANTS}"
+check jump_loss "${SCRATCH}/stage2_nojump_work" off
+check differ "${SCRATCH}/stage2_work/checkpoints/last.ckpt" state_dict "${SCRATCH}/stage2_nojump_work/checkpoints/last.ckpt" state_dict
 
 echo "=== [7/7] export of the default stage-2 run (CPU + CUDA, gated) and reload checks ==="
 run export_stage2 "${SCRATCH}/smoke_stage2.json" testing/export.py

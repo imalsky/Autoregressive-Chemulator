@@ -16,8 +16,9 @@ Outputs, in <paths.work_dir>_profile/ beside the config's run directory (refused
   config.json           the derived config
   work/                 the 1-epoch run main.py writes (train.log, metrics.csv, COMPLETED, ...)
   profile_summary.json  timed step time, samples/s, model TFLOP/s (src/trainer.py's FLOP count:
-                        no-grad skip steps forward-only), peak memory, GPU busy fraction of the
-                        profiled steps, per-step sync/copy/launch counts, top device and CPU ops
+                        no-grad skip steps forward-only, the long-jump batch included),
+                        peak memory, GPU busy fraction of the profiled steps, per-step
+                        sync/copy/launch counts, top device and CPU ops
   profile_trace.json    Chrome trace of the profiled steps (open in ui.perfetto.dev)
 The torch.profiler key_averages table of the profiled steps is printed.
 
@@ -137,6 +138,7 @@ class _Probe(pl.Callback):
         cuda = self._cuda(pl_module)
         r = self.summary
         batch_size = int(batch["y"].shape[0])
+        # Per window sample; train_forwards_per_sample counts the long-jump pairs in it.
         flops_per_step = batch_size * pl_module.train_forwards_per_sample() * pl_module.fwd_flops_per_sample_step
         step_s = r["timed_wall_s"] / TIMED_STEPS
         r.update(

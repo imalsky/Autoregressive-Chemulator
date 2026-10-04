@@ -12,8 +12,9 @@
     "  \"detach_between_steps\": true,",
     "  \"backward_per_step\": true,",
     "  \"loss_discount_gamma\": 0.9   <- REQUIRED with detach (E3; not enforced in code)",
-    "keeping skip_steps 1 and training.curriculum 2->10. Write the nested keys: a dotted key such as",
-    "\"autoregressive_training.loss_discount_gamma\" is rejected at startup.",
+    "keeping skip_steps 1 and training.curriculum 2->10, and set training.loss.jump_weight 0.0 (the detached",
+    "rollout does not add the long-jump term; src/trainer.py refuses the pair). Write the nested keys: a",
+    "dotted key such as \"autoregressive_training.loss_discount_gamma\" is rejected at startup.",
     "docs/DECISIONS.md: per-key evidence, and the Inherited / unjustified table for values without it.",
     "Schedule: recipe R (author decision 2026-10-01; docs/DECISIONS.md): fixed step budgets, not derived from the",
     "data size. 20,000-step epochs; 1-epoch LR warmup; curriculum 2->10 over 16 epochs (K up by 1 every 2);",
@@ -158,8 +159,18 @@
     "pin_memory": true,
     "rollout_steps": 10,
     "loss": {
+      "_comment": [
+        "Long-jump term: every step adds jump_weight * HybridLoss(F(z(t), D), z(t + D)) on jump_batch_size pairs from",
+        "<processed_dir>/raw_trajectories (written by preprocessing), D log-uniform in [jump_min_seconds,",
+        "jump_max_seconds] s and t log-uniform where t + D stays inside the trajectory. D runs past dt_max (1000 s):",
+        "the relaxation head's network never sees dt."
+      ],
       "lambda_log10_mae": 1.0,
-      "lambda_z_mse": 0.25
+      "lambda_z_mse": 0.25,
+      "jump_weight": 0.2,
+      "jump_min_seconds": 0.1,
+      "jump_max_seconds": 10000000.0,
+      "jump_batch_size": 512
     },
     "optimizer": {
       "name": "adamw",

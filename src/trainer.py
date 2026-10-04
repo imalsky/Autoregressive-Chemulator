@@ -17,6 +17,13 @@ Training styles (burn-in removed):
        * detach_between_steps=True  : stop-grad between steps (no BPTT across time)
        * detach_between_steps=False : BPTT across steps [M..K-1] (but never through warmup)
 
+Long-jump term (training.loss.jump_weight > 0; one-jump or BPTT, not detached):
+- every training batch carries jump pairs (z(t), z(t + D)) from the raw-trajectory store, D log-uniform
+  in [jump_min_seconds, jump_max_seconds] (dataset.py sample_jump_pairs), and each step adds
+  jump_weight * HybridLoss(forward_step(z(t), D), z(t + D)) to its loss. D may exceed the trained dt
+  range: the relaxation head's network never sees dt. The states are float64; forward_step runs the
+  network in float32 and adds the increment in float64.
+
 Optional curriculum (training only):
 - training.curriculum ramps training rollout steps from start_steps -> end_steps
   (main.py requires end_steps == rollout_steps) over ramp_epochs.
@@ -27,6 +34,9 @@ Optional curriculum (training only):
 Logging:
 - Uses Lightning CSVLogger. All self.log(...) metrics are written to metrics.csv.
 - LearningRateMonitor logs LR automatically.
+- train_loss (and its two components) is the window loss only; with the long-jump term on,
+  train_jump_loss is the epoch mean of the unweighted jump loss, and each step optimizes
+  train_loss + jump_weight * train_jump_loss.
 - Persistence diagnostics (validation): val_persistence_loss is the val_loss definition (same
   weights, mask and windows) scored on y_next = y, the window's first state carried forward;
   val_skill = 1 - val_loss / val_persistence_loss from the two epoch means. Neither is monitored.
@@ -41,7 +51,8 @@ Logging:
     perf_train_samples_per_s  training samples (steps x batch_size) per second of training time.
     perf_train_tflops         model matmul FLOP/s over training time: a forward is
                               2*sum(in*out) over the nn.Linear layers per sample-step, a step with
-                              backward counts 3 forwards, a no-grad skip (pushforward) step 1.
+                              backward counts 3 forwards, a no-grad skip (pushforward) step 1,
+                              and the long-jump term 3 x jump_batch_size / batch_size.
     perf_peak_mem_gb          CUDA only: peak allocated memory over the epoch (training and
                               validation), 1e9 bytes.
   Epoch 0 also contains the torch.compile and CUDA-graph warm-up.
@@ -52,6 +63,8 @@ Batch contract (from dataset.py):
 - y:  [B, K_full, S]   (states in z-space)
 - dt: [B, K_full-1]    (per-transition normalized dt)
 - g:  [B, G]           (G = 2 mandatory: P, T)
+- training batches with the long-jump term on also hold jump_z0, jump_z1 [Bj, S] float64,
+  jump_dt_norm [Bj] float32 and jump_g [Bj, G] float32 (Bj = training.loss.jump_batch_size)
 
 Note on "pushforward trick":
 - skip_steps warmup runs A(u) forward without grad, and training loss is computed on later steps.
@@ -498,6 +511,15 @@ class FlowMapRolloutModule(pl.LightningModule):
             lambda_z_mse=float(loss_cfg["lambda_z_mse"]),
             loss_dtype=self.loss_dtype,
         )
+        # Long-jump term (0 = off): jump_weight * criterion(forward_step(z(t), D), z(t + D)) on the batch's
+        # jump pairs, added to every training step's loss (main.py checks the keys' ranges).
+        self.jump_weight = float(loss_cfg["jump_weight"])
+        self._jump_batch_size = int(loss_cfg["jump_batch_size"])
+        if self.jump_weight > 0.0 and self.autoregressive_training and self.ar_detach_between_steps:
+            raise ValueError(
+                "training.loss.jump_weight > 0 requires autoregressive_training.detach_between_steps=false "
+                "(the detached rollout does not add the long-jump term)"
+            )
 
         self.sched_cfg = dict(tcfg["scheduler"])
         # Peak LR of a weights_only start (the warmup target and the plateau's first LR): main.py sets
@@ -539,6 +561,8 @@ class FlowMapRolloutModule(pl.LightningModule):
         # sample count (steps x batch_size) relies on the same fact.
         self._train_loss_sum: Optional[torch.Tensor] = None
         self._train_loss_n = 0
+        # Per-epoch device sum of the unweighted long-jump loss (one term per training step; None when off).
+        self._train_jump_sum: Optional[torch.Tensor] = None
         # The latest epoch's val_loss (a float), stored in every checkpoint (CKPT_EPOCH_VAL_LOSS_KEY).
         self._epoch_val_loss: Optional[float] = None
         # runtime.log_grad_norm: per-epoch device sum of [pre-clip total grad norm, clip fired] over
@@ -582,17 +606,21 @@ class FlowMapRolloutModule(pl.LightningModule):
         weights += ", train_loss is the epoch mean at each batch's live weights"
         dropout = float(self.hparams["model"]["dropout"])
         dropout_note = f"; dropout ({dropout}) is active only in training" if dropout > 0.0 else ""
+        jump_note = (
+            f"; the optimized loss is train_loss + {self.jump_weight:g} x train_jump_loss (the long-jump term, "
+            "logged separately)" if self.jump_weight > 0.0 else ""
+        )
         if self.autoregressive_training:
             msg = (
                 "train_loss is the autoregressive rollout loss over the curriculum horizon "
                 "(train_rollout_steps) with per-step weights gamma^(k-skip); val_loss is the open-loop "
                 "rollout over rollout_steps with uniform weights. They also differ in weights "
-                f"({weights}) and data (training vs validation windows){dropout_note}."
+                f"({weights}) and data (training vs validation windows){dropout_note}{jump_note}."
             )
         else:
             msg = (
                 "train_loss and val_loss are the same one-step loss; they differ in weights "
-                f"({weights}) and data (training vs validation windows){dropout_note}."
+                f"({weights}) and data (training vs validation windows){dropout_note}{jump_note}."
             )
         log.info(msg)
 
@@ -627,6 +655,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         self._epoch_t0 = time.perf_counter()
         self._train_loss_sum = None
         self._train_loss_n = 0
+        self._train_jump_sum = None
         self._grad_stats_sum = None
         self._grad_stats_n = 0
 
@@ -637,14 +666,18 @@ class FlowMapRolloutModule(pl.LightningModule):
         self._sync_device()
         self._val_t0 = time.perf_counter()
 
-    def train_forwards_per_sample(self) -> int:
+    def train_forwards_per_sample(self) -> float:
         """Forward-equivalents per training sample of this epoch's steps (after its first step).
 
         A trained step (forward + backward) counts _TRAIN_FLOPS_PER_FORWARD, a no-grad skip step
-        (pushforward warmup) 1; one-jump training is one trained step.
+        (pushforward warmup) 1; one-jump training is one trained step. The long-jump term adds one
+        trained step on jump_batch_size pairs per batch_size samples.
         """
         k, skip = (self._epoch_k_train, self.ar_skip_steps) if self.autoregressive_training else (1, 0)
-        return skip + _TRAIN_FLOPS_PER_FORWARD * (k - skip)
+        forwards = skip + _TRAIN_FLOPS_PER_FORWARD * (k - skip)
+        if self.jump_weight > 0.0:
+            forwards += _TRAIN_FLOPS_PER_FORWARD * self._jump_batch_size / int(self.hparams["training"]["batch_size"])
+        return forwards
 
     def _log_epoch_perf(self) -> float:
         """Log epoch_time_sec and the perf_* metrics (module docstring); return epoch_time_sec."""
@@ -705,8 +738,11 @@ class FlowMapRolloutModule(pl.LightningModule):
             self.log("train_loss", m[0], on_step=False, on_epoch=True, prog_bar=True)
             self.log("train_loss_log10_mae", m[1], on_step=False, on_epoch=True)
             self.log("train_loss_z_mse", m[2], on_step=False, on_epoch=True)
+            if self._train_jump_sum is not None:
+                jump = self._train_jump_sum / self._train_jump_sum.new_full((), float(self._train_loss_n))
+                self.log("train_jump_loss", jump, on_step=False, on_epoch=True)
             train_loss = float(m[0])
-            self._train_loss_sum, self._train_loss_n = None, 0
+            self._train_loss_sum, self._train_jump_sum, self._train_loss_n = None, None, 0
         if self._grad_stats_n > 0:
             g = self._grad_stats_sum / self._grad_stats_sum.new_full((), float(self._grad_stats_n))
             self.log("grad_norm", g[0], on_step=False, on_epoch=True)
@@ -902,8 +938,27 @@ class FlowMapRolloutModule(pl.LightningModule):
     # Training / eval
     # ------------------------
 
+    def _jump_term(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        """Unweighted long-jump loss: criterion(forward_step(z(t), D), z(t + D)) on the batch's jump pairs.
+
+        The pair states stay float64 (_cast_batch_tensors never sees them): forward_step runs the network
+        in float32 and adds the increment in float64. dt_norm and g go in as the stream made them (float32;
+        dt_norm unclamped). The term's device sum is kept for train_jump_loss.
+        """
+        z0, z1 = batch["jump_z0"], batch["jump_z1"]
+        if z0.dtype != torch.float64 or z1.dtype != torch.float64:
+            raise TypeError(f"jump_z0/jump_z1 must be float64 in the training step, got {z0.dtype}/{z1.dtype}")
+        pred = self._forward_step(z0, batch["jump_dt_norm"], batch["jump_g"])
+        loss = self.criterion(pred.unsqueeze(1), z1.unsqueeze(1), step_weights=None)["loss_total"]
+        s = loss.detach().to(torch.promote_types(loss.dtype, torch.float32))
+        self._train_jump_sum = s if self._train_jump_sum is None else self._train_jump_sum + s
+        return loss
+
     def _training_step_one_jump(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
-        """One-jump training: single transition y0 -> y1, loss on that one step (automatic optimization)."""
+        """One-jump training: single transition y0 -> y1, loss on that one step (automatic optimization).
+
+        With training.loss.jump_weight > 0 the returned (optimized) loss adds jump_weight x _jump_term.
+        """
         y = batch["y"]
         dt = batch["dt"]
         g = batch["g"]
@@ -929,6 +984,8 @@ class FlowMapRolloutModule(pl.LightningModule):
         self._train_loss_sum = s if self._train_loss_sum is None else self._train_loss_sum + s
         self._train_loss_n += 1
 
+        if self.jump_weight > 0.0:
+            return losses["loss_total"] + self.jump_weight * self._jump_term(batch)
         return losses["loss_total"]
 
 
@@ -938,6 +995,8 @@ class FlowMapRolloutModule(pl.LightningModule):
         Runs skip_steps warmup under no_grad (pushforward), then trains steps [skip..k_train) either
         with stop-grad-per-step (detached) or full BPTT, applying the gamma^(k-skip) per-step weights.
         Curriculum sets k_train per epoch. Handles its own backward/step via _maybe_step_optimizer.
+        With training.loss.jump_weight > 0 the BPTT branch backpropagates the rollout loss plus
+        jump_weight x _jump_term; the returned loss is the rollout loss only.
         """
         y = batch["y"]
         dt = batch["dt"]
@@ -1026,7 +1085,10 @@ class FlowMapRolloutModule(pl.LightningModule):
             loss_log10_mae = losses["loss_log10_mae"].detach()
             loss_z_mse = losses["loss_z_mse"].detach()
 
-            self.manual_backward(loss_total)
+            if self.jump_weight > 0.0:
+                self.manual_backward(loss_total + self.jump_weight * self._jump_term(batch))
+            else:
+                self.manual_backward(loss_total)
             self._maybe_step_optimizer(opt)
 
         s = torch.stack([loss_total.detach(), loss_log10_mae.detach(), loss_z_mse.detach()])
@@ -1099,6 +1161,13 @@ class FlowMapRolloutModule(pl.LightningModule):
                 f"training loss is non-finite in epoch {self.current_epoch} (sum of [loss_total, "
                 f"loss_log10_mae, loss_z_mse] over its {self._train_loss_n} steps = "
                 f"{self._train_loss_sum.tolist()}; global_step {self.global_step}): training diverged; "
+                "caught at the end of the epoch, not at the step; aborting before this epoch's "
+                "checkpoint is written."
+            )
+        if self._train_jump_sum is not None and not bool(torch.isfinite(self._train_jump_sum)):
+            raise FloatingPointError(
+                f"long-jump loss is non-finite in epoch {self.current_epoch} (sum over its {self._train_loss_n} "
+                f"steps = {self._train_jump_sum.item()}; global_step {self.global_step}): training diverged; "
                 "caught at the end of the epoch, not at the step; aborting before this epoch's "
                 "checkpoint is written."
             )

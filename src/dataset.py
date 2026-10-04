@@ -37,12 +37,24 @@ Two vectorized single-process streams wrap it and yield pre-batched tensors:
     }
 - create_train_dataloader(): a fixed number of batches per epoch, each B windows drawn
   uniformly at random WITH replacement (a window is a trajectory and a start index), from a
-  generator reseeded per epoch.
+  generator reseeded per epoch. With a JumpSampler, every batch also carries long-jump pairs
+  drawn from the raw-trajectory store by a second generator, so the windows are the same with
+  and without them:
+    {
+        "jump_z0":      [Bj, S] float64,  # z at a time t
+        "jump_z1":      [Bj, S] float64,  # z at t + D
+        "jump_dt_norm": [Bj]    float32,  # D normalized like dt, not clamped (may exceed 1)
+        "jump_g":       [Bj, G] float32,
+    }
 - create_val_dataloader(): a fixed window set, defined by the data and one count only: the
   N_val * n_starts (trajectory, start) windows are enumerated by index and an even subset of
   n_windows of them (all when n_windows >= N_val * n_starts) is scored in index order. No
   generator is involved, so the scored windows do not depend on the seed, the batch size, the
   epoch, a resume or the preload device.
+
+The raw-trajectory store (<processed_dir>/raw_trajectories/, written by processing/preprocessing.py:
+every kept train trajectory on its full raw time grid as log10 y in float64) is loaded whole onto
+the preload device by RawTrajectories; raw_store_nbytes() gives its size from the .npy headers.
 
 There is no loading path for data larger than RAM. np.load cannot memory-map
 .npz members, but because the members are stored uncompressed they can be opened
@@ -54,7 +66,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterator, List, Tuple, Union
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 
 import zipfile
 from numpy.lib import format as npy_format
@@ -70,8 +82,15 @@ _STORAGE_DTYPE = torch.float32
 # resumed run draws the same batches as an uninterrupted one (the id keeps it apart from any
 # other stream derived from the same seed).
 _TRAIN_STREAM_ID = 0
+# The long-jump pairs reseed their own generator every epoch from SeedSequence([seed, _JUMP_STREAM_ID,
+# epoch]): resume-safe, and the window draws do not depend on whether pairs are drawn.
+_JUMP_STREAM_ID = 1
 # Largest int64 + 1: the validation window index k * total must stay below it.
 _INT64_LIMIT = 2**63
+# The raw-trajectory store under processed_dir (processing/preprocessing.py writes it).
+_RAW_STORE_DIR = "raw_trajectories"
+_RAW_STORE_FILE = "train.npz"
+_RAW_STORE_GRID = "t_grid.npy"
 
 
 # -----------------------------------------------------------------------------
@@ -159,6 +178,24 @@ def preload_nbytes(processed_dir: Union[str, Path], split: str) -> Tuple[int, in
     shards, T, S, G = _scan_shards(split_dir)
     n = int(sum(si.n for si in shards))
     return n, n * (T * S + (T - 1) + G) * _STORAGE_DTYPE.itemsize
+
+
+def raw_store_path(processed_dir: Union[str, Path]) -> Path:
+    """The raw-trajectory store's array file, <processed_dir>/raw_trajectories/train.npz."""
+    return Path(processed_dir).expanduser().resolve() / _RAW_STORE_DIR / _RAW_STORE_FILE
+
+
+def raw_store_nbytes(processed_dir: Union[str, Path]) -> Tuple[int, int]:
+    """(trajectories, bytes) that RawTrajectories allocates, from the .npy headers alone:
+    logy [N,T,S] float64 + end [N] int64 + globals [N,G] float32."""
+    path = raw_store_path(processed_dir)
+    logy_shape, _ = _npz_read_array_header(path, key="logy")
+    g_shape, _ = _npz_read_array_header(path, key="globals")
+    if len(logy_shape) != 3 or len(g_shape) != 2:
+        raise ValueError(f"{path}: logy must be [N,T,S] and globals [N,G], got {logy_shape} and {g_shape}")
+    n, t, s = logy_shape
+    nbytes = n * (t * s * torch.float64.itemsize + torch.int64.itemsize + g_shape[1] * torch.float32.itemsize)
+    return n, nbytes
 
 
 class FlowMapRolloutDataset:
@@ -250,6 +287,125 @@ class FlowMapRolloutDataset:
         self._preloaded_all = (y_all, g_all, dt_all)
 
 
+class RawTrajectories:
+    """The raw-trajectory store, loaded whole onto `device`: the source of the long-jump pairs.
+
+    logy [N, T, S] float64 (log10 y on the raw time grid t [T], seconds), end [N] int64 (last valid
+    row), g [N, G] float32 (globals normalized as in the shards), and the manifest's mu, sd (float64)
+    and dt normalization range. logy_at interpolates log10 y linearly in log10 t between raw rows
+    1..end: on the production grid row 0 is t = 0, which has no log time, so row 0 is never read.
+    """
+
+    def __init__(
+        self,
+        processed_dir: Union[str, Path],
+        *,
+        normalization_manifest: Mapping[str, Any],
+        species_variables: Sequence[str],
+        device: torch.device,
+    ) -> None:
+        path = raw_store_path(processed_dir)
+        with np.load(path, allow_pickle=False) as z:
+            logy, end, g = z["logy"], z["end"], z["globals"]
+        t = np.load(path.parent / _RAW_STORE_GRID, allow_pickle=False)
+
+        dtypes = (logy.dtype, end.dtype, g.dtype, t.dtype)
+        if dtypes != (np.float64, np.int16, np.float32, np.float64):
+            raise ValueError(
+                f"{path}: logy, end, globals and {_RAW_STORE_GRID} must be float64, int16, float32, float64, "
+                f"got {dtypes}; regenerate it with processing/preprocessing.py"
+            )
+        n, S = (int(end.shape[0]) if end.ndim == 1 else 0), len(species_variables)
+        if n < 1 or t.ndim != 1 or logy.shape != (n, t.shape[0], S) or g.ndim != 2 or g.shape[0] != n:
+            raise ValueError(
+                f"{path}: expected logy [N, T, {S}], end [N], globals [N, G] and a [T] time grid with N >= 1, got "
+                f"{logy.shape}, {end.shape}, {g.shape}, {t.shape}"
+            )
+        # logy_at needs log10 t increasing over rows 1..T-1 and at least two valid rows (1 and 2).
+        if not (t.shape[0] >= 3 and t[1] > 0.0 and np.all(np.diff(t[1:]) > 0.0)):
+            raise ValueError(f"{path.parent / _RAW_STORE_GRID}: rows 1..T-1 must be positive and increasing")
+        if int(end.min()) < 2 or int(end.max()) > t.shape[0] - 1:
+            raise ValueError(f"{path}: end rows {int(end.min())}..{int(end.max())} outside 2..{t.shape[0] - 1}")
+
+        stats = normalization_manifest["per_key_stats"]
+        self.n = n
+        self.device = device
+        self.logy = torch.from_numpy(logy).to(device)
+        self.end = torch.from_numpy(end.astype(np.int64)).to(device)
+        self.g = torch.from_numpy(g).to(device)
+        self.t = torch.from_numpy(t).to(device)
+        self.logt = torch.log10(self.t[1:])  # positive rows 1..T-1
+        self.mu = torch.tensor([stats[s]["log_mean"] for s in species_variables], dtype=torch.float64, device=device)
+        self.sd = torch.tensor([stats[s]["log_std"] for s in species_variables], dtype=torch.float64, device=device)
+        self.dt_log10_min = float(normalization_manifest["dt"]["log_min"])
+        self.dt_log10_max = float(normalization_manifest["dt"]["log_max"])
+
+    def logy_at(self, idx: torch.Tensor, times: torch.Tensor) -> torch.Tensor:
+        """Log-log interpolant: idx [B], times [B, M] (s, float64) -> log10 y [B, M, S] float64.
+
+        Times past a trajectory's end row are held at that row's value (w is clamped to [0, 1]).
+        """
+        lt = torch.log10(times)
+        n_valid = self.end[idx]                       # valid rows are 1..end (n_valid of them)
+        j = torch.searchsorted(self.logt.expand(lt.shape[0], -1).contiguous(), lt.contiguous(), side="left")
+        j = torch.minimum(torch.clamp(j, min=1), (n_valid - 1).reshape(-1, 1))
+        i0 = j            # valid index j-1 -> raw row j
+        i1 = j + 1        # valid index j   -> raw row j+1
+        t0 = self.logt[j - 1]
+        t1 = self.logt[j]
+        w = ((lt - t0) / (t1 - t0)).clamp(0.0, 1.0)
+        b = idx.reshape(-1, 1).expand_as(j)
+        y0 = self.logy[b, i0]
+        y1 = self.logy[b, i1]
+        return (1.0 - w).unsqueeze(-1) * y0 + w.unsqueeze(-1) * y1
+
+    def z_of(self, logy: torch.Tensor) -> torch.Tensor:
+        """log10 y -> z (float64)."""
+        return (logy - self.mu) / self.sd
+
+
+def sample_jump_pairs(
+    raw: RawTrajectories,
+    B: int,
+    generator: torch.Generator,
+    d_min: float,
+    d_max: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """B pairs (z(t), z(t + D)) with D log-uniform in [d_min, d_max] s and t log-uniform in [t[1], t_end - D].
+
+    About 2B candidates are drawn and the ones that do not fit are moved to the end by a stable
+    sort; the first B are kept. The draws come from the CPU `generator` and are moved to raw.device,
+    so the pairs do not depend on the device. Returns z0, z1 [B, S] float64, the dt_norm of D [B]
+    float32, not clamped (it exceeds 1 for D > dt_max; the relaxation head's network never sees
+    dt), and g [B, G] float32.
+    """
+    dev = raw.device
+    m = 2 * B + 256
+    idx = torch.randint(0, raw.n, (m,), generator=generator).to(dev)
+    lD = np.log10(d_min) + (np.log10(d_max) - np.log10(d_min)) * torch.rand(m, generator=generator, dtype=torch.float64).to(dev)
+    Dt = torch.pow(10.0, lD)
+    t_lo = raw.t[1]
+    t_hi = raw.t[raw.end[idx]] - Dt
+    ok = t_hi > t_lo
+    u = torch.rand(m, generator=generator, dtype=torch.float64).to(dev)
+    lo, hi = torch.log10(t_lo), torch.log10(torch.clamp(t_hi, min=t_lo * (1 + 1e-12)))
+    t0 = torch.pow(10.0, lo + u * (hi - lo))
+    order = torch.sort(torch.logical_not(ok).to(torch.int8), stable=True).indices[:B]
+    idx, t0, Dt = idx[order], t0[order], Dt[order]
+    zz = raw.z_of(raw.logy_at(idx, torch.stack([t0, t0 + Dt], 1)))
+    dtn = ((torch.log10(Dt) - raw.dt_log10_min) / (raw.dt_log10_max - raw.dt_log10_min)).float()
+    return zz[:, 0], zz[:, 1], dtn, raw.g[idx]
+
+
+@dataclass(frozen=True)
+class JumpSampler:
+    """Long-jump pairs added to every training batch: batch_size pairs from `raw`, D in [min_seconds, max_seconds]."""
+    raw: RawTrajectories
+    batch_size: int
+    min_seconds: float
+    max_seconds: float
+
+
 class _PreloadedWindowStream(IterableDataset):
     """Shared part of the two batch streams: views of the preload buffers and the window gather.
 
@@ -305,7 +461,9 @@ class _PreloadedStochasticBatchStream(_PreloadedWindowStream):
     random with replacement (SGD-style) from a CPU generator.
 
     The generator is reseeded at the start of every epoch from the base seed and the epoch set by
-    set_epoch(), so epoch e draws the same windows whether or not the run was resumed.
+    set_epoch(), so epoch e draws the same windows whether or not the run was resumed. With a
+    JumpSampler, each batch also gets jump.batch_size long-jump pairs (sample_jump_pairs) from a
+    second CPU generator, reseeded the same way under its own stream id.
     """
 
     def __init__(
@@ -315,14 +473,19 @@ class _PreloadedStochasticBatchStream(_PreloadedWindowStream):
         batch_size: int,
         batches_per_epoch: int,
         seed: int,
+        jump: Optional[JumpSampler],
     ) -> None:
         super().__init__(base, batch_size=batch_size)
         if batches_per_epoch <= 0:
             raise ValueError(f"batches_per_epoch must be positive, got {batches_per_epoch}")
+        if jump is not None and jump.batch_size <= 0:
+            raise ValueError(f"jump batch_size must be positive, got {jump.batch_size}")
         self.batches_per_epoch = int(batches_per_epoch)
         self._seed = int(seed)
         self._epoch = 0
         self._generator = torch.Generator(device="cpu")
+        self._jump = jump
+        self._jump_generator = torch.Generator(device="cpu")
 
     def set_epoch(self, epoch: int) -> None:
         """Select the epoch whose windows the next iteration draws."""
@@ -336,6 +499,10 @@ class _PreloadedStochasticBatchStream(_PreloadedWindowStream):
         # on_train_epoch_start has called set_epoch (Lightning builds the iterator earlier).
         state = np.random.SeedSequence([self._seed, _TRAIN_STREAM_ID, self._epoch]).generate_state(1, dtype=np.uint64)
         self._generator.manual_seed(int(state[0]))
+        jump = self._jump
+        if jump is not None:
+            state = np.random.SeedSequence([self._seed, _JUMP_STREAM_ID, self._epoch]).generate_state(1, dtype=np.uint64)
+            self._jump_generator.manual_seed(int(state[0]))
 
         B = self.batch_size
         for _ in range(self.batches_per_epoch):
@@ -347,7 +514,13 @@ class _PreloadedStochasticBatchStream(_PreloadedWindowStream):
                 generator=self._generator,
                 dtype=torch.long,
             ).to(self.device)
-            yield self._gather(traj, start)
+            batch = self._gather(traj, start)
+            if jump is not None:
+                z0, z1, dtn, g = sample_jump_pairs(
+                    jump.raw, jump.batch_size, self._jump_generator, jump.min_seconds, jump.max_seconds
+                )
+                batch.update(jump_z0=z0, jump_z1=z1, jump_dt_norm=dtn, jump_g=g)
+            yield batch
 
 
 class _PreloadedValidationStream(_PreloadedWindowStream):
@@ -406,10 +579,12 @@ def create_train_dataloader(
     batches_per_epoch: int,
     seed: int,
     pin_memory: bool,
+    jump: Optional[JumpSampler],
 ) -> DataLoader:
-    """Training loader: `batches_per_epoch` full random batches per epoch (see the stream class)."""
+    """Training loader: `batches_per_epoch` full random batches per epoch, plus long-jump pairs
+    when `jump` is given (see the stream class)."""
     stream = _PreloadedStochasticBatchStream(
-        dataset, batch_size=batch_size, batches_per_epoch=batches_per_epoch, seed=seed
+        dataset, batch_size=batch_size, batches_per_epoch=batches_per_epoch, seed=seed, jump=jump
     )
     return _wrap_stream(stream, pin_memory=pin_memory)
 

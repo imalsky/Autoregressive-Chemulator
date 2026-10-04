@@ -18,7 +18,8 @@ This script:
    contents (fresh: empty or only train.log; resume: the run it continues) and opens
    work_dir/train.log. A resume from the final checkpoint of a run that died before publishing
    publishes best.ckpt and COMPLETED from it and exits 0, without training.
-5) Builds datasets/dataloaders sized for the rollouts actually used (memory budget first).
+5) Builds datasets/dataloaders sized for the rollouts actually used (memory budget first), with
+   the raw-trajectory store when the long-jump term is on.
 6) Runs Lightning training using explicit checkpoint behavior.
 
 Notes:
@@ -50,7 +51,16 @@ from lightning.pytorch import seed_everything
 from lightning.pytorch.callbacks.early_stopping import EarlyStoppingReason
 from lightning.pytorch.utilities.exceptions import SIGTERMException
 
-from dataset import FlowMapRolloutDataset, create_train_dataloader, create_val_dataloader, preload_nbytes
+from dataset import (
+    FlowMapRolloutDataset,
+    JumpSampler,
+    RawTrajectories,
+    create_train_dataloader,
+    create_val_dataloader,
+    preload_nbytes,
+    raw_store_nbytes,
+    raw_store_path,
+)
 from model import _REQUIRED_GLOBALS, create_model
 from trainer import (
     _MONITOR_METRIC,
@@ -233,6 +243,11 @@ _REQUIRED_CONFIG_KEYS: Tuple[str, ...] = (
     "training.rollout_steps",
     "training.loss.lambda_log10_mae",
     "training.loss.lambda_z_mse",
+    # Long-jump term (trainer.py; 0 = off): weight, the D range in seconds and the pairs per batch.
+    "training.loss.jump_weight",
+    "training.loss.jump_min_seconds",
+    "training.loss.jump_max_seconds",
+    "training.loss.jump_batch_size",
     "training.optimizer.name",
     "training.optimizer.lr",
     "training.optimizer.weight_decay",
@@ -302,6 +317,10 @@ _CONFIG_KEY_KINDS: Dict[str, str] = {
     "training.curriculum.ramp_epochs": "int",
     "training.loss.lambda_log10_mae": "float",
     "training.loss.lambda_z_mse": "float",
+    "training.loss.jump_weight": "float",
+    "training.loss.jump_min_seconds": "float",
+    "training.loss.jump_max_seconds": "float",
+    "training.loss.jump_batch_size": "int",
     "training.optimizer.name": "str",
     "training.optimizer.lr": "float",
     "training.optimizer.weight_decay": "float",
@@ -518,6 +537,12 @@ def _validate_value_ranges(cfg: Mapping[str, Any]) -> None:
     if opt["fused"] and opt["foreach"]:
         raise ValueError("training.optimizer.fused and training.optimizer.foreach cannot both be true")
 
+    loss = tcfg["loss"]
+    if not loss["jump_weight"] >= 0:
+        raise ValueError(f"training.loss.jump_weight must be >= 0 (0 = no long-jump term), got {loss['jump_weight']}")
+    if loss["jump_batch_size"] < 1:
+        raise ValueError(f"training.loss.jump_batch_size must be >= 1, got {loss['jump_batch_size']}")
+
     sched = tcfg["scheduler"]
     if sched["warmup_epochs"] < 0:
         raise ValueError(f"training.scheduler.warmup_epochs must be >= 0, got {sched['warmup_epochs']}")
@@ -530,7 +555,7 @@ def _validate_value_ranges(cfg: Mapping[str, Any]) -> None:
 
 
 def _validate_cross_key_constraints(cfg: Mapping[str, Any]) -> None:
-    """Curriculum, rollout and checkpointing rules that span several keys (kinds already checked)."""
+    """Curriculum, rollout, long-jump range and checkpointing rules that span several keys (kinds already checked)."""
     tcfg = require_dict(cfg, "training")
     rollout = tcfg["rollout_steps"]
     max_epochs = tcfg["max_epochs"]
@@ -560,6 +585,14 @@ def _validate_cross_key_constraints(cfg: Mapping[str, Any]) -> None:
                 f"training.autoregressive_training.skip_steps ({skip}) must be >= 0 and < the epoch-0 "
                 f"training horizon K={k_min} ({horizon}rollout_steps={rollout})"
             )
+
+    loss = tcfg["loss"]
+    d_min, d_max = loss["jump_min_seconds"], loss["jump_max_seconds"]
+    if not 0 < d_min < d_max:
+        raise ValueError(
+            "training.loss requires 0 < jump_min_seconds < jump_max_seconds, "
+            f"got jump_min_seconds={d_min}, jump_max_seconds={d_max}"
+        )
 
     ckpt = require_dict(require_dict(cfg, "runtime"), "checkpointing")
     if ckpt["enabled"]:
@@ -882,6 +915,25 @@ def _check_build_matches_config(
     _check_raw_files(cfg, raw_files, fresh=fresh)
 
 
+def _check_raw_store(processed_dir: Path) -> None:
+    """The long-jump term's raw-trajectory store must exist and hold one row per kept train trajectory
+    (preprocessing_summary.json groups_kept_by_split.train); read from the .npy headers only."""
+    path = raw_store_path(processed_dir)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"training.loss.jump_weight > 0 needs the raw-trajectory store {path} (processing/preprocessing.py "
+            "writes it); rebuild paths.processed_dir"
+        )
+    n, _ = raw_store_nbytes(processed_dir)
+    by_split = load_json_config(processed_dir / _SUMMARY_NAME).get("groups_kept_by_split")
+    kept = by_split.get("train") if isinstance(by_split, Mapping) else None
+    if n != kept:
+        raise ValueError(
+            f"{path} holds {n} trajectories, but {processed_dir / _SUMMARY_NAME} records groups_kept_by_split.train "
+            f"= {kept!r}; rebuild paths.processed_dir"
+        )
+
+
 def load_manifest_and_validate_config(
     cfg: Mapping[str, Any],
     processed_dir: Path,
@@ -894,6 +946,7 @@ def load_manifest_and_validate_config(
     and hold valid statistics (named errors); preprocessing_summary.json must record a build from
     this config's preprocessing/normalization/data blocks (except overwrite and num_workers) and
     raw files that still match raw_dir (`fresh`: a checkpoint_mode='none' run, see _check_raw_files).
+    With training.loss.jump_weight > 0 the raw-trajectory store must match the build (_check_raw_store).
     """
     mpath = processed_dir / "normalization.json"
     if not mpath.exists():
@@ -937,6 +990,8 @@ def load_manifest_and_validate_config(
 
     _validate_manifest_schema(manifest, mpath, list(cfg_species), list(cfg_globals))
     _check_build_matches_config(cfg, processed_dir, manifest_sha256=normalization_sha256(manifest), fresh=fresh)
+    if require_dotted(cfg, "training.loss.jump_weight") > 0:
+        _check_raw_store(processed_dir)
 
     return manifest, list(cfg_species), list(cfg_globals)
 
@@ -989,10 +1044,11 @@ def _mem_available_bytes() -> int:
     raise RuntimeError(f"MemAvailable not found in {_MEMINFO_PATH}")
 
 
-def _check_preload_budget(processed_dir: Path, preload_device: torch.device) -> None:
+def _check_preload_budget(processed_dir: Path, preload_device: torch.device, *, raw_store: bool) -> None:
     """Log the train+validation preload size (shard headers only) and refuse an oversize CPU preload.
 
-    Runs before either split is loaded: host allocation is lazy, so an oversize preload would
+    `raw_store`: the raw-trajectory store (long-jump term) is preloaded too and counts in the budget.
+    Runs before anything is loaded: host allocation is lazy, so an oversize preload would
     otherwise be OOM-killed midway through filling. A CUDA preload fails at allocation with the
     byte count, so only the host-RAM case is checked.
     """
@@ -1001,17 +1057,23 @@ def _check_preload_budget(processed_dir: Path, preload_device: torch.device) -> 
         n_traj, nbytes = preload_nbytes(processed_dir, split)
         log.info("preload %s: %d trajectories, %.3f GB", split, n_traj, nbytes / _BYTES_PER_GB)
         need += nbytes
+    what = "train+validation"
+    if raw_store:
+        n_traj, nbytes = raw_store_nbytes(processed_dir)
+        log.info("preload raw-trajectory store: %d trajectories, %.3f GB", n_traj, nbytes / _BYTES_PER_GB)
+        need += nbytes
+        what += "+raw-trajectory store"
     if preload_device.type != "cpu":
         return
     avail = _mem_available_bytes()
     cap = _PRELOAD_MAX_FRACTION_OF_MEM_AVAILABLE * avail
     log.info(
-        "preload train+validation: %.3f GB (cap %.3f GB = %.2f x MemAvailable %.3f GB)",
-        need / _BYTES_PER_GB, cap / _BYTES_PER_GB, _PRELOAD_MAX_FRACTION_OF_MEM_AVAILABLE, avail / _BYTES_PER_GB,
+        "preload %s: %.3f GB (cap %.3f GB = %.2f x MemAvailable %.3f GB)",
+        what, need / _BYTES_PER_GB, cap / _BYTES_PER_GB, _PRELOAD_MAX_FRACTION_OF_MEM_AVAILABLE, avail / _BYTES_PER_GB,
     )
     if need > cap:
         raise RuntimeError(
-            f"dataset preload needs {need / _BYTES_PER_GB:.1f} GB of host RAM for train+validation, above the "
+            f"dataset preload needs {need / _BYTES_PER_GB:.1f} GB of host RAM for {what}, above the "
             f"cap of {_PRELOAD_MAX_FRACTION_OF_MEM_AVAILABLE} x MemAvailable ({avail / _BYTES_PER_GB:.1f} GB) = "
             f"{cap / _BYTES_PER_GB:.1f} GB; use a smaller processed dataset (there is no loading path for data "
             "larger than the budget)"
@@ -1024,12 +1086,15 @@ def create_dataloaders(
     tcfg: Mapping[str, Any],
     preload_device: torch.device,
     seed: int,
+    normalization_manifest: Mapping[str, Any],
+    species_variables: List[str],
 ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     """Build train/val dataloaders (strict), after the preload memory budget check.
 
     The epoch is defined by counts, not by the data size: dataset.train_batches_per_epoch random
     training batches, and validation on the fixed set of dataset.val_samples windows (all windows
-    when the split holds fewer).
+    when the split holds fewer). With training.loss.jump_weight > 0 the raw-trajectory store is
+    preloaded too and every training batch carries training.loss.jump_batch_size long-jump pairs.
     """
     paths = require_dict(cfg, "paths")
     processed_dir = Path(as_str(require(paths, "processed_dir"), "paths.processed_dir")).expanduser().resolve()
@@ -1047,16 +1112,40 @@ def create_dataloaders(
     k_train = max_rollout_steps_for_training(tcfg)
     k_eval = max_rollout_steps_for_eval(tcfg)
 
-    _check_preload_budget(processed_dir, preload_device)
+    loss_cfg = require_dict(tcfg, "loss")
+    use_jump = float(loss_cfg["jump_weight"]) > 0.0
+    _check_preload_budget(processed_dir, preload_device, raw_store=use_jump)
 
     # Every split is preloaded (single-process batch stream) as float32 tensors (the shard
     # dtype) on the preload device.
     train_ds = FlowMapRolloutDataset(processed_dir, "train", total_steps=k_train, device=preload_device)
     val_ds = FlowMapRolloutDataset(processed_dir, "validation", total_steps=k_eval, device=preload_device)
 
+    jump: Optional[JumpSampler] = None
+    if use_jump:
+        raw = RawTrajectories(
+            processed_dir,
+            normalization_manifest=normalization_manifest,
+            species_variables=species_variables,
+            device=preload_device,
+        )
+        jump = JumpSampler(
+            raw=raw,
+            batch_size=int(loss_cfg["jump_batch_size"]),
+            min_seconds=float(loss_cfg["jump_min_seconds"]),
+            max_seconds=float(loss_cfg["jump_max_seconds"]),
+        )
+        log.info(
+            "long-jump pairs: %d per training batch from the raw-trajectory store (%d trajectories x %d times), "
+            "D log-uniform in [%g, %g] s, weight %g",
+            jump.batch_size, raw.n, int(raw.t.shape[0]), jump.min_seconds, jump.max_seconds,
+            float(loss_cfg["jump_weight"]),
+        )
+
     # The training stream is reseeded per epoch (resume-safe); validation uses no generator.
     train_dl = create_train_dataloader(
-        train_ds, batch_size=batch_size, batches_per_epoch=train_batches, seed=seed, pin_memory=pin_memory
+        train_ds, batch_size=batch_size, batches_per_epoch=train_batches, seed=seed, pin_memory=pin_memory,
+        jump=jump,
     )
     val_dl = create_val_dataloader(val_ds, batch_size=batch_size, n_windows=val_samples, pin_memory=pin_memory)
 
@@ -1662,6 +1751,8 @@ def main() -> None:
         tcfg=tcfg,
         preload_device=preload_device,
         seed=seed,
+        normalization_manifest=manifest,
+        species_variables=species_vars,
     )
     os.close(data_lock_fd)  # both splits are preloaded: release the processed-data lock
     train_batches_per_epoch = len(train_dl)
