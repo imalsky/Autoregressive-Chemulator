@@ -1723,6 +1723,7 @@ def main() -> None:
         train_dataloaders=train_dl,
         val_dataloaders=val_dl,
         ckpt_path=str(ckpt_path) if ckpt_mode == "resume" else None,
+        weights_only=True,
     )
 
     # A resume that trained no further epoch writes no metrics.csv: move the part back.
