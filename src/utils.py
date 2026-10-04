@@ -473,8 +473,12 @@ def parse_precision_config(cfg: Mapping[str, Any]) -> PrecisionConfig:
             raise ValueError("precision.amp_mode must be 'true' when compute_dtype is float32/float64")
         if model_dtype != compute_dtype:
             raise ValueError("precision.model_dtype must equal precision.compute_dtype for float32/float64 compute")
-        if input_dtype != compute_dtype:
-            raise ValueError("precision.input_dtype must equal precision.compute_dtype for float32/float64 compute")
+        # float64 inputs carry the rollout state in float64 (forward_step runs the network in float32 and adds
+        # the increment in the state's dtype); the shards stay float32.
+        if input_dtype not in (compute_dtype, torch.float64):
+            raise ValueError(
+                "precision.input_dtype must equal precision.compute_dtype or be float64 for float32/float64 compute"
+            )
 
     if amp_mode == "mixed":
         # Mixed precision keeps fp32 master weights and fp32 inputs; autocast lowers only the matmuls.

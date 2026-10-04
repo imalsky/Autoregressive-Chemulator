@@ -2,22 +2,22 @@
 """
 trainer.py - LightningModule + Trainer factory.
 
-Training styles (burn-in removed):
+Training styles:
 
 1) One-jump
    - training.rollout_steps must be 1
    - loss on the first transition only
 
-2) Autoregressive rollout
+2) Autoregressive rollout (long unroll)
    - Total rollout steps K := training.rollout_steps
    - Skip/warmup steps M := training.autoregressive_training.skip_steps
        * warmup is run under torch.no_grad() (pushforward trick input generation)
-       * warmup steps are excluded from the loss via masking (and/or by construction in detached-per-step mode)
-   - Gradients:
-       * detach_between_steps=True  : stop-grad between steps (no BPTT across time)
-       * detach_between_steps=False : BPTT across steps [M..K-1] (but never through warmup)
+       * warmup steps are excluded from the loss via masking
+   - Gradients: BPTT across steps [M..K-1] (but never through warmup), every trained step weighted equally
+   - The state is carried in precision.input_dtype: float64 carries it in float64 (forward_step runs the
+     network in float32 and adds the increment in float64); the shards stay float32.
 
-Long-jump term (training.loss.jump_weight > 0; one-jump or BPTT, not detached):
+Long-jump term (training.loss.jump_weight > 0; one-jump or BPTT):
 - every training batch carries jump pairs (z(t), z(t + D)) from the raw-trajectory store, D log-uniform
   in [jump_min_seconds, jump_max_seconds] (dataset.py sample_jump_pairs), and each step adds
   jump_weight * HybridLoss(forward_step(z(t), D), z(t + D)) to its loss. D may exceed the trained dt
@@ -28,8 +28,13 @@ Optional curriculum (training only):
 - training.curriculum ramps training rollout steps from start_steps -> end_steps
   (main.py requires end_steps == rollout_steps) over ramp_epochs.
 - Validation always uses rollout_steps (fixed horizon for comparability).
-- Early stopping and the plateau scheduler observe the same epochs: both start counting at the
-  first epoch after the LR warmup and the curriculum ramp.
+- Early stopping starts counting at the first epoch after the LR warmup and the curriculum ramp.
+
+LR schedule (training.scheduler):
+- Linear warmup over warmup_epochs, then a cosine from the peak (training.optimizer.lr) down to
+  min_lr_fraction x peak at the run's last step (max_epochs x train_batches_per_epoch), advanced once
+  per optimizer step (warmup_cosine_lr). With early stopping on, a run that stops early ends before
+  the LR has decayed to the floor.
 
 Logging:
 - Uses Lightning CSVLogger. All self.log(...) metrics are written to metrics.csv.
@@ -57,7 +62,7 @@ Logging:
                               validation), 1e9 bytes.
   Epoch 0 also contains the torch.compile and CUDA-graph warm-up.
 - One INFO line per epoch in the job log: epoch, K_train, the LR at epoch start and now (after
-  this epoch's plateau step), train/val losses and epoch_time_sec.
+  this epoch's last optimizer step), train/val losses and epoch_time_sec.
 
 Batch contract (from dataset.py):
 - y:  [B, K_full, S]   (states in z-space)
@@ -94,18 +99,8 @@ from ema_callback import EMACallback
 from lightning.pytorch.loggers import CSVLogger
 
 
-# Uniform per-step rollout weighting (no discount). Only consulted when the
-# optional training.autoregressive_training.loss_discount_gamma key is absent.
-_DEFAULT_LOSS_DISCOUNT_GAMMA = 1.0
-# Validation weights every step >= skip_steps equally, so val_loss is comparable across gamma
-# settings, not across skip_steps.
-_VAL_STEP_GAMMA = 1.0
-# ReduceLROnPlateau threshold mode (torch's default, set explicitly): val_loss counts as an improvement
-# only when it beats the best by the relative fraction training.scheduler.threshold (1e-3 stage 1,
-# 1e-4 stage 2); `patience` epochs without one cut the LR.
-_PLATEAU_THRESHOLD_MODE = "rel"
-# The one monitored metric and its direction, shared by the LR plateau, top-k checkpointing
-# (best.ckpt) and early stopping (no config key: any other value would desynchronize them).
+# The one monitored metric and its direction, shared by top-k checkpointing (best.ckpt) and early
+# stopping (no config key: any other value would desynchronize them).
 _MONITOR_METRIC = "val_loss"
 _MONITOR_MODE = "min"
 # last.ckpt must hold the latest completed epoch (auto-resume starts from it).
@@ -172,42 +167,42 @@ def _build_optimizer_param_groups(
     return groups
 
 
-class WarmupReduceLROnPlateau(torch.optim.lr_scheduler.ReduceLROnPlateau):
-    """ReduceLROnPlateau with linear warmup over optimizer steps."""
+def warmup_cosine_lr(step: int, total: int, peak: float, warmup: int, min_frac: float) -> float:
+    """LR of optimizer step `step` (0-based): a linear warmup to `peak` over `warmup` steps, then a cosine
+    from `peak` down to min_frac x peak at step `total`, held at that floor after it."""
+    if step < warmup:
+        return peak * (step + 1) / warmup
+    p = (step - warmup) / max(1, total - warmup)
+    return peak * (min_frac + (1 - min_frac) * 0.5 * (1 + math.cos(math.pi * min(1.0, p))))
 
-    def __init__(self, optimizer: torch.optim.Optimizer, *, warmup_steps: int, **kwargs: Any) -> None:
-        """Capture base LRs and start at LR=0 if warming up; kwargs pass through to ReduceLROnPlateau."""
-        self.warmup_steps = int(max(0, warmup_steps))
-        self.warmup_step_count = 0
-        self.base_lrs = [float(group["lr"]) for group in optimizer.param_groups]
-        super().__init__(optimizer, **kwargs)
-        if self.warmup_steps > 0:
-            self._set_warmup_lrs(step=0)
+
+class WarmupCosineLR(torch.optim.lr_scheduler.LRScheduler):
+    """warmup_cosine_lr of the optimizer's base LR (the peak), advanced once per optimizer step.
+
+    The LR is a pure function of the steps taken (last_epoch). The schedule's steps and floor are
+    scheduler state: a resume restores them with last_epoch, so it continues the schedule it started
+    with (a resume that raises training.max_epochs trains the added epochs at the floor).
+    """
+
+    def __init__(self, optimizer: torch.optim.Optimizer, *, warmup_steps: int, total_steps: int,
+                 min_lr_fraction: float) -> None:
+        # Set before super().__init__, whose initial step() sets the LR of step 0.
+        self.warmup_steps = int(warmup_steps)
+        self.total_steps = int(total_steps)
+        self.min_lr_fraction = float(min_lr_fraction)
+        super().__init__(optimizer)
 
     @property
     def warmup_active(self) -> bool:
-        """True while still inside the linear warmup ramp."""
-        return self.warmup_step_count < self.warmup_steps
+        """True while the next optimizer step is still inside the linear warmup."""
+        return self.last_epoch < self.warmup_steps
 
-    def _set_warmup_lrs(self, *, step: int) -> None:
-        """Set each param group's LR to base_lr * (step / warmup_steps)."""
-        scale = float(step) / float(max(1, self.warmup_steps))
-        for group, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
-            group["lr"] = float(base_lr) * scale
-        self._last_lr = [float(group["lr"]) for group in self.optimizer.param_groups]
-
-    def step_warmup(self) -> None:
-        """Advance the warmup ramp by one optimizer step (no-op once warmup is complete)."""
-        if not self.warmup_active:
-            return
-        self.warmup_step_count += 1
-        self._set_warmup_lrs(step=self.warmup_step_count)
-
-    def step(self, metrics: Any, epoch: Optional[int] = None) -> None:
-        """Plateau step on the monitored metric; suppressed while warmup is still active."""
-        if self.warmup_active:
-            return
-        super().step(metrics, epoch=epoch)
+    def get_lr(self) -> List[float]:
+        """LR of optimizer step last_epoch for every param group."""
+        return [
+            warmup_cosine_lr(self.last_epoch, self.total_steps, base_lr, self.warmup_steps, self.min_lr_fraction)
+            for base_lr in self.base_lrs
+        ]
 
 
 # ==============================================================================
@@ -378,13 +373,13 @@ def _build_curriculum(tcfg: Mapping[str, Any]) -> RolloutCurriculum:
 
 
 class CurriculumAwareEarlyStopping(EarlyStopping):
-    """EarlyStopping that observes the same epochs as the plateau scheduler.
+    """EarlyStopping that skips the curriculum ramp and the LR warmup.
 
     An epoch is skipped while it is before `start_epoch` (the first full-horizon epoch of the
-    rollout curriculum) or while the WarmupReduceLROnPlateau LR warmup is still active (read from
-    the scheduler, which ignores those epochs too). In a skipped epoch a finite metric leaves
-    best/wait untouched, so ES and the plateau both start counting at the first epoch after the
-    warmup and the ramp; the non-finite stop and the missing-metric error stay active from epoch 0.
+    rollout curriculum) or while the WarmupCosineLR warmup is still active (read from the
+    scheduler). In a skipped epoch a finite metric leaves best/wait untouched, so ES starts
+    counting at the first epoch after the warmup and the ramp; the non-finite stop and the
+    missing-metric error stay active from epoch 0.
     Overrides private EarlyStopping methods (Lightning 2.6.x).
     """
 
@@ -395,7 +390,7 @@ class CurriculumAwareEarlyStopping(EarlyStopping):
 
     def _run_early_stopping_check(self, trainer: pl.Trainer) -> None:
         in_warmup = any(
-            isinstance(c.scheduler, WarmupReduceLROnPlateau) and c.scheduler.warmup_active
+            isinstance(c.scheduler, WarmupCosineLR) and c.scheduler.warmup_active
             for c in trainer.lr_scheduler_configs
         )
         self._skip_epoch = int(trainer.current_epoch) < self.start_epoch or in_warmup
@@ -442,35 +437,13 @@ class FlowMapRolloutModule(pl.LightningModule):
         if self.rollout_steps < 1:
             raise ValueError(f"training.rollout_steps must be >= 1, got {self.rollout_steps}")
 
-        # The full autoregressive_training block is schema-required (enabled, skip_steps,
-        # detach_between_steps, backward_per_step); read them directly. When AR is disabled
-        # these values are inert (the one-jump training path ignores them).
+        # The full autoregressive_training block is schema-required (enabled, skip_steps); read it
+        # directly. When AR is disabled skip_steps is inert (the one-jump training path ignores it).
         ar_cfg = dict(tcfg["autoregressive_training"])
         self.autoregressive_training = bool(ar_cfg["enabled"])
         self.ar_skip_steps = int(ar_cfg["skip_steps"])
         if self.ar_skip_steps < 0:
             raise ValueError(f"training.autoregressive_training.skip_steps must be >= 0, got {self.ar_skip_steps}")
-        self.ar_detach_between_steps = bool(ar_cfg["detach_between_steps"])
-        self.ar_backward_per_step = bool(ar_cfg["backward_per_step"])
-        # Per-step discount gamma^(k-skip) on the rollout loss. 1.0 = uniform (legacy).
-        # Optional key; validation/checkpoint selection (_eval_step) intentionally stays uniform
-        # over steps >= skip_steps, so val_loss is comparable across gamma, not across skip_steps.
-        self.ar_loss_discount_gamma = float(ar_cfg.get("loss_discount_gamma", _DEFAULT_LOSS_DISCOUNT_GAMMA))
-        if not (0.0 < self.ar_loss_discount_gamma <= 1.0):
-            raise ValueError(
-                "training.autoregressive_training.loss_discount_gamma must be in (0, 1], "
-                f"got {self.ar_loss_discount_gamma}"
-            )
-        if not self.autoregressive_training and self.ar_loss_discount_gamma != 1.0:
-            raise ValueError(
-                "training.autoregressive_training.loss_discount_gamma has no effect when "
-                "autoregressive_training.enabled=false; remove it or set it to 1.0."
-            )
-        if self.autoregressive_training and self.ar_backward_per_step and not self.ar_detach_between_steps:
-            raise ValueError(
-                "training.autoregressive_training.backward_per_step has no effect when "
-                "detach_between_steps=false (BPTT does one backward); set it to false."
-            )
 
         # Gradient-norm clip threshold (None = no clipping). Lightning forbids
         # Trainer(gradient_clip_val=...) with manual optimization, so in AR mode the module clips
@@ -493,8 +466,6 @@ class FlowMapRolloutModule(pl.LightningModule):
 
         # Curriculum (training only). The full block is schema-required; read directly.
         self.curriculum = _build_curriculum(tcfg)
-        # The plateau scheduler is not stepped before the first full-horizon epoch (0 without a ramp).
-        self._plateau_start_epoch = self.curriculum.first_full_horizon_epoch() if self.autoregressive_training else 0
 
         # Loss
         loss_cfg = dict(tcfg["loss"])
@@ -515,17 +486,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         # jump pairs, added to every training step's loss (main.py checks the keys' ranges).
         self.jump_weight = float(loss_cfg["jump_weight"])
         self._jump_batch_size = int(loss_cfg["jump_batch_size"])
-        if self.jump_weight > 0.0 and self.autoregressive_training and self.ar_detach_between_steps:
-            raise ValueError(
-                "training.loss.jump_weight > 0 requires autoregressive_training.detach_between_steps=false "
-                "(the detached rollout does not add the long-jump term)"
-            )
 
-        self.sched_cfg = dict(tcfg["scheduler"])
-        # Peak LR of a weights_only start (the warmup target and the plateau's first LR): main.py sets
-        # min(training.optimizer.lr, the source checkpoint's LR) before fit; None = training.optimizer.lr.
-        # A resume restores its peak with the optimizer and scheduler state (base_lrs), never from here.
-        self.handoff_peak_lr: Optional[float] = None
         # Optimizer steps per epoch (one per training batch): the train loader's length, which is
         # dataset.train_batches_per_epoch by construction (dataset.py _PreloadedStochasticBatchStream).
         self._train_batches_per_epoch = int(cfg["dataset"]["train_batches_per_epoch"])
@@ -613,8 +574,8 @@ class FlowMapRolloutModule(pl.LightningModule):
         if self.autoregressive_training:
             msg = (
                 "train_loss is the autoregressive rollout loss over the curriculum horizon "
-                "(train_rollout_steps) with per-step weights gamma^(k-skip); val_loss is the open-loop "
-                "rollout over rollout_steps with uniform weights. They also differ in weights "
+                "(train_rollout_steps); val_loss is the open-loop rollout over rollout_steps; both weight "
+                "every step >= skip_steps equally. They also differ in weights "
                 f"({weights}) and data (training vs validation windows){dropout_note}{jump_note}."
             )
         else:
@@ -628,7 +589,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         """Log the peak LR in force (after a resume has restored the optimizer and scheduler state)."""
         sched = self._get_scheduler()
         peak = float(sched.base_lrs[0]) if sched is not None else self._current_lr()
-        log.info("peak LR (warmup target, plateau start) %.6g; training.optimizer.lr %.6g; LR now %.6g",
+        log.info("peak LR (warmup target, cosine start) %.6g; training.optimizer.lr %.6g; LR now %.6g",
                  peak, float(self.hparams["training"]["optimizer"]["lr"]), self._current_lr())
 
     # ------------------------
@@ -803,22 +764,19 @@ class FlowMapRolloutModule(pl.LightningModule):
         skip_steps: int,
         *,
         device: torch.device,
-        gamma: float,
     ) -> Optional[torch.Tensor]:
-        """Per-step loss weights (float64): 0 for warmup steps, gamma^(k-skip) after.
+        """Per-step loss weights (float64): 0 for warmup steps, 1 after.
 
-        Returns None (uniform, no masking) when there is nothing to weight —
-        preserving the legacy fast path. Raises when every step would be masked.
+        Returns None (uniform, no masking) when no step is skipped. Raises when every step would
+        be masked.
         """
         k = int(k)
         skip = int(skip_steps)
         if skip >= k:
             raise ValueError(f"skip_steps ({skip}) must be < the rollout horizon K={k} (every step would be masked).")
-        g = float(gamma)
-        if skip <= 0 and g == 1.0:
+        if skip <= 0:
             return None
-        offsets = torch.arange(k, device=device, dtype=torch.float64) - float(skip)
-        w = torch.pow(g, offsets.clamp_min(0.0))
+        w = torch.ones(k, device=device, dtype=torch.float64)
         w[:skip] = 0.0
         return w
 
@@ -845,15 +803,15 @@ class FlowMapRolloutModule(pl.LightningModule):
             raise TypeError(f"expected one optimizer, got {type(opt).__name__}")
         return opt
 
-    def _get_scheduler(self) -> Optional[WarmupReduceLROnPlateau]:
+    def _get_scheduler(self) -> Optional[WarmupCosineLR]:
         """Return the single LR scheduler, or None.
 
         None when training.scheduler.enabled=false, and outside fit (the weights_only init
         Trainer.validate pass sets up no optimizers or schedulers).
         """
         sched = self.lr_schedulers()
-        if sched is not None and not isinstance(sched, WarmupReduceLROnPlateau):
-            raise TypeError(f"expected one WarmupReduceLROnPlateau, got {type(sched).__name__}")
+        if sched is not None and not isinstance(sched, WarmupCosineLR):
+            raise TypeError(f"expected one WarmupCosineLR, got {type(sched).__name__}")
         return sched
 
     def _clip_and_record_grad_norm(self, params: List[torch.nn.Parameter], clip_val: Optional[float]) -> None:
@@ -896,8 +854,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         """Optimizer step after every batch: clip (and optional grad-norm record), step, zero_grad.
 
         Manual-optimization path only (autoregressive mode; gradient accumulation is unsupported,
-        main.py rejects accumulate_grad_batches != 1). Also advances the warmup ramp; the plateau
-        scheduler is stepped in on_validation_epoch_end.
+        main.py rejects accumulate_grad_batches != 1). Then advances the LR schedule by one step.
         """
         # The Trainer is constructed WITHOUT gradient_clip_val in AR mode (Lightning forbids it).
         params = [p for group in opt.optimizer.param_groups for p in group["params"]]
@@ -906,33 +863,25 @@ class FlowMapRolloutModule(pl.LightningModule):
         opt.step()
         opt.zero_grad(set_to_none=True)
 
-        # Advance the per-step warmup ramp; the plateau itself is stepped in on_validation_epoch_end.
         sched = self._get_scheduler()
         if sched is None:
             return
-        sched.step_warmup()
+        sched.step()
 
     def lr_scheduler_step(self, scheduler: Any, metric: Optional[Any]) -> None:
-        """Lightning's automatic scheduler step, except the plateau scheduler.
-
-        The plateau is stepped in on_validation_epoch_end in both optimization modes, i.e. before
-        this epoch's checkpoint is written; Lightning's own step would come after it.
-        """
-        if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            return
-        super().lr_scheduler_step(scheduler, metric)
+        """No-op: the module advances the schedule after every optimizer step in both optimization
+        modes (optimizer_step, _maybe_step_optimizer); Lightning's per-epoch step would add one more."""
 
     def optimizer_step(self, *args: Any, **kwargs: Any) -> None:
-        """Automatic-optimization hook: after the normal step, hand-advance the warmup ramp only."""
-        # Lightning calls this hook only in automatic optimization (stage 1). The custom
-        # WarmupReduceLROnPlateau's per-step warmup ramp is not driven by Lightning, so it is
-        # advanced here; the plateau is stepped in on_validation_epoch_end.
+        """Automatic-optimization hook: after the normal step, advance the LR schedule by one step."""
+        # Lightning calls this hook only in automatic optimization (stage 1); lr_scheduler_step is a
+        # no-op, so the schedule is advanced here.
         super().optimizer_step(*args, **kwargs)
 
         sched = self._get_scheduler()
         if sched is None:
             return
-        sched.step_warmup()
+        sched.step()
 
     # ------------------------
     # Training / eval
@@ -992,10 +941,11 @@ class FlowMapRolloutModule(pl.LightningModule):
     def _training_step_autoregressive(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
         """Autoregressive rollout training (manual optimization).
 
-        Runs skip_steps warmup under no_grad (pushforward), then trains steps [skip..k_train) either
-        with stop-grad-per-step (detached) or full BPTT, applying the gamma^(k-skip) per-step weights.
-        Curriculum sets k_train per epoch. Handles its own backward/step via _maybe_step_optimizer.
-        With training.loss.jump_weight > 0 the BPTT branch backpropagates the rollout loss plus
+        Runs skip_steps warmup under no_grad (pushforward), then trains steps [skip..k_train) by BPTT,
+        every trained step weighted equally. Curriculum sets k_train per epoch. Handles its own
+        backward/step via _maybe_step_optimizer. The state is carried in the batch's dtype
+        (precision.input_dtype; float64 carries it in float64 while forward_step runs the network in
+        float32). With training.loss.jump_weight > 0 it backpropagates the rollout loss plus
         jump_weight x _jump_term; the returned loss is the rollout loss only.
         """
         y = batch["y"]
@@ -1032,64 +982,25 @@ class FlowMapRolloutModule(pl.LightningModule):
                 for k in range(skip):
                     y_prev = self._forward_step(y_prev, dt_train[:, k], g_t)
 
-        gamma = float(self.ar_loss_discount_gamma)
+        # BPTT across the trained portion (after warmup). No gradients through warmup.
+        y_pred = y0.new_zeros((B, k_train, S))
 
-        if self.ar_detach_between_steps:
-            # Stop-grad between steps: no BPTT across time (but still trained on pushforward states).
-            # Per-step weights gamma^(k-skip); gamma=1.0 reproduces the legacy uniform 1/num_steps.
-            weights = [gamma ** (k - skip) for k in range(skip, k_train)]
-            weight_sum = float(sum(weights))
+        for k in range(skip, k_train):
+            y_prev = self._forward_step(y_prev, dt_train[:, k], g_t)
+            y_pred[:, k, :] = y_prev
 
-            loss_total_sum = y_prev.new_zeros(())
-            log10_mae_sum = y_prev.new_zeros(())
-            z_mse_sum = y_prev.new_zeros(())
+        step_weights = self._step_weights(k_train, skip, device=y_pred.device)
+        losses = self.criterion(y_pred, y_true, step_weights=step_weights)
 
-            for k in range(skip, k_train):
-                y_next = self._forward_step(y_prev, dt_train[:, k], g_t)
-                y_tgt = y_true[:, k, :]
+        loss_total = losses["loss_total"]
+        loss_log10_mae = losses["loss_log10_mae"].detach()
+        loss_z_mse = losses["loss_z_mse"].detach()
 
-                step_losses = self.criterion(y_next.unsqueeze(1), y_tgt.unsqueeze(1), step_weights=None)
-                w_k = weights[k - skip]
-
-                if self.ar_backward_per_step:
-                    self.manual_backward(step_losses["loss_total"] * (w_k / weight_sum))
-                else:
-                    loss_total_sum = loss_total_sum + step_losses["loss_total"] * w_k
-
-                log10_mae_sum = log10_mae_sum + step_losses["loss_log10_mae"].detach() * w_k
-                z_mse_sum = z_mse_sum + step_losses["loss_z_mse"].detach() * w_k
-
-                y_prev = y_next.detach()
-
-            if not self.ar_backward_per_step:
-                self.manual_backward(loss_total_sum / weight_sum)
-
-            self._maybe_step_optimizer(opt)
-
-            loss_log10_mae = log10_mae_sum / weight_sum
-            loss_z_mse = z_mse_sum / weight_sum
-            loss_total = self.criterion.lambda_log10_mae * loss_log10_mae + self.criterion.lambda_z_mse * loss_z_mse
-
+        if self.jump_weight > 0.0:
+            self.manual_backward(loss_total + self.jump_weight * self._jump_term(batch))
         else:
-            # BPTT across the trained portion (after warmup). No gradients through warmup.
-            y_pred = y0.new_zeros((B, k_train, S))
-
-            for k in range(skip, k_train):
-                y_prev = self._forward_step(y_prev, dt_train[:, k], g_t)
-                y_pred[:, k, :] = y_prev
-
-            step_weights = self._step_weights(k_train, skip, device=y_pred.device, gamma=gamma)
-            losses = self.criterion(y_pred, y_true, step_weights=step_weights)
-
-            loss_total = losses["loss_total"]
-            loss_log10_mae = losses["loss_log10_mae"].detach()
-            loss_z_mse = losses["loss_z_mse"].detach()
-
-            if self.jump_weight > 0.0:
-                self.manual_backward(loss_total + self.jump_weight * self._jump_term(batch))
-            else:
-                self.manual_backward(loss_total)
-            self._maybe_step_optimizer(opt)
+            self.manual_backward(loss_total)
+        self._maybe_step_optimizer(opt)
 
         s = torch.stack([loss_total.detach(), loss_log10_mae.detach(), loss_z_mse.detach()])
         s = s.to(torch.promote_types(s.dtype, torch.float32))  # sum in fp32 or wider, as Lightning does
@@ -1121,7 +1032,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         # Keep loss definition consistent by masking skip_steps the same way in val.
         step_weights = None
         if self.autoregressive_training:
-            step_weights = self._step_weights(k_eval, self.ar_skip_steps, device=y_pred.device, gamma=_VAL_STEP_GAMMA)
+            step_weights = self._step_weights(k_eval, self.ar_skip_steps, device=y_pred.device)
 
         losses = self.criterion(y_pred, y_true, step_weights=step_weights)
         loss_total = losses["loss_total"]
@@ -1147,11 +1058,10 @@ class FlowMapRolloutModule(pl.LightningModule):
         return self._eval_step(batch)
 
     def on_validation_epoch_end(self) -> None:
-        """Abort on a non-finite training loss or val_loss, then step the ReduceLROnPlateau scheduler.
+        """Abort on a non-finite training loss or val_loss, then record val_loss and log val_skill.
 
         This hook runs once val_loss is final and before ModelCheckpoint/EarlyStopping act on it
-        (they run in on_train_epoch_end), so a diverged epoch writes no checkpoint and every
-        checkpoint holds the scheduler state after this epoch's plateau step (resume-safe).
+        (they run in on_train_epoch_end), so a diverged epoch writes no checkpoint.
         """
         # A non-finite training loss is caught here, at the end of its epoch, not at the step: the
         # check reads the epoch's device-side loss sum once (any non-finite step loss makes it
@@ -1171,7 +1081,6 @@ class FlowMapRolloutModule(pl.LightningModule):
                 "caught at the end of the epoch, not at the step; aborting before this epoch's "
                 "checkpoint is written."
             )
-        # The plateau monitors _MONITOR_METRIC (val_loss).
         metric = self.trainer.callback_metrics.get(_MONITOR_METRIC)
         if metric is None:
             return
@@ -1188,19 +1097,6 @@ class FlowMapRolloutModule(pl.LightningModule):
         persistence = self.trainer.callback_metrics.get("val_persistence_loss")
         if persistence is not None:
             self.log("val_skill", 1.0 - metric / persistence, on_step=False, on_epoch=True)
-        if self.trainer.sanity_checking:  # the pre-training sanity batch is not an epoch
-            return
-        # No LR cut while the curriculum ramps: val_loss is measured at the full horizon while
-        # training runs shorter rollouts (the step-based LR warmup is unaffected).
-        if self.current_epoch < self._plateau_start_epoch:
-            return
-        if not bool(self.sched_cfg["enabled"]):
-            return
-
-        sched = self._get_scheduler()
-        if sched is None:  # the weights_only init validation pass (no schedulers outside fit)
-            return
-        sched.step(metric_val)
 
 
     # ------------------------
@@ -1210,14 +1106,13 @@ class FlowMapRolloutModule(pl.LightningModule):
     def configure_optimizers(self) -> Any:
         """Build the AdamW optimizer (with norm/bias WD exclusion) and the LR scheduler.
 
-        The scheduler is ReduceLROnPlateau wrapped with a linear warmup (the only scheduler).
-        Returns the Lightning optimizer/scheduler dict; the plateau monitors _MONITOR_METRIC (mode
-        _MONITOR_MODE).
+        The scheduler is WarmupCosineLR (the only scheduler; peak training.optimizer.lr), stepped by
+        the module after every optimizer step. Returns the Lightning optimizer/scheduler dict.
         """
         tcfg = dict(self.hparams["training"])
         opt_cfg = dict(tcfg["optimizer"])
 
-        lr = float(opt_cfg["lr"]) if self.handoff_peak_lr is None else float(self.handoff_peak_lr)
+        lr = float(opt_cfg["lr"])
         weight_decay = float(opt_cfg["weight_decay"])
         exclude_nd = bool(opt_cfg["exclude_norm_and_bias_from_weight_decay"])
         param_groups = _build_optimizer_param_groups(self, weight_decay=weight_decay, exclude_norm_and_bias=exclude_nd)
@@ -1249,39 +1144,26 @@ class FlowMapRolloutModule(pl.LightningModule):
         if not bool(sched_cfg["enabled"]):
             return opt
 
-        factor = float(sched_cfg["factor"])
-        patience = int(sched_cfg["patience"])
-        threshold = float(sched_cfg["threshold"])
-        min_lr = float(sched_cfg["min_lr"])
-        # Warmup in optimizer steps, capped at the run (main.py requires warmup_epochs >= 0 and
-        # max_epochs >= 1). This equals Lightning's min(warmup_epochs * num_training_batches,
-        # estimated_stepping_batches) because accumulate_grad_batches == 1, the Trainer gets no
-        # max_steps or limit_train_batches, and the run is single-process (main.py).
-        warmup_steps = min(int(sched_cfg["warmup_epochs"]), int(tcfg["max_epochs"])) * self._train_batches_per_epoch
-
-        sched = WarmupReduceLROnPlateau(
+        # Warmup and run length in optimizer steps, the warmup capped at the run (main.py requires
+        # warmup_epochs >= 0 and max_epochs >= 1). These equal Lightning's step counts because
+        # accumulate_grad_batches == 1, the Trainer gets no max_steps or limit_train_batches, and the
+        # run is single-process (main.py).
+        max_epochs = int(tcfg["max_epochs"])
+        warmup_steps = min(int(sched_cfg["warmup_epochs"]), max_epochs) * self._train_batches_per_epoch
+        sched = WarmupCosineLR(
             opt,
             warmup_steps=warmup_steps,
-            mode=_MONITOR_MODE,
-            factor=factor,
-            patience=patience,
-            threshold=threshold,
-            threshold_mode=_PLATEAU_THRESHOLD_MODE,
-            min_lr=min_lr,
+            total_steps=max_epochs * self._train_batches_per_epoch,
+            min_lr_fraction=float(sched_cfg["min_lr_fraction"]),
         )
 
+        # The interval only matters to Lightning's own step, which lr_scheduler_step turns off.
         lr_scheduler: Dict[str, Any] = {
             "scheduler": sched,
             "interval": "epoch",
             "frequency": 1,
             "name": "lr",
         }
-        # on_validation_epoch_end steps the plateau in both modes (lr_scheduler_step skips it).
-        # Lightning still requires "monitor" for a plateau scheduler under automatic optimization
-        # (stage 1) and warns about it under manual optimization (stage 2).
-        if self.automatic_optimization:
-            lr_scheduler["monitor"] = _MONITOR_METRIC
-
         return {"optimizer": opt, "lr_scheduler": lr_scheduler}
 
 
@@ -1373,7 +1255,7 @@ def build_lightning_trainer(
     ar_cfg = dict(tcfg["autoregressive_training"])
     es_cfg = tcfg["early_stopping"]
     if bool(es_cfg["enabled"]):
-        # ES skips the curriculum ramp (start_epoch; 0 without one) and the LR warmup, like the plateau.
+        # ES skips the curriculum ramp (start_epoch; 0 without one) and the LR warmup.
         es_start_epoch = _build_curriculum(tcfg).first_full_horizon_epoch() if bool(ar_cfg["enabled"]) else 0
         callbacks.append(
             CurriculumAwareEarlyStopping(

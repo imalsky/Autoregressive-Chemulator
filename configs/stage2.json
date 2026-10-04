@@ -1,37 +1,25 @@
 {
   "_comment": [
-    "PRODUCTION stage 2 (autoregressive fine-tune) - loads stage-1 best.ckpt (best val_loss,",
+    "PRODUCTION stage 2 (long-unroll fine-tune with the long-jump term) - loads stage-1 best.ckpt (best val_loss,",
     "published by src/main.py only when stage 1 finished, i.e. wrote COMPLETED; EMA weights",
     "preferred automatically by the weights_only loader).",
     "Model block is IDENTICAL to stage 1.",
-    "Default rollout-gradient mode is full BPTT with uniform per-step weighting, chosen on the",
-    "literature prior (GraphCast and NeuralGCM state BPTT). E4 local evidence mixed: detached better",
-    "on the geometric metric, BPTT better on fixed-dt; unresolved at 2-3 seeds.",
-    "FALLBACK (lower memory; the best local geometric point estimate, but the sandbox used skip 2",
-    "and this recipe keeps skip 1, smoke-tested only): under training.autoregressive_training set",
-    "  \"detach_between_steps\": true,",
-    "  \"backward_per_step\": true,",
-    "  \"loss_discount_gamma\": 0.9   <- REQUIRED with detach (E3; not enforced in code)",
-    "keeping skip_steps 1 and training.curriculum 2->10, and set training.loss.jump_weight 0.0 (the detached",
-    "rollout does not add the long-jump term; src/trainer.py refuses the pair). Write the nested keys: a",
-    "dotted key such as \"autoregressive_training.loss_discount_gamma\" is rejected at startup.",
-    "docs/DECISIONS.md: per-key evidence, and the Inherited / unjustified table for values without it.",
-    "Schedule: recipe R (author decision 2026-10-01; docs/DECISIONS.md): fixed step budgets, not derived from the",
-    "data size. 20,000-step epochs; 1-epoch LR warmup; curriculum 2->10 over 16 epochs (K up by 1 every 2);",
-    "plateau patience 5; early-stopping patience 12; at most 120 epochs (2.4M steps). Both monitors start",
-    "counting at the first epoch after the warmup and the ramp (epoch 16). If the epoch length changes,",
-    "re-derive every epoch-counted knob from its step target.",
-    "Peak LR at the handoff: min(training.optimizer.lr, the LR saved in the loaded stage-1 checkpoint)",
-    "(src/main.py; logged and recorded in provenance.jsonl); a resume keeps it.",
+    "Recipe: every step runs skip_steps = 81 no-grad steps from the window start (pushforward), then trains the",
+    "following steps by BPTT, every trained step weighted equally: the curriculum raises the horizon from 82 to",
+    "rollout_steps = 90 over 5 epochs (1 to 9 trained steps). The rollout state is carried in float64",
+    "(precision.input_dtype; the network runs in float32). Each step also adds the long-jump term (training.loss).",
+    "Schedule: a fixed step budget of 50 epochs x 1000 steps = 50,000 optimizer steps; LR warmup 1 epoch, then a",
+    "cosine from training.optimizer.lr to min_lr_fraction x that peak at the last step; no early stopping.",
+    "val_loss is the 90-step open loop scored on steps >= 81, a diagnostic.",
     "Stage 2 reuses the stage-1 processed shards; do NOT rerun preprocessing.",
     "Run: AUTOCHEM_CONFIG_PATH=configs/stage2.json python -u src/main.py"
   ],
   "precision": {
-    "_comment": "amp_mode \"true\" = Lightning 32-true: no autocast (required for float32 compute); only \"mixed\" enables autocast. TF32 is allow_tf32 (forced off by runtime.deterministic=true).",
+    "_comment": "amp_mode \"true\" = Lightning 32-true: no autocast (required for float32 compute); only \"mixed\" enables autocast. TF32 is allow_tf32 (forced off by runtime.deterministic=true). input_dtype float64: batches are cast to float64, so the rollout state is carried in float64 (the shards stay float32).",
     "compute_dtype": "float32",
     "amp_mode": "true",
     "model_dtype": "float32",
-    "input_dtype": "float32",
+    "input_dtype": "float64",
     "loss_dtype": "float32",
     "allow_tf32": true
   },
@@ -127,9 +115,9 @@
     "num_workers": 16
   },
   "dataset": {
-    "_comment": "Epoch by count, a fixed step budget: 20000 optimizer steps per epoch and a fixed validation set of 2621440 = 1280 x 2048 windows (no ragged last batch; 10 or 11 even-stride starts per validation trajectory of the 4-file build, N_val 256734 after the frozen-tail cut, 257704 before). Not re-derived when data is added.",
-    "train_batches_per_epoch": 20000,
-    "val_samples": 2621440
+    "_comment": "Epoch by count, a fixed step budget: 1000 optimizer steps per epoch and a fixed validation set of 65536 = 64 x 1024 windows (no ragged last batch; of the N_val x 10 enumerated 91-state windows). Not re-derived when data is added.",
+    "train_batches_per_epoch": 1000,
+    "val_samples": 65536
   },
   "model": {
     "type": "relax",
@@ -153,11 +141,11 @@
     }
   },
   "training": {
-    "batch_size": 2048,
-    "max_epochs": 120,
+    "batch_size": 1024,
+    "max_epochs": 50,
     "checkpoint_mode": "weights_only",
     "pin_memory": true,
-    "rollout_steps": 10,
+    "rollout_steps": 90,
     "loss": {
       "_comment": [
         "Long-jump term: every step adds jump_weight * HybridLoss(F(z(t), D), z(t + D)) on jump_batch_size pairs from",
@@ -188,30 +176,24 @@
     "scheduler": {
       "enabled": true,
       "warmup_epochs": 1,
-      "factor": 0.5,
-      "patience": 5,
-      "threshold": 0.0001,
-      "min_lr": 1e-08
+      "min_lr_fraction": 0.01
     },
     "autoregressive_training": {
       "enabled": true,
-      "skip_steps": 1,
-      "detach_between_steps": false,
-      "backward_per_step": false,
-      "loss_discount_gamma": 1.0
+      "skip_steps": 81
     },
     "curriculum": {
       "enabled": true,
-      "start_steps": 2,
-      "end_steps": 10,
-      "ramp_epochs": 16
+      "start_steps": 82,
+      "end_steps": 90,
+      "ramp_epochs": 5
     },
     "ema": {
       "enabled": true,
       "decay": 0.999
     },
     "early_stopping": {
-      "enabled": true,
+      "enabled": false,
       "patience": 12,
       "min_delta": 0.0
     }

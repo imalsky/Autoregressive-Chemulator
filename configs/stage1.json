@@ -1,7 +1,6 @@
 {
   "_comment": [
     "PRODUCTION stage 1 (one-jump pretrain) - single dt-conditioned model over dt in [0.1, 1e3] s.",
-    "docs/DECISIONS.md: per-key evidence, and the Inherited / unjustified table for values without it.",
     "Preprocess first (writes ../data/processed):",
     "  AUTOCHEM_CONFIG_PATH=configs/stage1.json python -u processing/preprocessing.py",
     "Then train:",
@@ -166,22 +165,18 @@
       "foreach": false
     },
     "scheduler": {
+      "_comment": "Linear warmup over warmup_epochs, then a cosine from the peak (optimizer.lr) to min_lr_fraction x peak at the last of the max_epochs x train_batches_per_epoch steps.",
       "enabled": true,
       "warmup_epochs": 30,
-      "factor": 0.5,
-      "patience": 15,
-      "threshold": 0.001,
-      "min_lr": 1e-07
+      "min_lr_fraction": 0.01
     },
     "autoregressive_training": {
-      "_comment": "Inert in stage 1 (disabled; the one-jump path never reads the sub-keys), but schema-required.",
+      "_comment": "Inert in stage 1 (disabled; read and validated but without effect), but schema-required.",
       "enabled": false,
-      "skip_steps": 0,
-      "detach_between_steps": true,
-      "backward_per_step": true
+      "skip_steps": 0
     },
     "curriculum": {
-      "_comment": "Inert in stage 1 (disabled; the sub-keys are not read), but schema-required.",
+      "_comment": "Inert in stage 1 (disabled; read and validated but without effect), but schema-required.",
       "enabled": false,
       "start_steps": 1,
       "end_steps": 1,
@@ -192,7 +187,8 @@
       "decay": 0.9995
     },
     "early_stopping": {
-      "enabled": true,
+      "_comment": "Off so the cosine schedule runs to its floor, as in the tested schedule.",
+      "enabled": false,
       "patience": 30,
       "min_delta": 0.0
     }

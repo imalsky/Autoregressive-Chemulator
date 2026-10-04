@@ -10,7 +10,8 @@
 #   4. a re-run of the finished stage 1, which src/main.py must refuse, leaving best.ckpt unchanged;
 #      then, with best.ckpt and COMPLETED deleted (a crash after the final last.ckpt), the same
 #      resume must publish both again without training: byte-identical, last.ckpt untouched
-#   5. stage 2 default recipe (AR + BPTT + the long-jump term, 16 pairs per batch, compiled) from stage 1's
+#   5. stage 2 default recipe (long unroll scaled to the smoke: 3 no-grad steps, then BPTT with the curriculum
+#      4 -> 5, the state carried in float64; plus the long-jump term, 16 pairs per batch; compiled) from stage 1's
 #      handoff checkpoint (the file name configs/stage2.json uses, best.ckpt); train_jump_loss finite and > 0
 #      every epoch (the training step refuses jump pairs that are not float64); the relaxation head keeps
 #      z + delta inside [zlo, zhi] and is the identity at dt_norm -10, on best.ckpt and on random weights
@@ -21,7 +22,7 @@
 #      for an out-of-range dt, units and ranges in the metadata, and the export gate re-run against eager
 # Every training run: COMPLETED, finite train/val losses at every epoch, the expected epoch count,
 # last.ckpt at the final epoch, a ragged last validation batch (as production stage 1 has; stage 2's
-# recipe-R validation set is a whole number of batches), and the
+# validation set is a whole number of batches), and the
 # compiled-function variant counts (TORCH_LOGS); a ragged-batch graph must have been compiled and
 # stage 2's forward_step may not exceed the latest compile gate's count. Stage-2 live weights must
 # differ from the handoff weights and between the runs with and without the long-jump term.
@@ -40,8 +41,8 @@ esac
 SCRATCH="smoke_scratch"
 # Stage-2 forward_step graph variants: no-grad full and ragged batch (validation, the weights_only init
 # validation and the pushforward warmup), the two BPTT inputs (the warmup output, then a state with grad)
-# and the float64 long-jump batch (step 5; step 6 has 4); a fullgraph compile hard-fails at the 9th variant
-# (recompile limit 8).
+# and the long-jump batch (float64 states like the windows', but float32 dt_norm and g; step 5; step 6 has
+# 4); a fullgraph compile hard-fails at the 9th variant (recompile limit 8).
 GATE_S2_FORWARD_STEP_VARIANTS=5
 SMOKE_TORCH_LOGS="recompiles,dynamo"  # dynamo: one "start tracing <fn>" line per compiled variant
 
@@ -306,7 +307,7 @@ prod = {s: json.loads(Path(f"configs/{s}.json").read_text()) for s in ("stage1",
 HANDOFF = Path(prod["stage2"]["runtime"]["checkpoint"]).name  # the production handoff file (best.ckpt)
 BATCH = 64
 # Not a multiple of BATCH, so the last validation batch is ragged (production stage 1 has one; stage 2's
-# 2621440 = 1280 x 2048 has none, so the smoke is where its ragged-batch graph is exercised).
+# 65536 = 64 x 1024 has none, so the smoke is where its ragged-batch graph is exercised).
 VAL_SAMPLES = BATCH + BATCH // 4
 EXTEND_EPOCHS = 1  # the deliberate extension of the finished stage-1 run
 
@@ -327,10 +328,11 @@ def smoke_ify(stage, *, work, source=None):
     c["training"]["early_stopping"]["enabled"] = False
     if source is not None:  # stage 2: weights_only from the source run's handoff checkpoint
         c["runtime"]["checkpoint"] = f"{source}/checkpoints/{HANDOFF}"
-        cur = c["training"]["curriculum"]
-        cur["ramp_epochs"] = 1
-        # Epoch 0 trains at least two rollout steps past the skipped ones.
-        cur["start_steps"] = c["training"]["autoregressive_training"]["skip_steps"] + 2
+        # The long unroll scaled to the smoke's windows (production: skip 81, curriculum 82 -> 90): epoch 0
+        # trains one step past the skipped ones, epoch 1 two.
+        c["training"]["autoregressive_training"]["skip_steps"] = 3
+        c["training"]["rollout_steps"] = 5
+        c["training"]["curriculum"].update(start_steps=4, end_steps=5, ramp_epochs=1)
         c["training"]["loss"]["jump_batch_size"] = 16
     return c
 
@@ -386,7 +388,7 @@ if grep -q "epoch [0-9]*: K_train" "${SCRATCH}/logs/stage1_publish.log"; then di
 [ "$(sha256sum "${SCRATCH}/stage1_work/checkpoints/last.ckpt")" = "${last_before}" ] || die "the publish-only resume changed last.ckpt"
 echo "OK publish-only resume: best.ckpt and COMPLETED republished byte-identical, no epoch trained"
 
-echo "=== [5/7] stage 2 default recipe (AR + BPTT + long-jump term, compiled, handoff from stage-1 best.ckpt) ==="
+echo "=== [5/7] stage 2 default recipe (long unroll + long-jump term, compiled, handoff from stage-1 best.ckpt) ==="
 train stage2
 check trained "${SCRATCH}/stage2_work" 2 "${SCRATCH}/logs/stage2.log" "${GATE_S2_FORWARD_STEP_VARIANTS}"
 check jump_loss "${SCRATCH}/stage2_work" on

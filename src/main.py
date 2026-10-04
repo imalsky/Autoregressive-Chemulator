@@ -12,8 +12,8 @@ This script:
 2) Resolves relative paths relative to the config file directory.
 3) Takes a shared flock on <processed_dir>.lock (held until step 5 has preloaded both splits;
    preprocessing holds it exclusively), loads the normalization manifest
-   (processed_dir/normalization.json), builds the model and loads weights_only weights (capping
-   the peak LR at the source checkpoint's LR), all before the run directory is created.
+   (processed_dir/normalization.json), builds the model and loads weights_only weights, all
+   before the run directory is created.
 4) Creates and flocks work_dir (one training process per run directory), then checks its
    contents (fresh: empty or only train.log; resume: the run it continues) and opens
    work_dir/train.log. A resume from the final checkpoint of a run that died before publishing
@@ -256,17 +256,12 @@ _REQUIRED_CONFIG_KEYS: Tuple[str, ...] = (
     "training.optimizer.eps",
     "training.optimizer.fused",
     "training.optimizer.foreach",
+    # Linear warmup over warmup_epochs, then a cosine to min_lr_fraction x the peak LR (the only scheduler).
     "training.scheduler.enabled",
     "training.scheduler.warmup_epochs",
-    # ReduceLROnPlateau (the only scheduler; linear warmup via warmup_epochs).
-    "training.scheduler.factor",
-    "training.scheduler.patience",
-    "training.scheduler.threshold",
-    "training.scheduler.min_lr",
+    "training.scheduler.min_lr_fraction",
     "training.autoregressive_training.enabled",
     "training.autoregressive_training.skip_steps",
-    "training.autoregressive_training.detach_between_steps",
-    "training.autoregressive_training.backward_per_step",
     "training.curriculum.enabled",
     "training.curriculum.start_steps",
     "training.curriculum.end_steps",
@@ -283,12 +278,7 @@ _REQUIRED_CONFIG_KEYS: Tuple[str, ...] = (
 )
 
 # Optional keys accepted by schema validation.
-_OPTIONAL_CONFIG_KEYS: Tuple[str, ...] = (
-    # Optional per-step discount gamma^(k-skip) on the autoregressive rollout loss.
-    # Default 1.0 (uniform) preserves current behavior; only relevant when
-    # autoregressive_training.enabled=true.
-    "training.autoregressive_training.loss_discount_gamma",
-)
+_OPTIONAL_CONFIG_KEYS: Tuple[str, ...] = ()
 
 # Mapping keys under these dotted paths are dynamic (validated elsewhere).
 _OPEN_MAP_CONFIG_KEYS: Tuple[str, ...] = (
@@ -308,9 +298,6 @@ _CONFIG_KEY_KINDS: Dict[str, str] = {
     "training.rollout_steps": "int",
     "training.autoregressive_training.enabled": "bool",
     "training.autoregressive_training.skip_steps": "int",
-    "training.autoregressive_training.detach_between_steps": "bool",
-    "training.autoregressive_training.backward_per_step": "bool",
-    "training.autoregressive_training.loss_discount_gamma": "float",
     "training.curriculum.enabled": "bool",
     "training.curriculum.start_steps": "int",
     "training.curriculum.end_steps": "int",
@@ -331,10 +318,7 @@ _CONFIG_KEY_KINDS: Dict[str, str] = {
     "training.optimizer.foreach": "bool",
     "training.scheduler.enabled": "bool",
     "training.scheduler.warmup_epochs": "int",
-    "training.scheduler.factor": "float",
-    "training.scheduler.patience": "int",
-    "training.scheduler.threshold": "float",
-    "training.scheduler.min_lr": "float",
+    "training.scheduler.min_lr_fraction": "float",
     "training.ema.enabled": "bool",
     "training.ema.decay": "float",
     "training.early_stopping.enabled": "bool",
@@ -546,12 +530,8 @@ def _validate_value_ranges(cfg: Mapping[str, Any]) -> None:
     sched = tcfg["scheduler"]
     if sched["warmup_epochs"] < 0:
         raise ValueError(f"training.scheduler.warmup_epochs must be >= 0, got {sched['warmup_epochs']}")
-    if sched["enabled"]:
-        if not 0.0 < sched["factor"] < 1.0:
-            raise ValueError(f"training.scheduler.factor must be in (0, 1), got {sched['factor']}")
-        for key in ("patience", "threshold", "min_lr"):
-            if not sched[key] >= 0:
-                raise ValueError(f"training.scheduler.{key} must be >= 0, got {sched[key]}")
+    if not 0.0 <= sched["min_lr_fraction"] <= 1.0:
+        raise ValueError(f"training.scheduler.min_lr_fraction must be in [0, 1], got {sched['min_lr_fraction']}")
 
 
 def _validate_cross_key_constraints(cfg: Mapping[str, Any]) -> None:
@@ -997,41 +977,6 @@ def load_manifest_and_validate_config(
 
 
 # ==============================================================================
-# Rollout sizing
-# ==============================================================================
-
-
-def max_rollout_steps_for_training(tcfg: Mapping[str, Any]) -> int:
-    """Dataset sizing K for the training split (accounts for the curriculum end horizon)."""
-    base_k = as_int(require(tcfg, "rollout_steps"), "training.rollout_steps")
-    if base_k < 1:
-        raise ValueError(f"training.rollout_steps must be >= 1, got {base_k}")
-
-    cur = require_dict(tcfg, "curriculum")
-    enabled = as_bool(require(cur, "enabled"), "training.curriculum.enabled")
-    if not enabled:
-        return base_k
-
-    start_steps = as_int(require(cur, "start_steps"), "training.curriculum.start_steps")
-    end_steps = as_int(require(cur, "end_steps"), "training.curriculum.end_steps")
-    if start_steps < 1 or end_steps < 1:
-        raise ValueError(
-            f"training.curriculum.start_steps and end_steps must be >= 1, got start_steps={start_steps}, "
-            f"end_steps={end_steps}"
-        )
-
-    return int(max(base_k, end_steps))
-
-
-def max_rollout_steps_for_eval(tcfg: Mapping[str, Any]) -> int:
-    """Dataset sizing K for validation split (fixed horizon)."""
-    base_k = as_int(require(tcfg, "rollout_steps"), "training.rollout_steps")
-    if base_k < 1:
-        raise ValueError(f"training.rollout_steps must be >= 1, got {base_k}")
-    return base_k
-
-
-# ==============================================================================
 # Dataloaders
 # ==============================================================================
 
@@ -1109,8 +1054,9 @@ def create_dataloaders(
     if batch_size <= 0:
         raise ValueError("bad batch_size")
 
-    k_train = max_rollout_steps_for_training(tcfg)
-    k_eval = max_rollout_steps_for_eval(tcfg)
+    # Both splits are sized for training.rollout_steps transitions: the validation horizon, and the
+    # training horizon's maximum (the curriculum ends at end_steps == rollout_steps, a cross-key rule).
+    k = as_int(require(tcfg, "rollout_steps"), "training.rollout_steps")
 
     loss_cfg = require_dict(tcfg, "loss")
     use_jump = float(loss_cfg["jump_weight"]) > 0.0
@@ -1118,8 +1064,8 @@ def create_dataloaders(
 
     # Every split is preloaded (single-process batch stream) as float32 tensors (the shard
     # dtype) on the preload device.
-    train_ds = FlowMapRolloutDataset(processed_dir, "train", total_steps=k_train, device=preload_device)
-    val_ds = FlowMapRolloutDataset(processed_dir, "validation", total_steps=k_eval, device=preload_device)
+    train_ds = FlowMapRolloutDataset(processed_dir, "train", total_steps=k, device=preload_device)
+    val_ds = FlowMapRolloutDataset(processed_dir, "validation", total_steps=k, device=preload_device)
 
     jump: Optional[JumpSampler] = None
     if use_jump:
@@ -1153,21 +1099,34 @@ def create_dataloaders(
     log.info(
         "Dataloaders: train(K=%d) %d trajectories, %d batches of %d per epoch (windows drawn with "
         "replacement); val(K=%d) %d of %d enumerated windows (%d trajectories x %d starts), %d batches",
-        k_train, train_ds._total_traj, train_batches, batch_size,
-        k_eval, val_stream.count, val_stream.total, val_ds._total_traj, val_stream.n_starts, len(val_dl),
+        k, train_ds._total_traj, train_batches, batch_size,
+        k, val_stream.count, val_stream.total, val_ds._total_traj, val_stream.n_starts, len(val_dl),
     )
     return train_dl, val_dl
 
 
-def _log_schedule_in_steps(cfg: Mapping[str, Any], *, steps_per_epoch: int) -> None:
-    """Log the epoch-denominated schedule lengths in optimizer steps (one step per training batch)."""
+def _log_schedule_in_steps(cfg: Mapping[str, Any], *, steps_per_epoch: int, resume: bool) -> None:
+    """Log the epoch-denominated schedule lengths in optimizer steps (one step per training batch).
+
+    `resume`: the LR schedule is restored from the checkpoint, so its length is the original run's,
+    which differs from this config's after a raised training.max_epochs (the only resume-mutable
+    schedule input).
+    """
     t = cfg["training"]
     run_steps = steps_per_epoch * int(t["max_epochs"])
     parts = [f"{steps_per_epoch} optimizer steps per epoch, up to {run_steps} per run"]
     sched = t["scheduler"]
     if sched["enabled"]:
-        parts.append(f"LR warmup {int(sched['warmup_epochs']) * steps_per_epoch}")
-        parts.append(f"plateau patience {int(sched['patience']) * steps_per_epoch}")
+        lr_part = (
+            f"LR warmup {min(int(sched['warmup_epochs']), int(t['max_epochs'])) * steps_per_epoch}, then cosine to "
+            f"{float(sched['min_lr_fraction']):g} x peak at step {run_steps}"
+        )
+        if resume:
+            lr_part += (
+                " (resume: the checkpoint's schedule continues, so after a raised max_epochs the floor is "
+                "reached at the original run's last step and the added steps train at the floor)"
+            )
+        parts.append(lr_part)
     if t["early_stopping"]["enabled"]:
         parts.append(f"early-stopping patience {int(t['early_stopping']['patience']) * steps_per_epoch}")
     if t["curriculum"]["enabled"]:
@@ -1186,33 +1145,8 @@ def _log_schedule_in_steps(cfg: Mapping[str, Any], *, steps_per_epoch: int) -> N
 # ==============================================================================
 
 
-def _checkpoint_lr(obj: Mapping[str, Any], ckpt_path: Path) -> float:
-    """The LR the checkpoint's run would train at next: its optimizer's param-group LR, strictly.
-
-    Lightning saves it after that epoch's plateau step (on_validation_epoch_end runs before the
-    checkpoint is written); the param groups differ only in weight decay, so they must share it.
-    """
-    states = obj.get("optimizer_states")
-    try:
-        lrs = {float(g["lr"]) for g in states[0]["param_groups"]}
-    except (TypeError, KeyError, IndexError) as e:
-        raise KeyError(
-            f"checkpoint {ckpt_path} has no optimizer_states[0]['param_groups'][*]['lr']: the weights_only "
-            "peak LR cap min(training.optimizer.lr, source LR) needs the source run's LR"
-        ) from e
-    if len(states) != 1 or len(lrs) != 1:
-        raise ValueError(
-            f"checkpoint {ckpt_path}: expected one optimizer whose param groups share one LR, got "
-            f"{len(states)} optimizer state(s) with LRs {sorted(lrs)}"
-        )
-    lr = lrs.pop()
-    if not (math.isfinite(lr) and lr > 0.0):
-        raise ValueError(f"checkpoint {ckpt_path}: optimizer LR {lr} is not finite and > 0")
-    return lr
-
-
-def _load_weights_only(module: FlowMapRolloutModule, ckpt_path: Path) -> float:
-    """Load Lightning checkpoint weights only (no optimizer/scheduler state), strictly; return the source LR.
+def _load_weights_only(module: FlowMapRolloutModule, ckpt_path: Path) -> None:
+    """Load Lightning checkpoint weights only (no optimizer/scheduler state), strictly.
 
     The source run must be finished (its work_dir holds COMPLETED: best.ckpt of a run that is
     still being extended is not a handoff), and the checkpoint must have been trained in this
@@ -1223,8 +1157,7 @@ def _load_weights_only(module: FlowMapRolloutModule, ckpt_path: Path) -> float:
     the checkpoint's own run had EMA enabled. The checkpoint's saved model block must equal this
     run's (comment keys ignored), every floating tensor must be finite, and any missing or
     unexpected key makes load_state_dict raise. The loss statistics (criterion buffers) are then
-    rebuilt from this run's manifest, never taken from the checkpoint. The returned LR
-    (_checkpoint_lr) caps this run's peak LR.
+    rebuilt from this run's manifest, never taken from the checkpoint.
     """
     if not ckpt_path.exists():
         raise FileNotFoundError("ckpt not found")
@@ -1266,7 +1199,6 @@ def _load_weights_only(module: FlowMapRolloutModule, ckpt_path: Path) -> float:
             "normalization statistics (or before the fingerprint existed)"
         )
     require_same_model_block(hparams.get("model"), module.hparams["model"], source=str(ckpt_path))
-    source_lr = _checkpoint_lr(obj, ckpt_path)
 
     if "ema_state_dict" in obj:
         source = "ema_state_dict"
@@ -1290,7 +1222,6 @@ def _load_weights_only(module: FlowMapRolloutModule, ckpt_path: Path) -> float:
         module.criterion.log_means.copy_(log_means)
         module.criterion.log_stds.copy_(log_stds)
     log.info("weights_only: loaded %s from %s (loss statistics from this run's manifest)", source, ckpt_path)
-    return source_lr
 
 
 def _validate_init_weights(
@@ -1677,17 +1608,8 @@ def main() -> None:
         species_variables=species_vars,
         precision=prec,
     )
-    # weights_only: the peak LR is capped at the source run's LR, so a handoff never warms above where
-    # the source run was training (a resume keeps it: base_lrs come back with the scheduler state).
-    handoff_peak_lr: Optional[Dict[str, float]] = None
     if ckpt_mode == "weights_only":
-        source_lr = _load_weights_only(lit_module, ckpt_path)
-        configured_lr = float(tcfg["optimizer"]["lr"])
-        lit_module.handoff_peak_lr = min(configured_lr, source_lr)
-        handoff_peak_lr = {"peak_lr": lit_module.handoff_peak_lr, "configured_lr": configured_lr,
-                           "source_checkpoint_lr": source_lr}
-        log.info("weights_only: peak LR %.6g = min(training.optimizer.lr %.6g, source checkpoint LR %.6g)",
-                 lit_module.handoff_peak_lr, configured_lr, source_lr)
+        _load_weights_only(lit_module, ckpt_path)
     _log_keep_all_checkpoints_estimate(cfg, total_params)
 
     ensure_dir(work_dir)
@@ -1756,7 +1678,7 @@ def main() -> None:
     )
     os.close(data_lock_fd)  # both splits are preloaded: release the processed-data lock
     train_batches_per_epoch = len(train_dl)
-    _log_schedule_in_steps(cfg, steps_per_epoch=train_batches_per_epoch)
+    _log_schedule_in_steps(cfg, steps_per_epoch=train_batches_per_epoch, resume=ckpt_mode == "resume")
 
     # On resume runs, preserve any existing metrics.csv before Lightning touches it.
     # (Non-resume modes require an empty work_dir, so nothing can exist yet.)
@@ -1789,7 +1711,6 @@ def main() -> None:
         config_snapshot_sha256=file_sha256(snapshot_path),
         checkpoint_mode=ckpt_mode,
         init_checkpoint=best_effort(lambda: _init_checkpoint_record(ckpt_path)),
-        handoff_peak_lr=handoff_peak_lr,
         processed_dir=str(processed_dir),
         norm_sha256=lit_module.hparams["norm_sha256"],
         tf32=tf32,
