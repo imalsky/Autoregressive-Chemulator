@@ -106,7 +106,7 @@ same weights. CBg's stage 2 continued from step 10,000 of a run with the same se
 The VULCAN runs, caches, truth sets, benches and checkpoints are not in this repository. `lib/paths.py` locates them
 from two environment variables, `CHEM_PROJECT` and `CHEM_SCRATCH` (defaults are those of the machine the model was
 trained on; `run/env.sh` exports them). The cache builder (`lib/rawtraj.py`) also imports `processing/preprocessing.py`
-of the 12-species code at commit 7d5b036, checked out at `paths.SNAPSHOT`, whose `normalization.json` is the default
+of the 12-species code at commit 7d5b036 (from the history before the repository was rewritten; not on GitHub), checked out at `paths.SNAPSHOT`, whose `normalization.json` is the default
 12-species normalization.
 
 Two components are separate and not included, because they are GPL-licensed: the training-data generator (a 0-D wrapper
