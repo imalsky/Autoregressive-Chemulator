@@ -25,15 +25,13 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import paths  # noqa: E402
 E = paths.E
-sys.path.insert(0, str(paths.DATAGEN))
 import score as SC  # noqa: E402
 import data as D  # noqa: E402
-import gcm  # noqa: E402
 
 assert len(D.SHORT) == 12, "run without HARNESS_NORM: the reported set is the production 12 species"
 KB = 1.380649e-16
 EDGES = [300, 800, 1300, 1800, 2300, 3001]
-SP53 = gcm.species()
+SP53 = [str(s) for s in np.load(paths.VREF / "ref_a" / "0.npz")["species"]]   # network order, from a VULCAN reference box
 ARMS = ("phys", "all", "pp", "old", "physwide", "all53u", "all53c", "allJ", "allG", "all53cfix", "res", "allJG", "physG", "resG", "all17G", "allG0", "allGst", "allGend", "allGun", "allGan", "allGcmb", "allGr", "allGw", "allGwf", "dcold", "drand", "capw", "all17E", "capw17", "big17", "allGendF", "capw17c", "base", "e12")  # base: production e9_F10fill_s0; e12: the E12 pilot control (G dt100 only)
 TESTS = {"G dt10": ("H_g10_{}", "H_gtest_dt10.npz"), "G dt100": ("H_g100_{}", "H_gtest_dt100.npz"),
          "G dt500": ("H_g500_{}", "H_gtest_dt500.npz"), "U dt10": ("H_u10_{}", "H_utest_dt10.npz"),
