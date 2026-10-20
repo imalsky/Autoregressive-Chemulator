@@ -43,7 +43,7 @@ def cases(f):
     for job in range(6):
         r = int(np.flatnonzero(d["job"] == job)[0])
         tm = d["t0"][r] + np.asarray(d["calls"], np.float64) * float(d["dt"])
-        lnd = np.log10(d["P"][r] / (S.A.KB * d["T"][r]))
+        lnd = np.log10(d["P"][r] / (S.KB * d["T"][r]))
         out.append((tm, err(B["vt"][r], B["st"][r], lnd), err(B["vt"][r], mc_logy(job, tm), lnd)))
     return out
 
