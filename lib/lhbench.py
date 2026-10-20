@@ -702,8 +702,7 @@ def main():
     ap.add_argument("--ckpt", default="stage2.pt")
     ap.add_argument("--arms", default="A,B,C,D,E")
     ap.add_argument("--dts", default="1,10,100")
-    mf = paths.BENCH_MODES   # campaign-wide default, read at start
-    ap.add_argument("--modes", default=mf.read_text().strip() if mf.exists() else "all", choices=["all", "P3", "P2P3P4"])
+    ap.add_argument("--modes", default="P3", choices=["all", "P3", "P2P3P4"])
     ap.add_argument("--renorm", action="store_true")
     ap.add_argument("--substeps", type=int, default=1)
     ap.add_argument("--v-schedule", default="rand")

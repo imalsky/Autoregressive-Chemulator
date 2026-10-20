@@ -4,7 +4,7 @@
 # Stops when <lane>/STOP exists (after the running job). Jobs move to running/, then done/ or failed/ with their log.
 #   bash runner.sh <lane_dir> <cpus>
 L=$1; C=$2
-source /home/imalsky/Chemulator_Project/code/e13-harness/run/env.sh
+source "$(dirname "$(readlink -f "$0")")/env.sh"
 mkdir -p $L/pending $L/running $L/done $L/failed
 gpu_free() {
   for p in $(nvidia-smi --query-compute-apps=pid,gpu_bus_id --format=csv,noheader | awk -F', ' '$2 ~ /B5:00.0/ {print $1}'); do
