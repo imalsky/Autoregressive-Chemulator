@@ -1,13 +1,16 @@
-"""T2 snap-back scorer. Reads the model's arm-H bench on the T2 tag (lhbench
---arms H --h-tag <t2/tag> --h-starts 1e-3 --h-dt 500, e.g. E13_gcm/H_t2tag_<label>/H_tag_dt500.npz), the tag's boxes and
-the source jobs' original truths. Per-gas rule (SCORE_RULE=phys, HARNESS_NORM unset), 12 reported species, NaN (no
-scored point) counts as 0. Box clock = elapsed time since the restart (the model starts at 1e-3 s).
+"""T2 snap-back scorer. Reads the model's arm-H bench on the T2 tag (as run/bench_dev.sh runs it: lhbench --arms H
+--h-tag <t2/tag> --h-starts 0 --h-dt 500 --h-calls 172800 --h-times <t2/times_t2.npy>, e.g.
+E13_gcm/H_t2tag_<label>/H_tag_dt500.npz), the tag's boxes and the source jobs' original truths. Per-gas rule
+(SCORE_RULE=phys, HARNESS_NORM unset), 12 reported species, NaN (no scored point) counts as 0.
+Time origin: each box is a VULCAN run from the kicked (or identity) state at its own t = 0, the restart; the model starts
+from that same state (start age 0; the bench's t0 must equal T0 = 0). tau = calls x 500 s is the time since the restart
+on the box clock and the model clock alike; the original truth is read at t_r + tau.
 Per kicked row (k1p, k1m, k2p, k2m, k3), with its identity partner k0 (same source job and t_r):
   s0(tau) = e(V_k, V_0) separation (primary), sO = e(V_k, O(t_r + tau)) vs the original truth, c = e(V_0, O) calibration;
   E_k = e(M_k, V_k), E_0 = e(M_0, V_0) surrogate errors (max over species); X0 = max_{tau>=1e3} E_k - max_{tau>=1e3} E_0;
   d = e(M_k, M_0) model deviation; A = d - s0 on the half-time species q (kicked species; max over 12 for k3);
-  D0 = s0_q(1e-3 s); half-times (first time after which the deviation stays < D0 / 2): h_V on the kicked box's own
-  steps, h_Vg and h_M on the model checkpoints; growth = max_{tau>=1e3} E_k - E_k(500 s).
+  D0 = s0_q(0), at the restart; half-times (first time after which the deviation stays < D0 / 2): h_V on the kicked
+  box's own steps, h_Vg and h_M on the model checkpoints; growth = max_{tau>=1e3} E_k - E_k(500 s).
 Rules (protocol.txt sec. 3), verdict inside env_any+margin (region "in"); readouts by band, region, class, tier, t_r.
 Writes <out stem>.txt and <out stem>.json.
     CUDA_VISIBLE_DEVICES= SCORE_RULE=phys PYTHONDONTWRITEBYTECODE=1 taskset -c 9,11 $PY score_t2.py <bench npz> <out stem>"""
