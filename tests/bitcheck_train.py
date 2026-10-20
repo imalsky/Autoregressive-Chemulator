@@ -52,7 +52,6 @@ DROP = {"time", "s_per_step", "peak_mem_gb"}          # log fields that are not 
 NEG = ("lambda_log10_mae=1.0,", "lambda_log10_mae=1.0 + 2.0 ** -20,")   # negative control: (old, new) in train.py
 
 
-# ----------------------------------------------------------------------------------------------------------- worker
 def hashes(ts):
     return [[str(t.dtype), list(t.shape), hashlib.sha256(t.detach().cpu().contiguous().numpy().tobytes()).hexdigest(),
              float(t.detach().double().sum())] for t in ts]
@@ -106,7 +105,6 @@ def worker(lib, run, out):
     Path(out).write_text(json.dumps(rec))
 
 
-# ----------------------------------------------------------------------------------------------------- orchestrator
 def setup():
     """The environment and the modes, from this repository's lib/paths.py. Imported here, in the orchestrator only: a
     worker must import the modules of the lib it tests (a cached 'paths' would leak into a reference copy)."""

@@ -1,7 +1,7 @@
 """Inference cost of one model call: wall time per call and per cell for a batch of cells,
 the call being the GCM's step: fp64 normalized state z -> model.delta(z fp32, dt, T/P globals) -> z += delta (fp64).
 GPU: CUDA graph of the whole step, TF32 off, 200 timed replays after warm-up. CPU: eager, 1 and 8 threads. Inputs are
-random in the normalized ranges (cost does not depend on values). Writes paths.OUT/speed_<run>.json.
+random in the normalized ranges. Writes paths.OUT/speed_<run>.json.
     python speed.py <run> [<closed heads' Newton iterations>]
 <run>: a run name under paths.RUNS or a run folder (SPEED_NAME names the output instead of the folder); the state width is
 the normalization file's entry count (lhbench: M.S). SPEED_FALLBACK=lm times the closed head with the LM rescue on every

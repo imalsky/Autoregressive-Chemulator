@@ -20,7 +20,7 @@ import torch
 
 import paths
 
-CACHE = Path(os.environ.get("ARCH_CACHE", str(paths.ARCH_TESTS)))   # the cache
+CACHE = Path(os.environ.get("ARCH_CACHE", str(paths.ARCH_TESTS)))
 NORM_PATH = Path(os.environ.get("HARNESS_NORM") or str(paths.NORM12))  # the normalization file (empty = unset)
 NORM = json.loads(NORM_PATH.read_text())   # NORM_PATH is also recorded in the model manifests (train.write_manifest)
 SPECIES = list(NORM["species_variables"])

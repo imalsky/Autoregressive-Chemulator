@@ -77,7 +77,7 @@ for lab in sys.argv[1:]:
             w_late = [v for key, v in j.items() if key.startswith("calls ") and not key.startswith("calls 0-")][0]
             d = np.load(f)
             pf = d["projfail"] if "projfail" in d.files else None
-            r[k] = {"paths": int(j["paths"]) if isinstance(j["paths"], (int, float)) else len(j["paths"]),
+            r[k] = {"paths": int(j["paths"]),
                     "max_all": float(w_all["max"]), "late_p50": float(w_late["p50"]), "late_p99": float(w_late["p99"]),
                     "newton_fail_rows": None if pf is None else int((pf[..., 0].sum(0) > 0).sum()),
                     "kept_rows": None if pf is None else int((pf[..., 1].sum(0) > 0).sum())}

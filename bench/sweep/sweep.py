@@ -1,4 +1,4 @@
-"""Step-size sweep runner (no step size may be a weak spot). One GPU run per model evaluates every dt in --dts at once: each
+"""Step-size sweep runner. One GPU run per model evaluates every dt in --dts at once: each
 row = (dt, start age, tag job) keeps its own fixed dt for N calls; all rows are batched in one rollout. Arm H machinery of
 lhbench.py in --lib (default: this repository's lib/; <run>/harness/lib = a run's frozen copy; imported read-only): start
 state = the VULCAN tag's own log10 y at the start age (lhbench.vref_logy), g = data.norm_globals(job P, T), truth = the same tag. The per-row dt is

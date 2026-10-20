@@ -423,7 +423,7 @@ def run_stage(stage, cfg, model, train, vy, vdt, vg, mu, sd, run, log, pr=None):
     nskip = nskip_log = 0                                           # skip_nonfinite: steps skipped so far, at the last log row
     ck = run / f"ckpt_stage{stage}.pt"
     step0 = 0
-    if cfg["resume"] and ck.exists():  # continue exactly where the last checkpoint left off
+    if cfg["resume"] and ck.exists():
         blob = torch.load(ck, map_location=dev, weights_only=False)
         model.load_state_dict(blob["model"])
         ema.shadow.load_state_dict(blob["ema"])
@@ -440,7 +440,7 @@ def run_stage(stage, cfg, model, train, vy, vdt, vg, mu, sd, run, log, pr=None):
     for step in range(step0, steps):
         for pg in opt.param_groups:
             pg["lr"] = lr_at(step, steps, peak, warm, cfg["lr_min_frac"])
-        if lock:   # stage 2: the one-step, jump, grid and chain terms (lock_terms)
+        if lock:
             loss, cl, tail, n_pre, kc = lock_terms(lfns, crit, train, cs, cfg, step, gen, pre_gen, mu, sd, rep,
                                                    (step + 1) % 50 == 0)
             loss = loss + cfg["chain_w"] * cl
@@ -451,7 +451,7 @@ def run_stage(stage, cfg, model, train, vy, vdt, vg, mu, sd, run, log, pr=None):
                 cacc[0] += float(cl.detach())
                 cacc[1] += float(tail.detach())
                 cacc[2] += 1
-        else:      # stage 1: one-step windows (teacher forcing)
+        else:
             z, dtn, g, _ = train.sample(cfg["batch"], 1, gen)
             z0 = z[:, 0]
             d_true = (z[:, 1] - z0).float()
