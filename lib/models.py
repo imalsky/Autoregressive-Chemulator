@@ -13,16 +13,9 @@ Levenberg-Marquardt when fallback is "lm"; otherwise (fallback "keep", or LM fai
 The entry set (S, SPECIES) is set by train.py and lhbench.py from the normalization file before a model is built.
 """
 import math
-import sys
-from pathlib import Path
 
 import torch
 import torch.nn as nn
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import paths  # noqa: E402
-sys.path.insert(0, str(paths.SNAP_SRC))  # pinned snapshot (model.ResidualMLP)
-from model import ResidualMLP  # noqa: E402
 
 S, G = 12, 2                        # entries, globals (P, T); S is reset from the normalization file
 SPECIES = None                      # entry names, set with S
@@ -40,6 +33,80 @@ def mu_sd(zlo, zhi):
     as the model was trained)."""
     sd = -EPS_LOG10 / (zhi.double() - zlo.double())
     return (-zhi.double() * sd).float(), sd.float()
+
+
+def _init_linear_xavier(linear, *, scale=1.0):
+    """Variance-preserving init; optionally scales weights."""
+    nn.init.xavier_uniform_(linear.weight)
+    if linear.bias is not None:
+        nn.init.zeros_(linear.bias)
+    if scale != 1.0:
+        with torch.no_grad():
+            linear.weight.mul_(float(scale))
+
+
+class ResidualMLP(nn.Module):
+    """Residual MLP with per-layer skip connections (the trunk of the 12-species model, tag paper-v1, src/model.py).
+
+    Per hidden layer:
+        h = LN( proj(h) + Dropout(Act(Linear(h))) )
+    """
+
+    def __init__(self, input_dim, hidden_dims, output_dim, activation_factory, dropout_p=0.0, *, layer_norm, layer_norm_eps):
+        super().__init__()
+
+        dims = [int(input_dim)] + [int(d) for d in hidden_dims]
+        h_dims = [int(d) for d in hidden_dims]
+        use_ln = bool(layer_norm)
+
+        self.linears = nn.ModuleList()
+        self.projs = nn.ModuleList()
+        self.acts = nn.ModuleList()
+        self.drops = nn.ModuleList()
+        self.norms = nn.ModuleList()
+
+        for i in range(len(h_dims)):
+            in_d, out_d = dims[i], dims[i + 1]
+            self.linears.append(nn.Linear(in_d, out_d))
+            self.acts.append(activation_factory())
+            self.drops.append(nn.Dropout(p=float(dropout_p)) if float(dropout_p) > 0.0 else nn.Identity())
+            self.projs.append(nn.Identity() if in_d == out_d else nn.Linear(in_d, out_d, bias=False))
+            self.norms.append(nn.LayerNorm(out_d, eps=float(layer_norm_eps)) if use_ln else nn.Identity())
+
+        self.out = nn.Linear(dims[-1], int(output_dim))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Xavier init throughout + conservative scaling on the residual branch.
+        n_layers = max(1, len(self.linears))
+        residual_scale = 1.0 / math.sqrt(float(n_layers))
+
+        for lin in self.linears:
+            _init_linear_xavier(lin, scale=residual_scale)
+
+        for proj in self.projs:
+            if isinstance(proj, nn.Linear):
+                _init_linear_xavier(proj)
+
+        _init_linear_xavier(self.out)
+
+    def forward(self, x):
+        # Under autocast (bf16-mixed) the input block, which reads the raw state, P and T, and the
+        # output layer run in fp32. Without autocast (fp32, torch.export) the plain loop runs.
+        fp32_islands = torch.is_autocast_enabled(x.device.type)
+        h = x
+        for i, (lin, act, drop, proj, norm) in enumerate(zip(self.linears, self.acts, self.drops, self.projs, self.norms)):
+            if fp32_islands and i == 0:
+                with torch.autocast(device_type=h.device.type, enabled=False):
+                    h = h.float()
+                    h = norm(proj(h) + drop(act(lin(h))))
+                continue
+            h = proj(h) + drop(act(lin(h)))
+            h = norm(h)
+        if fp32_islands:
+            with torch.autocast(device_type=h.device.type, enabled=False):
+                return self.out(h.float())
+        return self.out(h)
 
 
 class RelaxHead(nn.Module):

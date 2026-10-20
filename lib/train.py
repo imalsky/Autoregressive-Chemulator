@@ -35,15 +35,14 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import paths  # noqa: E402
-sys.path.insert(0, str(paths.SNAP_SRC))  # pinned snapshot (trainer.HybridLoss)
 import data as D  # noqa: E402
 import models as M  # noqa: E402
 import chains as C  # noqa: E402
 M.S, M.SPECIES = len(D.SHORT), list(D.SHORT)  # the entry set follows the normalization file
-from trainer import HybridLoss  # noqa: E402
 
 DEFAULTS = {
     "head": "relaxclosedr",     # the only head (models.build)
@@ -94,6 +93,32 @@ DEFAULTS = {
                                 # the pre-clip norm's median (gnorm_p50, per grid sub-step count gnorm_p50_nsub), max and
                                 # the steps above 1e3 (gnorm_gt1e3)
 }
+
+
+class HybridLoss(nn.Module):
+    """Two-term loss on [B, K, S] z-space predictions (z = (log10 y - log_mean) / log_std): lambda_log10_mae x the mean
+    |dlog10 y| (= |dz| log_std; the log mean cancels) + lambda_z_mse x the mean dz^2, in loss_dtype. The loss of the
+    12-species model (tag paper-v1, src/trainer.py), without its per-step weights."""
+
+    def __init__(self, log_means, log_stds, *, lambda_log10_mae, lambda_z_mse, loss_dtype=torch.float32):
+        super().__init__()
+        self.loss_dtype = loss_dtype
+        self.register_buffer("log_means", log_means.clone().detach().to(dtype=loss_dtype))
+        self.register_buffer("log_stds", log_stds.clone().detach().to(dtype=loss_dtype))
+        self.lambda_log10_mae = float(lambda_log10_mae)
+        self.lambda_z_mse = float(lambda_z_mse)
+
+    def forward(self, pred_z, true_z):
+        if pred_z.shape != true_z.shape:
+            raise ValueError(f"Shape mismatch: pred_z={tuple(pred_z.shape)} true_z={tuple(true_z.shape)}")
+        if pred_z.ndim != 3:
+            raise ValueError(f"Expected [B,K,S], got {tuple(pred_z.shape)}")
+        diff_z = (pred_z - true_z).to(self.loss_dtype)
+        z_mse = diff_z.square().mean()
+        diff_log10 = diff_z.abs().mul(self.log_stds)
+        log10_mae = diff_log10.mean()
+        loss_total = self.lambda_log10_mae * log10_mae + self.lambda_z_mse * z_mse
+        return {"loss_total": loss_total, "loss_log10_mae": log10_mae, "loss_z_mse": z_mse}
 
 
 class RowClip(torch.autograd.Function):
