@@ -1,11 +1,16 @@
-"""E12: harness cache from the packed Sobol raw files only (blocks 0 to K-1 = the first K * 2^16 design rows), through
-rawtraj._work unchanged (RAWTRAJ_FLOOR=1: floored, no drop_below rejection; split by production's hash of file and
-group name). Each block file is cut into n_per chunks.
+"""E13: harness cache from the packed gcm.py raw files (blocks 0 to K-1), through rawtraj._work unchanged
+(RAWTRAJ_FLOOR=1: floored, no drop_below rejection; production's split by file and group name; the 12 tracked
+species). GCM_KINDS (comma list of eq, mix, pert, broad, kick; default eq, mix, pert, broad) keeps only groups of those
+start types (the group's 'start' attr, which every packed group carries). Groups that hit VULCAN's step cap (end_case 3:
+truncated, then held constant) are left out. GCM_SPECIES=all caches every network species (the packs' 'species' attr,
+the generator's order, He included) instead of the 12. Each block file is cut into n_per chunks. Reads the packed files
+only (no generator import).
 
-    RAWTRAJ_FLOOR=1 ARCH_CACHE=<dir> python cache_sobol.py chunk <K> <n_per> <i>    (i < K * n_per)
-    RAWTRAJ_FLOOR=1 ARCH_CACHE=<dir> python cache_sobol.py merge <K> <n_per>
+    RAWTRAJ_FLOOR=1 ARCH_CACHE=<dir> [GCM_KINDS=eq,mix] python cache_gcm.py chunk <K> <n_per> <i>
+    RAWTRAJ_FLOOR=1 ARCH_CACHE=<dir> python cache_gcm.py merge <K> <n_per>
 """
 import json
+import os
 import pickle
 import sys
 from pathlib import Path
@@ -18,15 +23,39 @@ import paths  # noqa: E402
 import rawtraj as R  # noqa: E402
 
 assert R.FLOOR
-RAW = paths.RAW_SOBOL
+RAW = Path(os.environ.get("GCM_RAW", str(paths.RAW_GCM)))  # override: tests
+KINDS = set(os.environ.get("GCM_KINDS", "eq,mix,pert,broad").split(","))
+FILES = os.environ.get("GCM_FILES")  # sprint 2026-10-08: comma list of K raw basenames under GCM_RAW (else run_gcm_bNN)
+
+
+def pack_species(f):
+    """The network species of an open packed file, in stored order (its 'species' attr)."""
+    return [s.decode() for s in f.attrs["species"]]
+
+
+SPECIES_ALL = None
+if os.environ.get("GCM_SPECIES") == "all":
+    import dataclasses
+    with h5py.File(RAW / (FILES.split(",")[0] if FILES else "run_gcm_b00-result.h5"), "r") as _f:
+        SPECIES_ALL = pack_species(_f)
+    _cfg0 = R._cfg
+    R._cfg = lambda: dataclasses.replace(_cfg0(), species_variables=[s + "_evolution" for s in SPECIES_ALL])
+
+
+def kind(g):
+    """Start type: the group's 'start' attr (for design rows it equals the design's kind)."""
+    return str(g.attrs["start"])
 
 
 def jobs(K, n_per):
     out = []
-    for b in range(K):
-        fp = RAW / f"run_sobol_b{b:02d}-result.h5"
+    files = FILES.split(",") if FILES else [f"run_gcm_b{b:02d}-result.h5" for b in range(K)]
+    assert len(files) == K, (files, K)
+    for fn in files:
+        fp = RAW / fn
         with h5py.File(fp, "r") as f:
-            names = list(f.keys())
+            assert SPECIES_ALL is None or pack_species(f) == SPECIES_ALL, f"{fp}: species differ from the first file's"
+            names = [n for n in f.keys() if int(f[n].attrs["end_case"]) != 3 and kind(f[n]) in KINDS]
         step = -(-len(names) // n_per)
         out += [(str(fp), names[k:k + step]) for k in range(0, len(names), step)]
     assert len(out) == K * n_per
@@ -38,7 +67,7 @@ def chunk(K, n_per, i):
     R.CACHE_DIR.mkdir(parents=True, exist_ok=True)
     with open(R.CACHE_DIR / f"part_{i}.pkl", "wb") as f:
         pickle.dump(res, f, protocol=pickle.HIGHEST_PROTOCOL)
-    print(f"chunk {i}: rejects {res[2]}", flush=True)
+    print(f"chunk {i}: kinds {sorted(KINDS)}, rejects {res[2]}", flush=True)
 
 
 def merge(K, n_per):
