@@ -1,6 +1,5 @@
 #!/bin/bash
-# Development benches of one model (scale phase q/bench6.sh, plus the T2 and SD sets of the candidate drivers p/cbg.sh and
-# p/cbgp.sh, same flags). Every set runs this repository's lib/lhbench.py with the P* inference policy (--modes P3
+# Development benches of one model. Every set runs this repository's lib/lhbench.py with the P* inference policy (--modes P3
 # --closed-iters 32 --closed-fallback lm --lm-adaptive), HARNESS_NORM = arch_gcm17m_res/norm.json; path sets with
 # LHB_BLOCK 50, the combined and T2 / SD arm-H benches with LHB_BLOCK ${BLK_H:-10} (memory). Never change the rows per call
 # of a bench: results differ by up to 7e-4 dex across batch shapes. A bench whose meta.json exists is skipped.
@@ -10,9 +9,9 @@
 #   T2                 the snap-back tag (paths.T2/tag), then bench/score_t2.py -> paths.T2/score_t2_<label>.{json,txt}
 #   SD0.1 SD1          10,000 calls of dt 0.1 / 1 s from VULCAN's states at 1e3 and 1e6 s on devall6 (bench/sd_score.py)
 #   FIG4               the six mini-chem paper cases (paths.FIG4/tag, raw gas from VULCAN's state at 1e-3 s): 5,000 calls
-#                      at dt 1, 20 and 500 s, every call recorded (scale phase l/l1.sh f4) -> paths.FIG4/l_<label>_dt<dt>;
+#                      at dt 1, 20 and 500 s, every call recorded -> paths.FIG4/l_<label>_dt<dt>;
 #                      score with bench/score_minichem.py (add (name, 'l_<label>') to its MOD)
-#   PH2 H4ALL          the sealed path set and fixed-condition sets: opened once, on a frozen recipe, by the author's decision
+#   PH2 H4ALL          the sealed path set and fixed-condition sets: opened once, on a frozen recipe, by explicit decision
 #   bash bench_dev.sh <run dir> <label> <CPUs> [sets, default "PD PX P2l P2s PH DEV6"]   (GPU1; logs in $LOGS)
 source "$(dirname "$(readlink -f "$0")")/env.sh"
 set -u

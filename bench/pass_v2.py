@@ -1,6 +1,4 @@
-"""Pass rule v2 (author 2026-10-19: "get rid of the rule that prioritizes avoiding rare large misses so much"; project
-CLAUDE.md "Large misses are readouts, not vetoes"). Replaces l/judge.py's passes() and p/judge_cb.py's helps() for decisions
-from 2026-10-19 on. Input: a rules_t5.py verdict json j (X = x, reference R = r).
+"""Pass rule v2: large misses are readouts, not vetoes. Input: a rules_t5.py verdict json j (X = x, reference R = r).
   passes_v2(j, x, r): inside the envelope, lasting > 0.5 X <= 0.90 x R, late > 0.5 X <= R, lasting fixed >= 2 x broken, late
   fixed >= broken; T2 snap-back (P3); finite states (G5: no non-finite or kept-input rows, Newton failures bounded); cooler
   stratum lasting > 0.5 X <= R + 3 and late > 0.5 X <= 1.10 x R. INVALID / INCONCLUSIVE / missing counts never pass.

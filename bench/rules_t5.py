@@ -1,13 +1,13 @@
-"""T5 decision rules, executable and fail-closed (t5/rules.txt is the text; both fixed before any T5 result; Codex must-fix 4,
-reviewer must-fixes 1 and 6). Arm X (D) vs reference R (C0), FINAL as the G6 anchor, all benched with run/bench_dev.sh (six
+"""T5 decision rules, executable and fail-closed (the rule text and this code were fixed before any result they judged).
+Arm X vs reference R, FINAL as the G6 anchor, all benched with run/bench_dev.sh (six
 fixed sets through DEV6, five path sets, T2). No model call, no GPU.
 Rows: job x start age (1e-3, 1e3, 1e6 s) of G, Gc, H2, H2c, H3, H3c (score_mask.rows, per-gas rule, SCORE_RULE=phys);
 late = max over checkpoints >= 1e3 s elapsed; lasting = the last checkpoint (1000 days); paired by (set, job, start age).
 inside = env_any+margin (select_jobs.env_margin); outside = not inside; cooler = 300 <= T < 1300 K and 1e-5 <= P <= 100
 bar (overlaps inside). "fixed" = R > 0.5 and X <= 0.5; "broken" = R <= 0.5 and X > 0.5 (same row).
 Order: INVALID (a missing / failed output, row order mismatch, T2 json INVALID or not reproducible) -> INCONCLUSIVE (C0
-moves lasting > 0.5 inside by >= 20 % vs FINAL: fine-tune churn; to the author) -> ADOPT (P1-P3 and G1-G7 all pass) ->
-NO GAIN (lasting inside X >= 0.90 x R and T2 mean change < +0.02: lever closed this phase) -> NOT ADOPTED (everything
+moves lasting > 0.5 inside by >= 20 % vs FINAL: fine-tune churn) -> ADOPT (P1-P3 and G1-G7 all pass) ->
+NO GAIN (lasting inside X >= 0.90 x R and T2 mean change < +0.02: the lever is closed) -> NOT ADOPTED (everything
 else: partial gain 0.80-0.90 x R, snap-back only, any guard failure; failing rows read and reported).
     SCORE_RULE=phys HARNESS_NORM= python rules_t5.py <X label> <R label> [--final L] [--t2x json] [--t2r json]
         [--t2npz-x npz] [--t2npz-r npz] [--out stem]
@@ -31,7 +31,7 @@ import score_t2 as ST  # noqa: E402  (rules(): the T2 protocol's five rules)
 S, E = M.S, M.E
 T2DIR = paths.T2
 RULES5 = ("a_k1", "a_k2", "a_k3", "b", "c")
-FIN_LATE2_IN, FIN_LAST05_IN = 5, 61          # G6 thresholds (plan.txt sec. 5; FINAL inside: late > 2 = 4, lasting > 0.5 = 61)
+FIN_LATE2_IN, FIN_LAST05_IN = 5, 61          # G6 thresholds (FINAL inside: late > 2 = 4, lasting > 0.5 = 61)
 
 ap = argparse.ArgumentParser()
 ap.add_argument("x")

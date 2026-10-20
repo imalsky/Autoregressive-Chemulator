@@ -1,5 +1,5 @@
-"""Rows of fixed-condition benches with a late (>= 1e3 s) point > 2 dex or any point > 5 dex, per set and label (fixes
-phase 2026-10-12): job, start, T, P, late max, first-call max, worst species. Pairs labels side by side on the union of
+"""Rows of fixed-condition benches with a late (>= 1e3 s) point > 2 dex or any point > 5 dex, per set and label: job,
+start, T, P, late max, first-call max, worst species. Pairs labels side by side on the union of
 flagged rows.   SCORE_RULE=phys python rows_gt2.py <set> <label> [<label> ...]      (HARNESS_NORM unset)"""
 import os
 import sys

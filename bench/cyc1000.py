@@ -1,17 +1,12 @@
-"""Model-only 1000-day changing-condition run (plan Day 3 item 11, run early on Gate-B candidates; 2026-10-10). No truth past
-58 days, so it checks boundedness, not accuracy. Each of the 16 xlong paths (paths_v2x: VULCAN start, per-call T, P, dt,
+"""Model-only 1000-day changing-condition run. No truth past 58 days, so it checks boundedness, not accuracy. Each of the 16 xlong paths (paths_v2x: VULCAN start, per-call T, P, dt,
 10,000 calls = 58 days) is repeated until 1000 days of model time (~17 cycles, ~172k calls), as lhbench's P3 mode: fp64
 normalized state, z += delta(z fp32, dt, T/P) fp64, a call is rejected (state kept, counted) if non-finite or outside the
 log10 envelope [-40, 0.05]. Recorded at every cycle end (same forcing phase): the 12 reported species' log10 mixing ratios,
 the sum of the 12, and for the whole entry set the element ratios C/H, O/H, N/H (12-species states: over the 12; reservoir
 sets: over all entries). Reported: per path, the change of the reported species between successive cycle ends (max over
-species, dex), the largest |d log10 ratio| vs the start, sum12 max, rejected calls, and whether the state is finite.
-Fixes phase 2026-10-13 copy (conservation-phase checks/cyc1000.py): inference policy P* for closed heads (fallback lm:
-the LM rescue where Newton fails) and the per-row projection counters (Newton failed / kept input) in the output.
-T6 copy (scale phase 2026-10-15, Codex review of T6 AMENDMENT 1, must-fix 1): the 12 reported gases are picked from the
-entry set by name (chains.REPORTED), not as the first 12 entries (right for 12- and 25-entry sets, wrong for 53); the
-same columns as before for FINAL, so its 10-14 numbers stay comparable (and, for 25-entry sets such as CBg's, the
-same columns as the fixes-phase copy checks/cyc1000_fx.py that CBg's stored run used).
+species, dex), the largest |d log10 ratio| vs the start, sum12 max, rejected calls, the per-row projection counters
+(Newton failed / kept input) and whether the state is finite. Closed heads run with fallback lm (the LM rescue where
+Newton fails). The 12 reported gases are picked from the entry set by name (chains.REPORTED).
     HARNESS_NORM=<the run's norm.json> python cyc1000.py <run dir> <out json> [<closed iterations>]   (GPU)"""
 import json
 import re

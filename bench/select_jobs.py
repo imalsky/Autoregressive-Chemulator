@@ -1,4 +1,4 @@
-"""T2 snap-back test, step 1 (scale phase, 2026-10-14): source jobs from the six development sets (G, Gc, H2, H2c, H3, H3c).
+"""T2 snap-back test, step 1: source jobs from the six development sets (G, Gc, H2, H2c, H3, H3c).
 Read-only on every input; writes paths.T2/jobs.txt and jobs_sel.json (refuses to overwrite them: they define the
 stored T2 tag). env_margin() is the envelope every decision scorer uses.
 
@@ -161,7 +161,7 @@ def main():
             f"{sum(e['stratum'] == 'strat' for e in out)} stratified inside env_any+margin + "
             f"{sum(e['stratum'] == 'cool' for e in out)} cooler stratum.",
             f"env_any bins (n_models >= 1): {n_env}; after the +-100 K / +-0.1 dex margin: {n_envm} (of 140 x 176).",
-            f"region: in = inside env_any+margin; cool = 300-1300 K, 1e-5..100 bar, outside it; out = anything else (miss jobs only).",
+            "region: in = inside env_any+margin; cool = 300-1300 K, 1e-5..100 bar, outside it; out = anything else (miss jobs only).",
             "kick species: dom_sp (miss jobs) first, else the band default; build_kicks.py falls back down the list "
             "[dom_sp, band default, CH4, C2H2, CO2, H2O] to the first species with truth x >= 10 S at t_r.",
             "band defaults: 300-650 K CH4, 650-1300 K C2H2, 1300-2000 K CO2, 2000-3000 K H2O."] + log + \

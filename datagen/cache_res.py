@@ -1,9 +1,9 @@
-"""E13: a reservoir-set cache and its normalization from the 53-species cache (same groups, order, split, end/conv,
+"""A reservoir-set cache and its normalization from the 53-species cache (same groups, order, split, end/conv,
 P, T, seed). Entries: the 12 reported species (production order), He, the 7 species a greedy element-coverage pass
 added first on eq/mix states (C, N, CH3, H2CN, C2H6, CN, O2), and 5 reservoirs over the remaining 33 species: C_res,
 N_res, O_res, H_res (atoms of each element) and M_res (molecule count). log10 max(value, 1e-30). Element ratios to H
 and sum 1 over molecules (tracked + M_res) equal those of the full 53-species state. The normalization is the
-production file with the species entries replaced by training-split statistics (norm53.py's rule, log_std >= 0.5).
+12-species file with the species entries replaced by training-split statistics (log_std floored at 0.5).
 
     python cache_res.py <53-species cache dir> <out dir>
 """

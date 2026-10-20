@@ -1,4 +1,4 @@
-"""Development-board readouts restricted to a region of (T, P) (scale phase, 2026-10-14). No model call, no GPU: reads the
+"""Development-board readouts restricted to a region of (T, P). No model call, no GPU: reads the
 existing P* benches of a bench label (E13_gcm/<set>_<label>) with scoreboard.bench (per-gas rule, SCORE_RULE=phys).
 
 A mask is any function inside(T_K, P_bar) -> bool array. Two makers:

@@ -8,7 +8,7 @@ source "$(dirname "$(readlink -f "$0")")/env.sh"
 mkdir -p $L/pending $L/running $L/done $L/failed
 gpu_free() {
   for p in $(nvidia-smi --query-compute-apps=pid,gpu_bus_id --format=csv,noheader | awk -F', ' '$2 ~ /B5:00.0/ {print $1}'); do
-    u=$(ps -o user= -p $p 2>/dev/null | tr -d ' '); [ -n "$u" ] && [ "$u" != imalsky ] && return 1
+    u=$(ps -o user= -p $p 2>/dev/null | tr -d ' '); [ -n "$u" ] && [ "$u" != "$(id -un)" ] && return 1
   done; return 0; }
 echo "$(date) runner $L on CPUs $C"
 while true; do

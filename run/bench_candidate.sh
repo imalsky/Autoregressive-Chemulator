@@ -1,5 +1,5 @@
 #!/bin/bash
-# Candidate bench and judge (template of the scale phase's p/cbgp.sh with the run as an argument; GPU1 alone, checked first):
+# Candidate bench and judge (GPU1 alone, checked first):
 # (1) idle-GPU speed (bench/speed.py, 32 Newton iterations; Newton only, then the LM rescue on every row) -> paths.OUT/
 #     speed_<label>_idle_{keep,lm}.json; (2) the model-only 1000-day run (bench/cyc1000.py) -> paths.OUT/cyc1000_<label>.json;
 # (3) every development set (run/bench_dev.sh: PD PX P2l P2s PH DEV6 T2 SD0.1 SD1), one bench at a time; (4) bench/judge.py

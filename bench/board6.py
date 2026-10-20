@@ -1,6 +1,4 @@
-"""Development board of the scale phase (2026-10-13; plan + amendment in _build/log.txt). Replaces the fixes phase's
-board_fx.py, which left H3 / H3c out of the totals, skipped missing sets silently and kept the removed 5-dex rule.
-Per bench label (E13_gcm/<set>_<label>):
+"""Development board: per bench label (E13_gcm/<set>_<label>):
   fixed-condition sets G, Gc, H2, H2c, H3, H3c: rows (job x start age) with a late (>= 1e3 s) point > 0.5 / > 2 dex,
   first-call rows > 2, the max over every checkpoint (readout only), invented-switch rows (late error > 2 dex in a species
   whose prediction moves > 2 dex over the late checkpoints while its truth moves < 0.5 dex, floors applied), rows with a
@@ -33,7 +31,7 @@ PSETS = {"PD": (f"{OLD}/dev", "2500-"), "PX": (f"{S.E}/paths_v2x", "2500-"), "P2
          "P2s": (f"{S.E}/paths_v2s", "50-"), "PH": (f"{OLD}/hold", "2500-"),
          "PH2": (f"{OLD}/hold2", "2500-")}   # sealed: opened once
 FIXED = ("G", "Gc", "H2", "H2c", "H3", "H3c")
-SEALED = ("H4", "H4c")  # sealed sets, opened once at the phase's end: BOARD_SETS="H4 H4c PH2", totals over H4 + H4c alone
+SEALED = ("H4", "H4c")  # sealed sets, opened once on a frozen recipe: BOARD_SETS="H4 H4c PH2", totals over H4 + H4c alone
 want = os.environ.get("BOARD_SETS", " ".join(FIXED + ("PD", "PX", "P2l", "P2s", "PH"))).split()
 L = np.array([SR.PHYS[s] for s in S.SP])
 

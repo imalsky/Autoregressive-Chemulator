@@ -1,5 +1,6 @@
 """Split a combined arm-H bench (datagen/combine_tags.py tag) back into the per-set files lhbench writes, so the boards read them
-unchanged (fixes phase 2026-10-12; scale-phase copy 2026-10-13 adds the sealed H4 / H4c, opened once at the phase's end). Rows of set s = the rows whose job's 'orig' is 's:<id>', in combined order (start-major,
+unchanged (also the sealed H4 / H4c, opened once on a frozen recipe). Rows of set s = the rows whose job's 'orig' is
+'s:<id>', in combined order (start-major,
 ids ascending = the per-set order); job -> the set's own id, tag -> the set's own path; states split on axis 2, nint / first /
 projfail on axis 1; calls, dt, seconds, nredo copied (seconds and nredo are the combined run's). The (job, t0) order is
 asserted equal to a reference per-set bench of the same set where one exists (REF below). Refuses to overwrite.

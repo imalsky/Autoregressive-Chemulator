@@ -1,4 +1,4 @@
-"""Inference cost of one model call (plan section R-early (e)): wall time per call and per cell for a batch of cells,
+"""Inference cost of one model call: wall time per call and per cell for a batch of cells,
 the call being the GCM's step: fp64 normalized state z -> model.delta(z fp32, dt, T/P globals) -> z += delta (fp64).
 GPU: CUDA graph of the whole step, TF32 off, 200 timed replays after warm-up. CPU: eager, 1 and 8 threads. Inputs are
 random in the normalized ranges (cost does not depend on values). Writes paths.OUT/speed_<run>.json.
@@ -24,7 +24,7 @@ RUN = os.environ.get("SPEED_NAME") or Path(SPEC).name
 NEWTON = int(sys.argv[2]) if len(sys.argv) > 2 else None
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
-FALLBACK = os.environ.get("SPEED_FALLBACK")  # 2026-10-12: 'lm' times relaxclosedr with the LM rescue on every row
+FALLBACK = os.environ.get("SPEED_FALLBACK")  # 'lm' times the closed head with the LM rescue on every row
 out = {"run": RUN, "closed_iters": NEWTON, "fallback": FALLBACK, "gpu": {}, "cpu1": {}, "cpu8": {}}
 
 
@@ -74,7 +74,7 @@ with torch.no_grad():
         torch.cuda.empty_cache()
 cpu_model = set_fallback(LB.load_model(SPEC, "stage2.pt", torch.device("cpu"), NEWTON)[0])
 CPU_RUNS = () if os.environ.get("SPEED_GPU_ONLY") else (("cpu1", 1, (1, 10, 100, 1000, 10_000)),
-                                                          ("cpu8", 8, (1, 10, 100, 1000, 10_000, 100_000)))  # 2026-10-12
+                                                          ("cpu8", 8, (1, 10, 100, 1000, 10_000, 100_000)))
 for key, nth, sizes in CPU_RUNS:
     torch.set_num_threads(nth)
     with torch.no_grad():

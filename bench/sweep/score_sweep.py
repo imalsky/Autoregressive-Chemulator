@@ -1,4 +1,4 @@
-"""Score step-size sweeps (sweep.py outputs) with the project rule and combine the nine dt with equal weight (2026-10-19).
+"""Score step-size sweeps (sweep.py outputs) with the per-gas rule and combine the nine dt with equal weight.
 Truth = the row's VULCAN tag at t0 + tcum (scoreboard.vtruth, as scoreboard.bench with tcum); states cut to the 12 reported gases
 (scoreboard.cut12); error = scorerule.err with SCORE_RULE=phys (per-gas floors) on resolved points (truth or prediction
 number density >= 1e-2 cm^-3). Per row: w(call) = worst-gas error at a recorded call (NaN -> 0);
@@ -8,8 +8,8 @@ number density >= 1e-2 cm^-3). Per row: w(call) = worst-gas error at a recorded 
 Per (model, start type, subset, dt): rows lasting > 0.5, late > 0.5, median of the per-row mean, rows lasting > 2, late > 2,
 max w; rows > 0.5 at tau. Equal weight = mean over the dt of the per-dt counts; worst dt = the dt with the largest count;
 ratio = model count / reference count per dt (n/0 shown as 'inf', 0/0 as '-').
-Subsets (devall6 rows): scope = the target, inside the envelope (select_jobs.env_margin) AND Z 0.1-300x AND C/O 0.1-1
-(2026-10-19 evening; it was Z 1-100x, C/O <= 1); inside; all;
+Subsets (devall6 rows): scope = the target, inside the envelope (select_jobs.env_margin) AND Z 0.1-300x AND C/O 0.1-1;
+inside; all;
 cooler = 300 <= T < 1300 K and 1e-5 <= P <= 100 bar; fig4 = the six raw-gas cases (own tag).
     CUDA_VISIBLE_DEVICES= SCORE_RULE=phys HARNESS_NORM= python score_sweep.py <out stem> <ref label>=<sweep dir>
         [<label>=<sweep dir> ...]      -> <stem>.txt (tables), <stem>.json (all numbers), <stem>_rows.npz (per-row values)"""
