@@ -24,7 +24,6 @@ SNAPSHOT = SWEEP / "snapshot"                            # frozen Auto-Chem snap
 SNAP_SRC = SNAPSHOT / "src"                              # model.py (MLP, FlowMapMLP, ResidualMLP), trainer.py (HybridLoss)
 SNAP_PROCESSING = SNAPSHOT / "processing"                # preprocessing.py (rawtraj)
 NORM12 = SNAPSHOT / "data/processed/normalization.json"  # production normalization (12 species); data.NORM default
-SHARDS = SNAPSHOT / "data/processed"                     # production validation shards (data.load_val_shards)
 E = SWEEP / "g2/E13_gcm"                                 # E13 bench folder: H_*/P*_ benches, truth sets, rows
 GTEST, GTEST_COLD = E / "gtest", E / "gtest_cold"        # fixed-condition truth sets (G, Gc)
 PATHS_V2S, PATHS_V2L, PATHS_V2X = E / "paths_v2s", E / "paths_v2l", E / "paths_v2x"   # changing-condition paths (v2s, v2l, xlong)

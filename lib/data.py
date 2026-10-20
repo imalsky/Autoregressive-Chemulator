@@ -1,9 +1,14 @@
-"""GPU-resident raw trajectories, the production normalization and a production-law window sampler.
+"""The cache on the GPU, the normalization and the training samplers.
 
-Windows follow processing/preprocessing.py: dt log-uniform in [0.1, 1e3] s; t_start is anchored at
-the first positive raw time with probability 1/4 (draw 0 of 4) or log-uniform in
-[t_lo, t_end - FIT_STEPS * dt]; windows that do not fit are redrawn. Values are the production
-log-log interpolant (log10 y linear in log10 t between valid raw rows), computed in fp64.
+A cache (ARCH_CACHE; datagen/ builds it) holds raw_<split>.npz per split (logy [N, 100, S] log10 mixing ratios of the entry
+set on one stored log-time grid t_grid.npy, end = last valid row, P, T, file_idx) and meta.json. The normalization file
+(HARNESS_NORM, default paths.NORM12) gives the entry set (species_variables), the per-entry log10 mean and std, the globals'
+ranges and the dt range; z = (log10 y - mu) / sd.
+Samplers (RawSplit.sample, sample_grid, sample_jump_pairs) draw on a torch.Generator in a fixed order; one-step windows:
+dt log-uniform in DT_LOG, the start anchored at the first positive stored time with probability ANCHOR_P or log-uniform
+in [t_lo, t_end - FIT_STEPS dt]; candidates that do not fit are dropped by a stable sort (no host sync). Values between
+stored rows are the log-log interpolant (log10 y linear in log10 t), computed in fp64; for a complete entry set (He
+included) the interpolated labels are projected back onto each trajectory's element ratios and sum 1 (elemproj.project_ln).
 """
 import json
 import math
@@ -15,23 +20,22 @@ import torch
 
 import paths
 
-REPO = paths.SNAPSHOT
-CACHE = Path(os.environ.get("ARCH_CACHE", str(paths.ARCH_TESTS)))  # E8: alternative cache via ARCH_CACHE
-NORM_PATH = Path(os.environ.get("HARNESS_NORM") or str(paths.NORM12))  # empty = unset  # E13: other species sets
-NORM = json.loads(NORM_PATH.read_text())   # 2026-10-19: NORM_PATH kept for the model manifests (train.write_manifest)
+CACHE = Path(os.environ.get("ARCH_CACHE", str(paths.ARCH_TESTS)))   # the cache
+NORM_PATH = Path(os.environ.get("HARNESS_NORM") or str(paths.NORM12))  # the normalization file (empty = unset)
+NORM = json.loads(NORM_PATH.read_text())   # NORM_PATH is also recorded in the model manifests (train.write_manifest)
 SPECIES = list(NORM["species_variables"])
 SHORT = [s.replace("_evolution", "") for s in SPECIES]
-CLOSED = "He" in SHORT  # E13: a complete species set (He included): labels are projected in RawSplit.logy_at
-FIT_STEPS = 99          # preprocessing n_steps - 1: every window must fit 99 transitions
-ANCHOR_P = 0.25         # draw 0 of samples_per_source_trajectory = 4 is anchored
-DT_LOG = (-1.0, 3.0)    # window dt, log10 s (production law [0.1, 1e3]); train.py sets it from dt_min_s / dt_max_s
-X0_ANCHOR_P = 0.0       # sprint 2026-10-08 (arm M): share of the windows of rows flagged in RawSplit.x0 that start at row 0
-X0_JUMP_P = 0.0         # sprint 2026-10-08 (arm M): share of the jump pairs of flagged rows that start at row 0
+CLOSED = "He" in SHORT  # a complete entry set (He included): labels are projected in RawSplit.logy_at
+FIT_STEPS = 99          # every window must fit 99 transitions before the trajectory's end
+ANCHOR_P = 0.25         # share of one-step windows anchored at the first positive stored time (train.py anchor_p)
+DT_LOG = (-1.0, 3.0)    # window dt, log10 s; train.py sets it from dt_min_s / dt_max_s
+X0_ANCHOR_P = 0.0       # share of the windows of rows flagged in RawSplit.x0 that start at row 0 (t = 0)
+X0_JUMP_P = 0.0         # share of the jump pairs of flagged rows that start at row 0
 EPS = float(NORM["epsilon"])
 
 
 def take(x, names):
-    """E13: SHORT columns of linear mixing ratios x [..., len(names)] over the full network (names). Reservoir entries
+    """SHORT columns of linear mixing ratios x [..., len(names)] over the full network (names). Reservoir entries
     (reservoir sets): C_res, N_res, O_res, H_res = atoms of that element in the species not in SHORT, M_res = their
     molecule count."""
     import elemproj as EP
@@ -68,46 +72,32 @@ def dt_norm_of(dt_s):
 
 
 class RawSplit:
-    """One split of the cache on the GPU: logy [N, 100, S] fp64, end row, converged-tail row, globals."""
+    """One split of the cache on the device: logy [N, 100, S] fp64, end row, globals g [N, 2] (fp32), the stored times t."""
 
-    def __init__(self, split, device, limit=None, frac=1.0, frac_seed=0, rows=None, cache=None):
-        root = CACHE if cache is None else Path(cache)  # 2026-10-09: another cache's split (lhbench --g-cache)
-        d = np.load(root / f"raw_{split}.npz")
-        n_all = d["end"].shape[0]
-        sel = np.arange(n_all if limit is None else min(limit, n_all))
-        if frac < 1.0:  # data-scaling test: a seeded random subset of the trajectories
-            sel = np.sort(np.random.default_rng(frac_seed).choice(n_all, size=int(round(frac * n_all)), replace=False))
-        if rows is not None:  # E13 (2026-10-07): an explicit list of the split's trajectories (train.py train_rows)
-            sel = np.asarray(rows, np.int64)
-        n = sel.size
-        self.n = n
+    def __init__(self, split, device):
+        d = np.load(CACHE / f"raw_{split}.npz")
+        self.n = d["end"].shape[0]
         self.device = device
-        self.logy = torch.from_numpy(d["logy"][sel]).to(device)
-        self.end = torch.from_numpy(d["end"][sel].astype(np.int64)).to(device)
-        self.conv = torch.from_numpy(d["conv"][sel].astype(np.int64)).to(device)
-        self.P = d["P"][sel]
-        self.T = d["T"][sel]
-        self.seed = d["seed"][sel]
-        self.lo = d["lo"][sel]
-        self.name = d["name"][sel]
-        self.file_idx = d["file_idx"][sel] if "file_idx" in d.files else None  # sprint 2026-10-08: raw file of each row
+        self.logy = torch.from_numpy(d["logy"]).to(device)
+        self.end = torch.from_numpy(d["end"].astype(np.int64)).to(device)
+        self.P = d["P"]
+        self.T = d["T"]
+        self.file_idx = d["file_idx"] if "file_idx" in d.files else None  # the raw file of each row (meta.json 'files')
         self.g = torch.from_numpy(norm_globals(self.P, self.T)).to(device)
-        # E13 review (2026-10-07): log10 total number density (cm^-3; P in barye) per trajectory, for the scored mask
-        self.lnd = torch.from_numpy(np.log10(np.asarray(self.P, np.float64) / (1.380649e-16 * np.asarray(self.T, np.float64)))).to(device)
-        t = np.load(root / "t_grid.npy")
+        t = np.load(CACHE / "t_grid.npy")
         self.t = torch.from_numpy(t).to(device)
         self.logt = torch.log10(self.t[1:])            # positive rows 1..99
         self.mu, self.sd, self.zlo, self.zhi = norm_consts(device)
-        self.closed = CLOSED and self.logy.shape[-1] == len(SHORT)  # lhbench also loads the 12-species test cache
-        if self.closed:  # E13: labels of a complete species set keep each trajectory's element ratios and sum 1 (logy_at)
+        self.closed = CLOSED and self.logy.shape[-1] == len(SHORT)
+        if self.closed:  # labels of a complete entry set keep each trajectory's element ratios and sum 1 (logy_at)
             import elemproj as EP
             self.EP = EP
             self.nh, self.na = (t.to(device) for t in EP.stoich(SHORT))
             self.mol = EP.molidx(SHORT).to(device)  # sum 1 over molecules (reservoir sets: not over the atom reservoirs)
             self.lr = EP.log_ratios(self.logy[:, 0] * math.log(10.0), self.na, self.nh)   # [N, 4], from the start row
 
-    w = None  # E13 (2026-10-07): per-trajectory sampling weights [n] (train.py traj_w); None = uniform
-    x0 = None  # sprint 2026-10-08 (arm M): bool [n], rows whose row 0 (the start, t = 0) can be a training input
+    w = None   # per-trajectory draw weights [n] (train.py traj_weights_file); None = uniform
+    x0 = None  # bool [n]: rows whose row 0 (the start, t = 0) can be a training input (train.py x0_file)
 
     def draw(self, m, gen):
         """m trajectory indices: uniform (the original randint draw) unless self.w is set."""
@@ -130,7 +120,7 @@ class RawSplit:
         y0 = self.logy[b, i0]
         y1 = self.logy[b, i1]
         ly = (1.0 - w).unsqueeze(-1) * y0 + w.unsqueeze(-1) * y1
-        if self.closed:  # per-species log interpolation breaks sum 1 and the ratios; restore both (E13, second review)
+        if self.closed:  # per-species log interpolation breaks sum 1 and the ratios; restore both
             ln10 = math.log(10.0)
             lw, _ = self.EP.project_ln(ly * ln10, self.lr[idx].unsqueeze(1).expand(-1, ly.shape[1], -1), self.na, self.nh,
                                         mol=self.mol)
@@ -140,34 +130,32 @@ class RawSplit:
     def z_of(self, logy):
         return (logy - self.mu) / self.sd
 
-    def sample_grid(self, B, K, gen, t_min, stride=1, end_frac=0.0):
-        """E13 (Fable review 2026-10-06, proposal 1): B chains of K steps along the stored log-time grid, starting at a
-        row with t >= t_min; labels are the stored rows (no interpolation), rows past a trajectory's end row repeat it
-        (the sampler's constant-tail convention). Returns z fp64 [B, K+1, S], step lengths dt [B, K] (s), g [B, G], idx.
-        E13 review (2026-10-07): stride = stored rows per step (chains span stride x K rows); end_frac = fraction of
-        chains that end at the trajectory's last row (0: none; draws nothing extra)."""
+    def sample_grid(self, B, K, gen, t_min, end_frac=0.0):
+        """B chains of K steps along the stored log-time grid, starting at a row with t >= t_min; labels are the stored
+        rows (no interpolation), rows past a trajectory's end row repeat it (the samplers' constant-tail convention).
+        end_frac = fraction of chains that end at the trajectory's last row (0: none; draws nothing extra). Returns z fp64
+        [B, K+1, S], step lengths dt [B, K] (s), g [B, G], idx."""
         dev = self.device
         last = self.t.numel() - 1
-        rlo = self.__dict__.setdefault("_r_lo", {})   # 2026-10-19: first stored row at t >= t_min, found once per t_min
-        if t_min not in rlo:                           # (the .item() was a host sync on every call)
+        rlo = self.__dict__.setdefault("_r_lo", {})   # first stored row at t >= t_min, found once per t_min (no host sync
+        if t_min not in rlo:                           # on later calls)
             rlo[t_min] = int(torch.searchsorted(self.t, torch.tensor([t_min], dtype=self.t.dtype, device=dev)).item())
         r_lo = rlo[t_min]
-        assert r_lo + stride * K <= last, (r_lo, stride, K)
+        assert r_lo + K <= last, (r_lo, K)
         idx = self.draw(B, gen)
-        top = torch.clamp(torch.clamp(self.end[idx], max=last) - stride * K, min=r_lo)
+        top = torch.clamp(torch.clamp(self.end[idx], max=last) - K, min=r_lo)
         u = torch.rand(B, device=dev, generator=gen, dtype=torch.float64)
         r0 = r_lo + torch.floor(u * (top - r_lo + 1).double()).long()
         if end_frac > 0:
             r0 = torch.where(torch.rand(B, device=dev, generator=gen) < end_frac, top, r0)
-        rows = r0.reshape(-1, 1) + stride * torch.arange(K + 1, device=dev).reshape(1, -1)
+        rows = r0.reshape(-1, 1) + torch.arange(K + 1, device=dev).reshape(1, -1)
         dt = self.t[rows[:, 1:]] - self.t[rows[:, :-1]]
         lab = torch.minimum(rows, self.end[idx].reshape(-1, 1))
         return self.z_of(self.logy[idx.reshape(-1, 1).expand_as(lab), lab]), dt, self.g[idx], idx
 
-    def sample(self, B, K, gen, steady_frac=0.0):
-        """B windows of K transitions (K+1 states) at one dt each. Returns z fp64 [B, K+1, S],
-        dt_norm fp32 [B], g fp32 [B, G], idx [B]. steady_frac oversamples windows that start inside
-        a converged tail (fixed-point supervision)."""
+    def sample(self, B, K, gen):
+        """B windows of K transitions (K+1 states) at one dt each. Returns z fp64 [B, K+1, S], dt_norm fp32 [B],
+        g fp32 [B, G], idx [B]."""
         dev = self.device
         t_lo = self.t[1]
         m = B + B // 4 + 256  # about 1% of draws do not fit; a stable sort puts fits first (no host sync)
@@ -182,26 +170,15 @@ class RawSplit:
         anchor = torch.rand(m, device=dev, generator=gen) < ANCHOR_P
         ts = torch.where(anchor, t_lo.expand(m), ts)
         a0 = None
-        if X0_ANCHOR_P > 0 and self.x0 is not None:  # arm M: windows from row 0 (t = 0); drawn after the default draws
+        if X0_ANCHOR_P > 0 and self.x0 is not None:  # windows from row 0 (t = 0); drawn after the default draws
             a0 = self.x0[idx] & (torch.rand(m, device=dev, generator=gen) < X0_ANCHOR_P)
             ok = torch.where(a0, self.t[self.end[idx]] - max(FIT_STEPS, K) * dt > 0, ok)
             ts = torch.where(a0, torch.zeros_like(ts), ts)
-        torch._assert_async(ok.sum() >= B, "sample: fewer than B windows fit")   # 2026-10-19: on the device, no host sync
+        torch._assert_async(ok.sum() >= B, "sample: fewer than B windows fit")   # on the device, no host sync
         order = torch.sort(torch.logical_not(ok).to(torch.int8), stable=True).indices[:B]
         idx, ts, dt = idx[order], ts[order], dt[order]
         if a0 is not None:
             a0 = a0[order]
-        if steady_frac > 0:
-            ns = int(round(steady_frac * B))
-            cand = torch.nonzero(self.conv >= 1).squeeze(1)
-            pick = cand[torch.randint(0, cand.numel(), (ns,), device=dev, generator=gen)]
-            ldt = DT_LOG[0] + (DT_LOG[1] - DT_LOG[0]) * torch.rand(ns, device=dev, generator=gen, dtype=torch.float64)
-            dts = torch.pow(10.0, ldt)
-            tc = self.t[self.conv[pick]]
-            # start inside the converged tail; times past t_end are held at the last row (constant tail)
-            idx[:ns], ts[:ns], dt[:ns] = pick, tc * 1.0001, dts
-            if a0 is not None:
-                a0[:ns] = False
         k = torch.arange(K + 1, device=dev, dtype=torch.float64)
         times = ts.reshape(-1, 1) + k.reshape(1, -1) * dt.reshape(-1, 1)
         times = torch.minimum(times, self.t[self.end[idx]].reshape(-1, 1))
@@ -213,10 +190,10 @@ class RawSplit:
         return z, dt_norm_of(dt).float(), self.g[idx], idx
 
 
-def sample_jump_pairs(split, B, gen, d_min, d_max, with_idx=False):
+def sample_jump_pairs(split, B, gen, d_min, d_max):
     """B pairs (z(t), z(t + D)) with D log-uniform in [d_min, d_max] s and t log-uniform in [t_lo, t_end - D]
     (pairs that do not fit are dropped via a stable sort; about 2B candidates are drawn). Returns z0, z1 (fp64),
-    the unclamped dt_norm of D (may exceed 1: only for heads whose network does not see dt), g."""
+    the unclamped dt_norm of D (may exceed 1: the head's network does not see dt), g."""
     dev = split.device
     m = 2 * B + 256
     idx = split.draw(m, gen)
@@ -229,11 +206,11 @@ def sample_jump_pairs(split, B, gen, d_min, d_max, with_idx=False):
     lo, hi = torch.log10(t_lo), torch.log10(torch.clamp(t_hi, min=t_lo * (1 + 1e-12)))
     t0 = torch.pow(10.0, lo + u * (hi - lo))
     a0 = None
-    if X0_JUMP_P > 0 and split.x0 is not None:  # arm M: pairs from row 0 (t = 0); drawn after the default draws
+    if X0_JUMP_P > 0 and split.x0 is not None:  # pairs from row 0 (t = 0); drawn after the default draws
         a0 = split.x0[idx] & (torch.rand(m, device=dev, generator=gen) < X0_JUMP_P)
         ok = torch.where(a0, t_hi >= 0, ok)
         t0 = torch.where(a0, torch.zeros_like(t0), t0)
-    torch._assert_async(ok.sum() >= B, "sample_jump_pairs: fewer than B pairs fit")   # 2026-10-19: on the device, no sync
+    torch._assert_async(ok.sum() >= B, "sample_jump_pairs: fewer than B pairs fit")   # on the device, no host sync
     order = torch.sort(torch.logical_not(ok).to(torch.int8), stable=True).indices[:B]
     idx, t0, Dt = idx[order], t0[order], Dt[order]
     if a0 is None:
@@ -244,31 +221,14 @@ def sample_jump_pairs(split, B, gen, d_min, d_max, with_idx=False):
         zz[:, 0] = torch.where(a0.unsqueeze(1), split.z_of(split.logy[idx, 0]), zz[:, 0])
     lo_, hi_ = NORM["dt"]["log_min"], NORM["dt"]["log_max"]
     dtn = ((torch.log10(Dt) - lo_) / (hi_ - lo_)).float()
-    return (zz[:, 0], zz[:, 1], dtn, split.g[idx]) + ((idx,) if with_idx else ())
+    return zz[:, 0], zz[:, 1], dtn, split.g[idx]
 
 
 def cache_val(n_windows, k_states, device, seed=20261006):
-    """E13: validation windows from the cache's validation split (for species sets without production shards):
-    z fp32 [N, k_states, S], dt_norm fp32 [N], g fp32 [N, G]; a fixed generator, so every run sees the same windows."""
+    """Validation windows from the cache's validation split: z fp32 [N, k_states, S], dt_norm fp32 [N], g fp32 [N, G];
+    a fixed generator, so every run sees the same windows."""
     split = RawSplit("validation", device)
     gen = torch.Generator(device=device).manual_seed(seed)
     z, dtn, g, _ = split.sample(n_windows, k_states - 1, gen)
     return z.float(), dtn, g
 
-
-def load_val_shards(n_windows, k_states, device, split="validation"):
-    """The first n_windows rows of the production shards (fp32 z), first k_states states."""
-    root = paths.SHARDS / split
-    ys, ds, gs, got = [], [], [], 0
-    for p in sorted(root.glob("shard_*.npz")):
-        with np.load(p) as z:
-            ys.append(z["y_mat"][:, :k_states])
-            ds.append(z["dt_norm_mat"][:, 0])
-            gs.append(z["globals"])
-        got += ys[-1].shape[0]
-        if got >= n_windows:
-            break
-    y = torch.from_numpy(np.concatenate(ys)[:n_windows]).to(device)
-    dtn = torch.from_numpy(np.concatenate(ds)[:n_windows]).to(device)
-    g = torch.from_numpy(np.concatenate(gs)[:n_windows]).to(device)
-    return y, dtn, g
