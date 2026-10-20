@@ -19,7 +19,9 @@ Loss: HybridLoss (log10 MAE + lambda_z x z-space MSE) on fp64 targets; the rollo
 runs in fp32 with TF32 on. AdamW (fused), linear warmup then cosine to lr_min_frac x the peak, EMA weights (s1_ema / s2_ema)
 written as the stage file; stage 2 starts from stage 1's EMA weights. Validation: one-step windows of the cache's
 validation split (fixed draws), EMA and live model. path_readout: at every validation, the EMA model's arm-P bench rollout
-(lhbench.run_paths) on a paths folder, scored in its late window.
+(lhbench.run_paths) on a paths folder, scored in its late window. t0_readout: at every validation, the EMA model rolled
+from row 0 (t = 0) of the validation rows of the t0_readout_files, 10 calls at dt 10 s and 100 s, against the stored
+trajectory (t0_setup, t0_readout).
 ckpt_every / resume: exact continuation from run_dir/ckpt_stage<N>.pt (model, EMA, optimizer, generators, accumulators).
 Environment: ARCH_CACHE (the cache), HARNESS_NORM (its normalization file), HARNESS_DEVICE (default cuda).
 """
@@ -43,6 +45,7 @@ import paths  # noqa: E402
 import data as D  # noqa: E402
 import models as M  # noqa: E402
 import chains as C  # noqa: E402
+import scorerule as SR  # noqa: E402
 M.S, M.SPECIES = len(D.SHORT), list(D.SHORT)  # the entry set follows the normalization file
 
 DEFAULTS = {
@@ -73,6 +76,9 @@ DEFAULTS = {
     "resume": False,            # skip a stage whose stage<N>.pt exists, continue one from its ckpt_stage<N>.pt
     "val_source": "cache",      # validation windows from the cache's validation split (data.cache_val; the only source)
     "path_readout": None,       # a paths folder: at every validation, the EMA model's arm-P rollout scored (path_readout)
+    "t0_readout": False,        # at every validation, the EMA model from row 0 of the validation rows of the cache files
+    "t0_readout_files": [],     # named here (meta.json 'files'), scored against their stored trajectories (t0_readout;
+                                # log key t0_readout, written only when on)
     "chain_w": 0.0,             # chain term (stage 2): chain_batch windows per step from the chain_sets folders (finished
     "chain_sets": [],           # paths at the stage's start; an exact resume needs the same files)
     "chain_batch": 256,
@@ -279,6 +285,69 @@ def path_readout(model, pr):
             "path_max": float(e.max()) if e.size else float("nan"), "path_s": time.time() - t}
 
 
+T0_DTS, T0_CALLS = (10.0, 100.0), 10   # t0_readout: step sizes (s) and calls per step size
+T0_BANDS = {"300-650": (300, 650), "650-1300": (650, 1300), "1300-2000": (1300, 2000), "2000-3000": (2000, 3001)}   # K
+
+
+def t0_setup(files, dev):
+    """t0_readout: the validation rows of the named cache files (meta.json 'files'): their row-0 states z, globals, file,
+    T, log10 number density and, per dt in T0_DTS, the 12 reported species' stored trajectory at the calls k dt
+    (k = 1..T0_CALLS; the training interpolant RawSplit.logy_at), computed once."""
+    val = D.RawSplit("validation", dev)
+    names = json.loads((D.CACHE / "meta.json").read_text())["files"]
+    rows = np.flatnonzero(np.isin(val.file_idx, [names.index(f) for f in files]))
+    if rows.size == 0:
+        sys.exit(f"t0_readout: no validation rows in {files}")
+    idx = torch.from_numpy(rows).to(dev)
+    cols = [D.SHORT.index(s) for s in C.REPORTED]
+    k = torch.arange(1, T0_CALLS + 1, dtype=torch.float64, device=dev)
+    vt = {dt: val.logy_at(idx, (k * dt).expand(rows.size, -1).contiguous())[..., cols].cpu().numpy() for dt in T0_DTS}
+    return {"z0": val.z_of(val.logy[idx, 0]), "g": val.g[idx], "mu": val.mu, "sd": val.sd, "cols": cols, "vt": vt,
+            "file": np.asarray(names)[val.file_idx[rows]], "T": val.T[rows], "dev": dev,
+            "lnd": np.log10(val.P[rows] / (1.380649e-16 * val.T[rows]))[:, None, None]}
+
+
+@torch.no_grad()
+def t0_readout(model, t0, bs=8192):
+    """The model rolled from row 0 of the t0_setup rows, T0_CALLS calls at each dt in T0_DTS (fp64 state z, z += fp64(
+    model.delta(z fp32, dt, g)); TF32 off for the rollout, restored after), against the stored trajectory. Row error: the
+    max over the calls and the 12 reported species of the per-gas scored error (scorerule.err; resolved: number density
+    >= 1e-2 cm^-3; not scored = 0). Per dt, over all rows, per file and per T band (K): rows, p50 / p90 / p99 of the row
+    error over the rows whose states stay finite, its max over all rows (inf if a state is not finite), share of rows
+    > 0.5 dex; non-finite rows. And its seconds."""
+    t = time.time()
+    tf = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
+
+    def q(e):
+        f = e[np.isfinite(e)]
+        p = np.percentile(f, [50, 90, 99]) if f.size else [float("nan")] * 3
+        return {"rows": int(e.size), "p50": float(p[0]), "p90": float(p[1]), "p99": float(p[2]),
+                "max": float(e.max()) if e.size else float("nan"), "gt05": float((e > 0.5).mean()) if e.size else float("nan")}
+    out = {}
+    try:
+        for dt in T0_DTS:
+            sts = []
+            for i in range(0, t0["z0"].shape[0], bs):
+                z, g = t0["z0"][i:i + bs], t0["g"][i:i + bs]
+                dtn = D.dt_norm_of(torch.full((z.shape[0],), dt, dtype=torch.float64, device=t0["dev"])).float()
+                st = []
+                for _ in range(T0_CALLS):
+                    z = z + model.delta(z.float(), dtn, g).double()
+                    st.append(z)
+                sts.append((torch.stack(st, 1) * t0["sd"] + t0["mu"])[..., t0["cols"]].cpu().numpy())
+            st, vt, lnd = np.concatenate(sts), t0["vt"][dt], t0["lnd"]
+            e = SR.err(vt, st, ((vt + lnd) >= -2.0) | ((st + lnd) >= -2.0), C.REPORTED)
+            e = np.nan_to_num(e, nan=0.0, posinf=np.inf).max(axis=(1, 2))
+            out[f"dt{dt:g}"] = {"all": q(e), "files": {f: q(e[t0["file"] == f]) for f in np.unique(t0["file"])},
+                                "T": {b: q(e[(t0["T"] >= lo) & (t0["T"] < hi)]) for b, (lo, hi) in T0_BANDS.items()},
+                                "nonfinite_rows": int(np.logical_not(np.isfinite(st)).any(axis=(1, 2)).sum())}
+    finally:
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = tf
+    out["s"] = time.time() - t
+    return out
+
+
 def row0_probs(cfg, split):
     """Per-row probabilities (fp32 [n], on the split's device) that a one-step window and a jump pair of a training row
     start at its row 0 (t = 0): x0_anchor / x0_jump map cache file names (meta.json 'files') to p, rows of other files get
@@ -422,7 +491,7 @@ def lock_terms(fns, crit, train, cs, cfg, step, gen, pre_gen, mu, sd, rep, want_
     return loss, cl, tail, n_pre, K
 
 
-def run_stage(stage, cfg, model, train, vy, vdt, vg, mu, sd, run, log, pr=None):
+def run_stage(stage, cfg, model, train, vy, vdt, vg, mu, sd, run, log, pr=None, t0r=None):
     dev = train.device
     s = "s1" if stage == 1 else "s2"
     steps, peak, warm = cfg[f"{s}_steps"], cfg[f"{s}_lr"], cfg[f"{s}_warmup"]
@@ -544,7 +613,8 @@ def run_stage(stage, cfg, model, train, vy, vdt, vg, mu, sd, run, log, pr=None):
                 if fz:
                     model.fused = True
             log(stage, step + 1, val_loss=vl, val_loss_live=vlive, val_persistence=vp,
-                **({} if pr is None else path_readout(ema.shadow, pr)))
+                **({} if pr is None else path_readout(ema.shadow, pr)),
+                **({} if t0r is None else {"t0_readout": t0_readout(ema.shadow, t0r)}))
         if cfg["ckpt_every"] > 0 and (step + 1) % cfg["ckpt_every"] == 0 and step + 1 < steps:
             if not finite(model, ema.shadow):
                 sys.exit(f"stage {stage} step {step + 1}: non-finite weights; stopped (last checkpoint kept)")
@@ -573,6 +643,8 @@ def main(run):
     assert cfg["cache"] in (None, str(D.CACHE)), f"config cache {cfg['cache']} but ARCH_CACHE {D.CACHE}"
     assert cfg["s2_K"] == 1 and cfg["s2_skip"] == 0, "stage 2 trains one-step windows only (s2_K 1, s2_skip 0)"
     assert cfg["val_source"] == "cache", "validation windows come from the cache (val_source 'cache')"
+    if bool(cfg["t0_readout"]) != bool(cfg["t0_readout_files"]):
+        sys.exit(f"{run / 'config.json'}: t0_readout and t0_readout_files are set together")
     assert cfg["s2_steps"] <= 0 or (cfg["lockstep"] and cfg["jump_w"] > 0 and cfg["grid_w"] > 0 and cfg["chain_w"] > 0), \
         "stage 2 runs the one-step, jump, grid and chain terms in lockstep (lockstep true, jump_w, grid_w, chain_w > 0)"
     lib_md5 = {f.name: hashlib.md5(f.read_bytes()).hexdigest() for f in sorted(Path(__file__).resolve().parent.glob("*.py"))}
@@ -596,6 +668,7 @@ def main(run):
                     fused=cfg["fused_proj"]).to(dev)
     vy, vdt, vg = D.cache_val(cfg["val_windows"], 2, dev)
     pr = None if cfg["path_readout"] is None else readout_setup(cfg["path_readout"], dev)
+    t0r = t0_setup(cfg["t0_readout_files"], dev) if cfg["t0_readout"] else None
     logf = open(run / "log.csv", "a")
 
     def log(stage, step, **kw):
@@ -618,7 +691,7 @@ def main(run):
             secs[f"s{stage}"] = blob["seconds"]
             log(stage, None, resumed_from=str(done))
             continue
-        secs[f"s{stage}"] = run_stage(stage, cfg, model, train, vy, vdt, vg, mu, sd, run, log, pr)
+        secs[f"s{stage}"] = run_stage(stage, cfg, model, train, vy, vdt, vg, mu, sd, run, log, pr, t0r)
     (run / "done.json").write_text(json.dumps({"seconds": secs, **info, "arch_cache": str(D.CACHE), "lib_md5": lib_md5}))
     write_manifest(run, cfg, code_info(lib_md5))
 
