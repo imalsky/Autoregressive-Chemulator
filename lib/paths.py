@@ -19,7 +19,7 @@ PROJECT = Path(os.environ.get("CHEM_PROJECT") or "/home/imalsky/Chemulator_Proje
 SCRATCH = Path(os.environ.get("CHEM_SCRATCH") or "/scratch/imalsky")
 
 SWEEP = PROJECT / "experiments/2026-10-03_repo-sweep/_build"   # VULCAN references, snapshot, E13 benches and truth sets
-VREF = SWEEP / "vulcan"                                  # VULCAN reference tags (ref_a: read by every bench); lhbench.VREF
+VREF = SWEEP / "vulcan"                                  # VULCAN reference tags: where a tag NAME given to lhbench / scoreboard resolves
 SNAPSHOT = SWEEP / "snapshot"                            # frozen Auto-Chem snapshot (orphaned commit 7d5b036), pinned dependency
 SNAP_PROCESSING = SNAPSHOT / "processing"                # preprocessing.py (rawtraj)
 NORM12 = SNAPSHOT / "data/processed/normalization.json"  # production normalization (12 species); data.NORM default
