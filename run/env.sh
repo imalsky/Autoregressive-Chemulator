@@ -10,7 +10,7 @@ export TORCHINDUCTOR_CACHE_DIR=/home/imalsky/tmp/sweep_inductor
 export TORCHINDUCTOR_COMPILE_THREADS=1
 export CUDA_VISIBLE_DEVICES=1
 export CUDA_DEVICE_ORDER=PCI_BUS_ID      # ordinal 1 = B5:00.0 (nvidia-smi index 1, NUMA node 1)
-export H=/home/imalsky/Chemulator_Project/code/e13-harness
+export H=/home/imalsky/Chemulator_Project/code/Auto-Chem
 export B=/home/imalsky/Chemulator_Project/experiments/2026-10-03_repo-sweep/_build
 export X=/home/imalsky/Chemulator_Project/experiments/2026-10-08_e13-sprint/_build
 export E=$B/g2/E13_gcm R=$B/runs
