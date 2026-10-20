@@ -16,12 +16,14 @@ only; no checkpoints, resume or path readout; traj_weights_file None, because CU
 generator state (uniform randint draws do), so the weighted trajectory draw is the one path not covered. s2 also sets
 chain_K_ramp = chain_pre_ramp = 1: step 0 runs the start of the curriculum (8 chain calls, no pre-roll) and later steps
 its end (16 calls, 0-80 pre-roll calls); grid sub-steps cycle 1, 2, 3, 4 over steps 0-3.
-Both sides compile with torch._inductor.config.triton.autotune_pointwise = False: with autotuning on, inductor times
-several block sizes for a reduction kernel the first time it compiles a graph and keeps the fastest, so the process that
-compiles a graph first can sum in a different order than later processes that load it from the cache (seen 2026-10-19:
-stage 1, the first process differed from the next two in the input-layer gradients). With one config per kernel the
-two sides run the same kernels whenever they trace the same graph. Training keeps autotuning on, so these runs are not
-bitwise those of training; they test that two code trees compute the same thing.
+Both sides compile with inductor's run-time kernel choices off (torch._inductor.config.triton.autotune_pointwise and
+dynamic_scale_rblock False). With them on, each process times several block sizes for some reduction kernels at their
+first launch and keeps the fastest, so two processes can sum in different orders: seen 2026-10-19 in stage 1, where the
+layer-norm backward of the first block (a register-heavy reduction that dynamic_scale_rblock gives a second, smaller
+block size) gave different input-layer gradients in about 1 process in 10, the same code and data each time. With one
+kernel config each, the two sides run the same kernels whenever they trace the same graph. Training keeps both on, so
+these runs are not bitwise those of training (nor are two training runs of one config); they test that two code trees
+compute the same thing.
 
     source run/env.sh
     taskset -c <cpus> $PY tests/bitcheck_train.py s2|s1 [--steps N] [--ref DIR] [--repeat] [--negative] [--work DIR]
@@ -69,7 +71,8 @@ def worker(lib, run, out):
     import torch
     import torch._inductor.config
     from torch.optim.optimizer import register_optimizer_step_pre_hook
-    torch._inductor.config.triton.autotune_pointwise = False   # one kernel config per reduction (see the docstring)
+    torch._inductor.config.triton.autotune_pointwise = False   # one kernel config per reduction, no run-time timing
+    torch._inductor.config.dynamic_scale_rblock = False         # choices (see the docstring)
     rec = {"loss": [], "clip": [], "grad": []}
     backward0, clip0 = torch.Tensor.backward, torch.nn.utils.clip_grad_norm_
 
