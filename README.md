@@ -85,12 +85,17 @@ same weights. CBg's stage 2 continued from step 10,000 of a run with the same se
   10,000 calls) and `bench/sweep/score_sweep.py`.
 - `bench/score_minichem.py`: the six mini-chem paper cases (Tsai et al. 2022, Fig. 4) against VULCAN, for model benches and
   for stored mini-chem predictions.
+- `bench/yardstick.py`: models and stored mini-chem predictions against VULCAN on the yardstick design (histories at fixed
+  T and P, run as restarted segments and as free runs, steps 1-500 s), paired per condition with bootstrap intervals;
+  `--rule v3.1` (default: only unrecovered steps fail; exact log-time quadrature split at decade edges) or `--rule v3`.
 - Scoring (`lib/scorerule.py`): per-gas floors (1e-10 for H2O, CO, CO2, CH4, NH3, HCN, C2H2; 1e-8 for H, OH, O; 1e-6 for
   H2, N2); a point counts where the truth or the prediction is above its floor and resolved (>= 1e-2 cm^-3); the error is
   |log10 max(pred, floor) - log10 max(truth, floor)|. Boards and rules: `bench/scoreboard.py`, `bench/path_board.py`,
   `bench/board6.py`, `bench/rules_t5.py`, `bench/judge.py`, `bench/pass_v2.py`.
-- `tests/bitcheck_train.py` (training, bit for bit against a reference code copy) and `tests/score_regress.py` (scorers
-  against stored results) are regression checks; they need the stored runs and benches.
+- `tests/bitcheck_train.py` (training, bit for bit against a reference code copy), `tests/score_regress.py` (scorers
+  against stored results) and `tests/yardstick_regress.py` (the yardstick scorer: rule v3.1 on synthetic inputs, rule v3
+  against its stored result, rule v3.1 against the stored readout it reproduces) are regression checks; they need the
+  stored runs and benches.
 
 ## Layout
 
@@ -99,7 +104,7 @@ same weights. CBg's stage 2 continued from step 10,000 of a run with the same se
     bench/      scorers, boards, decision rules, speed, the 1000-day run, the step-size sweep (bench/sweep/)
     datagen/    cache builders (generator packs -> 12-, 53-species and 25-entry caches), draw weights, T2 kick tags
     run/        env.sh (sourced by every driver), bench drivers, a job runner
-    tests/      bitcheck_train.py, score_regress.py
+    tests/      bitcheck_train.py, score_regress.py, yardstick_regress.py
 
 ## Data and components not included
 
