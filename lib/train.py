@@ -944,7 +944,11 @@ def long_unroll_batch(delta_fn, train, cfg, gen, k_train):
 
 def main(run):
     run = Path(run)
-    cfg = {**DEFAULTS, **json.loads((run / "config.json").read_text())}
+    user = json.loads((run / "config.json").read_text())
+    unknown = sorted(set(user) - set(DEFAULTS))
+    if unknown:   # 2026-10-19: a key this train.py does not know would be ignored silently (an old run's config belongs to
+        sys.exit(f"{run / 'config.json'}: keys not in train.DEFAULTS: {unknown}")   # the code copy in its own folder)
+    cfg = {**DEFAULTS, **user}
     assert cfg["cache"] in (None, str(D.CACHE)), f"config cache {cfg['cache']} but ARCH_CACHE {D.CACHE}"
     lib_md5 = {f.name: hashlib.md5(f.read_bytes()).hexdigest() for f in sorted(Path(__file__).resolve().parent.glob("*.py"))}
     torch.manual_seed(cfg["seed"])
