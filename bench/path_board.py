@@ -81,12 +81,13 @@ for run in dict.fromkeys(a.runs + ([a.vs] if a.vs else [])):
     r = res[run] = {"bench": f"{prefix}_{run}", "checkpoints": int(calls.size), "paths": int(e.shape[1])}
     for lo, hi in win:
         m = wmask(calls, lo, hi)
-        q = e[m][np.isfinite(e[m])]
+        q = e[m][~np.isnan(e[m])]   # inf (a failed, non-finite prediction) stays in
         r[wname(lo, hi, calls)] = {"n_ckpt": int(m.sum()), "p50": float(np.percentile(q, 50)), "p90": float(np.percentile(q, 90)),
                                    "p99": float(np.percentile(q, 99)), "max": float(q.max()),
-                                   "paths_gt0.5": int((np.nan_to_num(e[m], nan=0.0).max(axis=(0, 2)) > 0.5).sum())}
+                                   "paths_gt0.5": int((np.nan_to_num(e[m], nan=0.0).max(axis=(0, 2)) > 0.5).sum()),
+                                   "nonfinite_paths": int(np.isinf(e[m]).any(axis=(0, 2)).sum())}
     first = calls >= win[0][0]
-    pm = np.nan_to_num(e[first], nan=0.0).max(axis=(0, 2))
+    pm = np.nan_to_num(e[first], nan=0.0, posinf=np.inf).max(axis=(0, 2))
     r["per_path_max"] = {int(p): [round(float(v), 2), round(float(t))] for p, v, t in zip(pids, pm, Tm)}
     k = np.unravel_index(np.nanargmax(np.where(first[:, None, None], e, np.nan)), e.shape)
     r["worst"] = {"dex": float(e[k]), "call": int(calls[k[0]]), "path": int(pids[k[1]]), "species": REP[k[2]]}
@@ -94,7 +95,8 @@ for run in dict.fromkeys(a.runs + ([a.vs] if a.vs else [])):
     for lo, hi in win:
         c = r[wname(lo, hi, calls)]
         print(f"  {wname(lo, hi, calls):17s} ({c['n_ckpt']} ckpt) p50 {c['p50']:.3f} p90 {c['p90']:.3f} p99 {c['p99']:.3f} "
-              f"max {c['max']:.2f} paths>0.5 {c['paths_gt0.5']}/{e.shape[1]}")
+              f"max {c['max']:.2f} paths>0.5 {c['paths_gt0.5']}/{e.shape[1]}"
+              + (f" | NON-FINITE predictions in {c['nonfinite_paths']} paths" if c["nonfinite_paths"] else ""))
     print("  per-path max [dex, mean T]:", r["per_path_max"])
 
 if a.vs:
@@ -113,12 +115,12 @@ if a.vs:
         late = (e[wmask(calls, lo, hi)], ev[wmask(cv, lo, hi)])
         sv = []                                                      # pooled: sorted values and the path of each, per side
         for x in late:
-            f = np.isfinite(x)
+            f = ~np.isnan(x)
             o = np.argsort(x[f], kind="stable")
             sv.append((x[f][o], np.broadcast_to(np.arange(R)[None, :, None], x.shape)[f][o]))
         out = {}
         for q in (50, 99):
-            pp = [np.array([np.percentile(x[:, r][np.isfinite(x[:, r])], q) if np.isfinite(x[:, r]).any() else np.nan
+            pp = [np.array([np.percentile(x[:, r][~np.isnan(x[:, r])], q) if (~np.isnan(x[:, r])).any() else np.nan
                             for r in range(R)]) for x in late]
             dp = pp[0] - pp[1]                                       # per path, run - ref
             bm = np.nanmean(dp[idx], 1)
