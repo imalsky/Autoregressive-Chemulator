@@ -18,6 +18,8 @@ import hashlib
 import json
 import math
 import os
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -326,6 +328,44 @@ def save_atomic(obj, path):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def sha256(f):
+    return hashlib.sha256(Path(f).read_bytes()).hexdigest()
+
+
+def code_info(lib_md5):
+    """2026-10-19: the code a run trained with: its lib folder, every lib file's md5, and the git commit, tags and dirty
+    flag when lib is the lib/ of a git repository (None for a frozen copy outside one)."""
+    lib = Path(__file__).resolve().parent
+
+    def git(*a):
+        r = subprocess.run(["git", "-C", str(lib), *a], capture_output=True, text=True, check=False)
+        return r.stdout.strip() if r.returncode == 0 else None
+    out = {"lib": str(lib), "lib_md5": lib_md5, "git_commit": None}
+    top = git("rev-parse", "--show-toplevel")
+    if top is not None and Path(top).resolve() == lib.parent:
+        out.update(git_commit=git("rev-parse", "HEAD"), git_tags=(git("tag", "--points-at", "HEAD") or "").split(),
+                   git_dirty=bool(git("status", "--porcelain", "--", ".")))
+    return out
+
+
+def write_manifest(run, cfg, code, note=None):
+    """2026-10-19: run/manifest.json, what a model's checkpoints need at use: the sha256 of every .pt in run; a byte-identical
+    copy of the normalization file in use (data.NORM_PATH) as run/norm.json, with its sha256; the entry order; the resolved
+    config (DEFAULTS merged with config.json); the parent checkpoint's sha256 (init_from); the code. lhbench.load_model
+    refuses a normalization file whose sha256 differs."""
+    run = Path(run)
+    shutil.copyfile(D.NORM_PATH, run / "norm.json")
+    assert sha256(run / "norm.json") == sha256(D.NORM_PATH)
+    man = {"checkpoints": {f.name: sha256(f) for f in sorted(run.glob("*.pt"))},
+           "norm": {"file": "norm.json", "sha256": sha256(run / "norm.json"), "source": str(D.NORM_PATH)},
+           "species": list(D.SHORT), "config": cfg,
+           "parent": {"path": str(cfg["init_from"]), "sha256": sha256(cfg["init_from"])} if cfg["init_from"] else None,
+           "code": code}
+    if note:
+        man["note"] = note
+    (run / "manifest.json").write_text(json.dumps(man, indent=1))
 
 
 def readout_setup(p_dir, dev):
@@ -1005,6 +1045,7 @@ def main(run):
             continue
         secs[f"s{stage}"] = run_stage(stage, cfg, model, train, vy, vdt, vg, mu, sd, run, log, pr)
     (run / "done.json").write_text(json.dumps({"seconds": secs, **info, "arch_cache": str(D.CACHE), "lib_md5": lib_md5}))
+    write_manifest(run, cfg, code_info(lib_md5))   # 2026-10-19
 
 
 if __name__ == "__main__":

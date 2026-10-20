@@ -17,7 +17,8 @@ import paths
 
 REPO = paths.SNAPSHOT
 CACHE = Path(os.environ.get("ARCH_CACHE", str(paths.ARCH_TESTS)))  # E8: alternative cache via ARCH_CACHE
-NORM = json.loads(Path(os.environ.get("HARNESS_NORM") or str(paths.NORM12)).read_text())  # empty = unset  # E13: other species sets
+NORM_PATH = Path(os.environ.get("HARNESS_NORM") or str(paths.NORM12))  # empty = unset  # E13: other species sets
+NORM = json.loads(NORM_PATH.read_text())   # 2026-10-19: NORM_PATH kept for the model manifests (train.write_manifest)
 SPECIES = list(NORM["species_variables"])
 SHORT = [s.replace("_evolution", "") for s in SPECIES]
 CLOSED = "He" in SHORT  # E13: a complete species set (He included): labels are projected in RawSplit.logy_at
