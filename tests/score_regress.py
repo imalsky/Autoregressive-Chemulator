@@ -2,7 +2,10 @@
 written). Every script runs from this repository; the stored results stay in the scale phase's _build (NB below).
 
   (i)   bench/sweep/score_sweep.py on the four stored sweeps (CBg, LD1, FINAL, LD; labels and folders as recorded in
-        the stored score.json) -> score.json and score.txt byte-identical to the stored ones, score_rows.npz array-equal.
+        the stored score.json) -> every number outside the 'scope' subset equal to the stored score.json, every line of
+        score.txt outside the scope tables equal, every array of score_rows.npz but sub_scope equal. (The stored files were
+        made with the old scope, Z 1-100x and C/O <= 1; the scorer's scope is the target Z 0.1-300x, C/O 0.1-1 since
+        2026-10-19. With the old scope line the outputs were byte-identical: _build/h2 of the cleanup.)
   (ii)  bench/score_minichem.py 1 20 500 on the stored fig4 benches -> median / max / end of the worst gas per call for
         CBg and FINAL in the six cases equal the numbers logged in paper-notes/notes.md (entry "2026-10-19: raw-gas cases at
         1, 20 and 500 s"), LD's two dt-20 cases in the scale phase's log.txt (2026-10-19 14:04), and mini-chem's two dt-20
@@ -94,14 +97,32 @@ def check_sweep(work):
     args = [work / "sweep" / "score"] + [f"{k}={v}" for k, v in meta["dirs"].items()]
     (work / "sweep").mkdir()
     rc, _ = run(REPO / "bench" / "sweep" / "score_sweep.py", args, d, work / "sweep" / "log.txt")
-    ok = rc == 0
-    for ext in (".json", ".txt"):
-        eq = rc == 0 and same_bytes(work / "sweep" / f"score{ext}", d / f"score{ext}")
-        print(f"  score{ext}: {'byte-identical' if eq else 'DIFFERS'} (stored {d / ('score' + ext)})")
-        ok &= eq
-    bad = npz_equal(work / "sweep" / "score_rows.npz", d / "score_rows.npz") if rc == 0 else ["(not written)"]
-    print(f"  score_rows.npz: {'every array equal' if not bad else 'DIFFERS: ' + ', '.join(bad[:10])}")
-    return ok and not bad
+    if rc != 0:
+        return False
+    new, old = (json.loads((p / "score.json").read_text()) for p in (work / "sweep", d))
+    drop = lambda j: {k: ({kk: vv for kk, vv in v.items() if "|scope|" not in kk} if isinstance(v, dict) else v)
+                      for k, v in j.items()}
+    eq_j = json.dumps(drop(new), sort_keys=True) == json.dumps(drop(old), sort_keys=True)
+    print(f"  score.json outside the scope subset: {'equal' if eq_j else 'DIFFERS'} (stored {d / 'score.json'})")
+    eq_t = scopeless((work / "sweep" / "score.txt").read_text()) == scopeless((d / "score.txt").read_text())
+    print(f"  score.txt outside the scope tables: {'equal' if eq_t else 'DIFFERS'}")
+    bad = [k for k in npz_equal(work / "sweep" / "score_rows.npz", d / "score_rows.npz") if k != "sub_scope"]
+    print(f"  score_rows.npz but sub_scope: {'every array equal' if not bad else 'DIFFERS: ' + ', '.join(bad[:10])}")
+    h = new["_headline"]
+    print("  scope (target) headline, equal-weight rows > 0.5 (lasting / late): " + "; ".join(
+        f"{lab} {h[f'{lab}|scope|last05']['eq']:.1f} / {h[f'{lab}|scope|late05']['eq']:.1f}" for lab in meta["dirs"]))
+    return eq_j and eq_t and not bad
+
+
+def scopeless(txt):
+    """score.txt without the scope subset's table blocks and headline lines."""
+    out, skip = [], False
+    for ln in txt.splitlines():
+        if ln.startswith("-- ") or ln.startswith("== ") or not ln.strip():
+            skip = ln.startswith("-- scope /")
+        if not skip and not ln.startswith("   scope "):
+            out.append(ln)
+    return out
 
 
 def check_fig4(work):

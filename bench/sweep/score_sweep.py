@@ -8,7 +8,8 @@ number density >= 1e-2 cm^-3). Per row: w(call) = worst-gas error at a recorded 
 Per (model, start type, subset, dt): rows lasting > 0.5, late > 0.5, median of the per-row mean, rows lasting > 2, late > 2,
 max w; rows > 0.5 at tau. Equal weight = mean over the dt of the per-dt counts; worst dt = the dt with the largest count;
 ratio = model count / reference count per dt (n/0 shown as 'inf', 0/0 as '-').
-Subsets (devall6 rows): scope = inside the envelope (select_jobs.env_margin) AND Z 1-100x AND C/O <= 1; inside; all;
+Subsets (devall6 rows): scope = the target, inside the envelope (select_jobs.env_margin) AND Z 0.1-300x AND C/O 0.1-1
+(2026-10-19 evening; it was Z 1-100x, C/O <= 1); inside; all;
 cooler = 300 <= T < 1300 K and 1e-5 <= P <= 100 bar; fig4 = the six raw-gas cases (own tag).
     CUDA_VISIBLE_DEVICES= SCORE_RULE=phys HARNESS_NORM= python score_sweep.py <out stem> <ref label>=<sweep dir>
         [<label>=<sweep dir> ...]      -> <stem>.txt (tables), <stem>.json (all numbers), <stem>_rows.npz (per-row values)"""
@@ -54,7 +55,7 @@ def subsets(d):
     T, P = d["T"], d["P"] / 1e6
     dev = d["tagi"] == 0
     ins = dev & inside(T, P)
-    sc = ins & (d["Z"] >= 1) & (d["Z"] <= 100) & (d["CO"] <= 1)
+    sc = ins & (d["Z"] >= 0.1) & (d["Z"] <= 300) & (d["CO"] >= 0.1) & (d["CO"] <= 1)   # the target (was Z 1-100x, C/O <= 1)
     cool = dev & (T >= 300) & (T < 1300) & (P >= 1e-5) & (P <= 100)
     return {"scope": sc, "inside": ins, "all": dev, "cooler": cool, "fig4": d["tagi"] == 1}
 
