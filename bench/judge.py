@@ -1,7 +1,8 @@
 """Candidate judge: a run X against a reference R (the 2026-10-18 CBg judge, scale-phase p/judge_cbg.py, with the run names
 as arguments). No model call, no GPU.
   X vs R by rules_t5.py (fixed-condition rows of G, Gc, H2, H2c, H3, H3c; the five path sets; numerics; T2 snap-back);
-  X vs FINAL by rules_t5.py with FINAL's T2 files (readout);
+  X vs FINAL by rules_t5.py with FINAL's T2 files (readout; --final names another anchor, whose T2 score is
+  paths.T2/score_t2_<FINAL>.json, or score_t2.json for e13s_FINw1536_s2, which kept that name);
   small steps from evolved states (sd_score.py, dt 1 s) vs R;
   speed (paths.OUT/speed_<X>_idle_keep.json, us per cell at 1e5 cells) and the 1000-day run (paths.OUT/cyc1000_<X>.json),
   when present.
@@ -57,7 +58,9 @@ def helps(j, x, r):
 
 L = []
 jl = r5(CB, LD)
-jf = r5(CB, FIN, ("--t2r", str(paths.T2 / "score_t2.json"), "--t2npz-r", str(paths.E / f"H_t2tag_{FIN}" / "H_tag_dt500.npz")))
+t2f = paths.T2 / f"score_t2_{FIN}.json"
+t2f = t2f if t2f.exists() else paths.T2 / "score_t2.json"   # FINAL's T2 score kept the name score_t2.json
+jf = r5(CB, FIN, ("--t2r", str(t2f), "--t2npz-r", str(paths.E / f"H_t2tag_{FIN}" / "H_tag_dt500.npz")))
 for nm, j, r in ((f"{CB} vs {LD}", jl, LD), (f"{CB} vs {FIN}", jf, FIN)):
     if j["verdict"] == "INVALID":
         L.append(f"{nm}: INVALID")

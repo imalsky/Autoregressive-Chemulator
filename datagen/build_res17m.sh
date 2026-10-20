@@ -4,7 +4,7 @@
 # norm.json is CBg's normalization (irreplaceable): this script refuses to run while that cache exists. The 12-species
 # source cache and the 53-species intermediate are not kept; rebuild arch_gcm17m_all with cache_gcm.py first.
 #   bash build_res17m.sh <CPU>
-source "$(dirname "$(readlink -f "$0")")/env.sh"
+source "$(dirname "$(dirname "$(readlink -f "$0")")")/run/env.sh"
 set -eu
 C=${1:-82}
 [ -e $CHEM_SCRATCH/arch_gcm17m_res/meta.json ] && { echo "refusing: $CHEM_SCRATCH/arch_gcm17m_res exists"; exit 1; }
