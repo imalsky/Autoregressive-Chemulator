@@ -1,18 +1,21 @@
-"""Candidate judge: a run X against a reference R (the rule CBg was judged by, with the run names as arguments). No model
-call, no GPU.
+"""DEV / G / Gc judge: a run X against a reference R (with the run names as arguments). No model call, no GPU.
+Precedence: adoption between models is decided by the yardstick under rule v3.1 (bench/yardstick.py) with the path-set
+check; this judge's verdict is the DEV / G / Gc continuity readout beside it.
   X vs R by rules_t5.py (fixed-condition rows of G, Gc, H2, H2c, H3, H3c; the five path sets; numerics; T2 snap-back);
   X vs FINAL by rules_t5.py with FINAL's T2 files (readout; --final names another anchor, whose T2 score is
   paths.T2/score_t2_<FINAL>.json, or score_t2.json for e13s_FINw1536_s2, which kept that name);
   small steps from evolved states (sd_score.py, dt 1 s) vs R;
   speed (paths.OUT/speed_<X>_idle_keep.json, us per cell at 1e5 cells) and the 1000-day run (paths.OUT/cyc1000_<X>.json),
   when present.
-Pass rule: helps() below (rules_t5 ADOPT, or lasting > 0.5 inside X <= 0.90 x R with fixed >= 2 x broken,
-late > 0.5 inside X <= R, P3 and every guard G1-G7); then SD (non-finite rows 0, rows > 0.5 inside <= 1.10 x R + 3, rows > 2
+DEV / G / Gc verdict: pass rule v2 (pass_v2.passes_v2 on the rules_t5 counts of X vs R: lasting and late > 0.5 inside the envelope,
+the fixed / broken balance, T2 snap-back P3, finite states G5, the cooler-stratum > 0.5 counts; large misses are
+readouts, printed by pass_v2.large_misses); then SD (non-finite rows 0, rows > 0.5 inside <= 1.10 x R + 3, rows > 2
 <= R + 1), speed <= 10 us per cell and a bounded 1000-day run (finite, nothing rejected, no kept input, last five cycle
-changes <= 0.1 dex). The later pass rule v2 (pass_v2.py: large misses as readouts) is not wired in.
+changes <= 0.1 dex). Readouts beside it: pass rule v2 vs FINAL, and the earlier rule helps() (rules_t5 ADOPT, or lasting
+> 0.5 inside X <= 0.90 x R with fixed >= 2 x broken, late > 0.5 inside X <= R, P3 and every guard G1-G7) vs R and FINAL.
 Inputs: the benches of X, R and FINAL in paths.E (run/bench_dev.sh, all sets incl. T2 and SD1), X's T2 score
 paths.T2/score_t2_<X>.json. Writes <out>/verdict_<X>_vs_<R>.{txt,json}, <out>/verdict_<X>_vs_<FINAL>.{txt,json} and
-<out>/judge_<X>.txt; last line VERDICT.
+<out>/judge_<X>.txt; last line VERDICT (the DEV / G / Gc verdict).
     SCORE_RULE=phys HARNESS_NORM= python judge.py <X> <R> [--final FINAL] [--out DIR]   (DIR default paths.OUT)"""
 import argparse
 import json
@@ -26,6 +29,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import sd_score as SD  # noqa: E402  (puts lib/ on sys.path)
 import paths  # noqa: E402
+import pass_v2  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("x")
@@ -71,6 +75,11 @@ for nm, j, r in ((f"{CB} vs {LD}", jl, LD), (f"{CB} vs {FIN}", jf, FIN)):
              f"cooler lasting {j['counts']['cooler'][CB]['last05']} vs {j['counts']['cooler'][r]['last05']}; T2 mean "
              f"{j.get('t2_mean_change', float('nan')):+.3f}; guards "
              f"{' '.join(k + (':ok' if j['rules'][k]['pass'] else ':FAIL') for k in j['rules'] if k.startswith('G'))}")
+    cc = j["counts"]["cooler"]
+    L.append(f"  pass rule v2 ({'DEV / G / Gc verdict' if r == LD else 'readout'}): {'PASS' if pass_v2.passes_v2(j, CB, r) else 'FAIL'} "
+             f"(late fixed {c['late_fixed']}, broken {c['late_broken']}; cooler late > 0.5 {cc[CB]['late05']} vs "
+             f"{cc[r]['late05']}); earlier rule helps() (readout): {'pass' if helps(j, CB, r) else 'fail'}")
+    L.append("  " + pass_v2.large_misses(j, CB, r))
 try:
     sa, sb = SD.score(CB, "1"), SD.score(LD, "1")
     sd_ok = (sa["nonfinite_rows"] == 0 and sa["inside"]["gt05"] <= 1.10 * sb["inside"]["gt05"] + 3
@@ -89,8 +98,10 @@ if cy.exists():
     cyc = (cj["run"].rstrip("/").endswith(CB) and cj["days_min"] >= 1000 and bool(cj["finite"]) and sum(cj["rejected"]) == 0
            and all(r[1] == 0 for r in cj["projfail"]) and max(cj["cycle_change_last5_max"]) <= 0.1)
 L.append(f"speed {speed if speed is not None else 'PENDING'} us/cell; 1000-day run {'PENDING' if cyc is None else ('PASS' if cyc else 'FAIL')}")
-ok = helps(jl, CB, LD) and sd_ok
+ok = pass_v2.passes_v2(jl, CB, LD) and sd_ok
 fin = ok and speed is not None and speed <= 10.0 and cyc is True
-L.append(f"VERDICT: {f'{CB} is the new candidate' if fin else (f'{CB} beats {LD} (speed / 1000-day pending)' if ok and (speed is None or cyc is None) else f'{LD} stays the candidate')}")
+L.append("adoption between models is decided by the yardstick under rule v3.1 (bench/yardstick.py) with the path-set check; "
+         "the verdict below is the DEV / G / Gc continuity readout")
+L.append(f"VERDICT (DEV / G / Gc, pass rule v2): {f'{CB} passes vs {LD}' if fin else (f'{CB} passes vs {LD} (speed / 1000-day pending)' if ok and (speed is None or cyc is None) else f'{CB} does not pass vs {LD}')}")
 (OUT / f"judge_{CB}.txt").write_text("\n".join(L) + "\n")
 print("\n".join(L))
