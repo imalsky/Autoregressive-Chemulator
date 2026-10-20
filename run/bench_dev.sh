@@ -9,12 +9,16 @@
 #                      (datagen/combine_tags.py), split back into the per-set files by bench/split6.py
 #   T2                 the snap-back tag (paths.T2/tag), then bench/score_t2.py -> paths.T2/score_t2_<label>.{json,txt}
 #   SD0.1 SD1          10,000 calls of dt 0.1 / 1 s from VULCAN's states at 1e3 and 1e6 s on devall6 (bench/sd_score.py)
+#   FIG4               the six mini-chem paper cases (paths.FIG4/tag, raw gas from VULCAN's state at 1e-3 s): 5,000 calls
+#                      at dt 1, 20 and 500 s, every call recorded (scale phase l/l1.sh f4) -> paths.FIG4/l_<label>_dt<dt>;
+#                      score with bench/score_minichem.py (add (name, 'l_<label>') to its MOD)
 #   PH2 H4ALL          the sealed path set and fixed-condition sets: opened once, on a frozen recipe, by the author's decision
 #   bash bench_dev.sh <run dir> <label> <CPUs> [sets, default "PD PX P2l P2s PH DEV6"]   (GPU1; logs in $LOGS)
 source "$(dirname "$(readlink -f "$0")")/env.sh"
 set -u
 P=$CHEM_PROJECT/experiments/2026-10-09_e13-conservation/_build/paths_v3
 T2=$CHEM_PROJECT/experiments/2026-10-13_e13-scale/_build/t2
+FIG4=$CHEM_PROJECT/experiments/2026-10-13_e13-scale/_build/fig4
 DEVALL6=$CHEM_SCRATCH/e13_scaledev/devall6
 LOGS=${LOGS:-$CHEM_PROJECT/experiments/2026-10-13_e13-scale/_build/bench/logs}   # paths.OUT/logs
 NORM=$CHEM_SCRATCH/arch_gcm17m_res/norm.json
@@ -49,6 +53,10 @@ for s in $SETS; do
           && { [ -e $T2/score_t2_$L.json ] || CUDA_VISIBLE_DEVICES= SCORE_RULE=phys HARNESS_NORM= taskset -c $A $PY $H/bench/score_t2.py \
           $E/H_t2tag_$L/H_tag_dt500.npz $T2/score_t2_$L > $LOGS/score_t2_$L.log 2>&1 || echo "$(date '+%F %T') FAILED score_t2 $L"; } ;;
     SD0.1|SD1) dt=${s#SD}; lb ${BLK_H:-10} $E/H_sd_dt${dt}_$L --arms H --h-tag $DEVALL6 --h-starts 1e3,1e6 --h-dt $dt --h-calls 10000 ;;
+    FIG4) for dt in 1 20 500; do
+            lb 50 $FIG4/l_${L}_dt$dt --arms H --h-tag $FIG4/tag --h-starts 1e-3 --h-dt $dt --h-calls 5000 \
+              --h-times $FIG4/times_all_dt$dt.npy
+          done ;;
     *) echo "unknown set $s"; exit 1 ;;
   esac
 done
