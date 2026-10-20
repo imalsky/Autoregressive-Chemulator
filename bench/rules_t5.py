@@ -1,4 +1,4 @@
-"""T5 decision rules, executable and fail-closed (the rule text and this code were fixed before any result they judged).
+"""T5 decision rules, executable and fail-closed.
 Arm X vs reference R, FINAL as the G6 anchor, all benched with run/bench_dev.sh (six
 fixed sets through DEV6, five path sets, T2). No model call, no GPU.
 Rows: job x start age (1e-3, 1e3, 1e6 s) of G, Gc, H2, H2c, H3, H3c (score_mask.rows, per-gas rule, SCORE_RULE=phys);
@@ -60,7 +60,6 @@ def files_of(lab):
     return [hfile(k, lab) for k in M.HSETS] + [E / f"{pre}_{lab}" / "P_paths.npz" for pre in M.PSETS]
 
 
-# ---------- VALIDITY: every output present
 miss = [f"missing {f}" for lab in (X, R, F) for f in files_of(lab) if not f.exists()]
 invalid += miss
 for lab in (X, R):
@@ -73,7 +72,6 @@ if miss:
     print("\n".join(L) + "\nT5-VERDICT: INVALID")
     sys.exit(0)
 
-# ---------- fixed-condition rows
 rows = {lab: M.rows(lab) for lab in (X, R, F)}
 for lab in (R, F):
     for k in ("set", "job", "t0"):
@@ -110,7 +108,6 @@ for nm, m in (("inside", ins), ("outside", outs), ("cooler", cool), ("all", allr
              f"{q[nm][R]['last2']} | first > 2 X {q[nm][X]['first2']} R {q[nm][R]['first2']}")
 out["counts"] = q
 
-# ---------- path sets
 pth = {}
 for pre in M.PSETS:
     pth[pre] = {}
@@ -122,7 +119,7 @@ for pre in M.PSETS:
              f"{pth[pre][X]['max_all']:.2f} R {pth[pre][R]['max_all']:.2f}")
 out["paths"] = pth
 
-# ---------- numerics: non-finite model states (P3), kept input, failed Newton solves (rows with >= 1)
+# Non-finite model states (P3), kept input, failed Newton solves (rows with >= 1).
 num = {}
 for lab in (X, R):
     nf = kept = newton = 0
@@ -141,7 +138,7 @@ for lab in (X, R):
     L.append(f"numerics {lab}: non-finite rows {nf}, kept-input rows {kept}, failed-Newton rows (fixed + path sets) {newton}")
 out["numerics"] = num
 
-# ---------- invented switches among X's new late > 2 rows (board6.invented's rule, per row)
+# Invented switches among X's new late > 2 rows (board6.invented's rule, per row).
 Lth = np.array([M.SR.PHYS[s] for s in M.SP])
 
 
@@ -169,7 +166,6 @@ for i in np.flatnonzero(newx):
              f"lasting {r['last'][i]:.2f} | invented {bool(inv[i])}")
 out["new_gt2"] = {"n": int(newx.sum()), "invented": n_inv_new}
 
-# ---------- T2 (snap-back) shares
 t2 = {}
 
 
@@ -203,7 +199,6 @@ else:
 out["t2"] = t2
 out["t2_mean_change"] = t2mean
 
-# ---------- rules
 I = q["inside"]
 res = {}
 lx, lr, lf = I[X]["last05"], I[R]["last05"], I[F]["last05"]

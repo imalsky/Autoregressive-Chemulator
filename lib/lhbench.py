@@ -64,7 +64,7 @@ def vref_index(tag):
             out[i] = j
         else:
             drop.append(i)
-    if drop:   # said, not dropped silently (which jobs are used is unchanged)
+    if drop:
         print(f"vref_index {tag}: {len(drop)} of {len(jobs)} jobs missing or short of their runtime, not used; first ids "
               f"{drop[:10]}", file=sys.stderr, flush=True)
     return out
@@ -383,7 +383,7 @@ def main():
                 m_.fallback = a.closed_fallback
         meta["closed_fallback"] = a.closed_fallback
 
-    if "P" in arms:                          # changing conditions: T and P change every call
+    if "P" in arms:
         r, files, Ps, n, dts, nmix = run_paths(model, a.p_dir, dev)
         np.savez(out / "P_paths.npz", path=np.array([int(f.stem) for f in files]), dt=dts,
                  T=np.stack([p["T"][:n] for p in Ps]), Pbar=np.stack([p["Pbar"][:n] for p in Ps]), p_dir=str(a.p_dir), **r)
@@ -393,7 +393,7 @@ def main():
                               "entry set, floored at eps; chains.mix)"}
         print(f"P n={n} rows={len(Ps)} {r['seconds']:.0f}s interventions={r['nint'].sum(1).tolist()}", flush=True)
 
-    if "H" in arms:                          # starts from a VULCAN tag's own states; truth = the same tag
+    if "H" in arms:
         dt = float(a.h_dt)
         cap = LEVELS[a.level]
         n = a.h_calls if a.h_calls is not None else int(min(cap.get(dt, cap[10.0]), round(HORIZON_S / dt)))

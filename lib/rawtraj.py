@@ -6,7 +6,7 @@ interpolate windows at any (t_start, dt, K) with the exact interpolant. Uses tha
 (processing/preprocessing.py and configs/stage1.json of the pinned snapshot, paths.SNAPSHOT).
 
 Run (no multiprocessing: its spawn semaphores live on the shared RAM disk), one process per chunk:
-    for i in 0..7: taskset -c <cpu_i> python rawtraj.py chunk i 8   (writes CACHE_DIR/part_<i>.npz)
+    for i in 0..7: taskset -c <cpu_i> python rawtraj.py chunk i 8   (writes CACHE_DIR/part_<i>.pkl)
     python rawtraj.py merge 8                                        (writes CACHE_DIR/raw_<split>.npz)
 """
 import json

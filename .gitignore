@@ -1,16 +1,11 @@
-# Ignore everything inside the data folder
 data/*
 
-figures/*
 figures/
 
-plots/*
 plots/
 
-logs/*
 logs/
 
-models/*
 models/
 
 *.pt
@@ -27,15 +22,8 @@ __pycache__/
 .ipynb_checkpoints/
 .pytest_cache/
 
-# Smoke-test scratch tree (testing/run_local_smoke.sh)
+# Smoke-test scratch tree
 smoke_scratch/
-
-# Per-user Claude Code settings
-.claude/settings.local.json
-
-# Author-local files (not tracked)
-/CLAUDE.md
-/todo.md
 
 # Paper notes, kept outside the repository
 /notes.md
