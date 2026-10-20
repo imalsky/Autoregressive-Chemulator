@@ -1,6 +1,5 @@
-"""E13: a 53-species cache paired exactly with a 12-species gcm cache (after the second review: building the 53-species
-cache through rawtraj's own filters gives species-dependent frozen-tail cuts and rejections, so trajectories and their
-order differ). Same groups, order, split, end and conv rows, P, T, seed as the 12-species cache; logy = log10 max(y,
+"""A 53-species cache paired exactly with a 12-species gcm cache (building the 53-species cache through rawtraj's own
+filters would give species-dependent frozen-tail cuts and rejections, so trajectories and their order would differ). Same groups, order, split, end and conv rows, P, T, seed as the 12-species cache; logy = log10 max(y,
 1e-30) of every network species (the raw files' 'species' attr: the generator's order, He included) read from the
 same raw files; no generator import. Checks that the 12
 shared columns equal the 12-species cache exactly.

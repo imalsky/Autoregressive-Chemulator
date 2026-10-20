@@ -1,20 +1,15 @@
-"""U4 (2026-10-17; copy of t5/check_u3.py, the same checks with U4 against U3): U3's 14 files + run_gcm_z23n1 (n1) +
-run_gcm_z23n2 (n2); coverage of n1 / n2 against gen/rows_n1.npy / rows_n2.npy (SEED - 4.2e9 plus missing_rows); the kick
-file is inside the prefix (checked by prefix identity). Original docstring follows.
-T5 arm D: checks of the rebuilt cache U3 against U2 (plan.txt sec. 2 + AMENDMENT (reviews)). No writes.
-  1. files: U3's first files are U2's (same names, same order); the rest are run_gcm_z22b1..4 and run_gcm_z22k.
-  2. prefix identity: in each split, U3's first n_U2 rows equal U2's rows bitwise in every field (logy, end, conv, P, T,
-     seed, file_idx, lo, name): old rows keep their split, order and values, so w_U2_s2's per-row facts carry over.
-  3. per new file: cache entries are distinct groups of the file; groups - entries - step-cap groups (end_case 3) >= 0,
-     and summed over the new files it equals the cache's new rawtraj rejects (meta group_rejects minus U2's; the rule of
-     caches/check_u2.py);
-     y21b (z22b1-4): SEED - 4.2e9 plus the file's missing_rows = gen/rows_y21b<i>.npy;
-     z22k: every group has start "kick" (else cache_gcm.kind would look the SEED up in the gcm design), and no kick
-     row sits in validation or test (the IDs were chosen to hash to train).
-  4. t_grid equal to U2's.
-    python check_u3.py <U3 dir> <U2 dir> <raw dir>          (12-species or 53-species caches)
-    python check_u3.py --res <U3 res dir> <U2 res dir>        (prefix identity and files only)
-Prints CHECK-U3 OK / CHECK-U3-RES OK, else ... FAIL."""
+"""Checks of the training cache U4 against U3, the cache it extends. No writes.
+  1. files: U4's first files are U3's 14 (same names, same order); the rest are run_gcm_z23n1 and run_gcm_z23n2; t_grid
+     and the species list equal U3's.
+  2. prefix identity: in each split, U4's first n_U3 rows equal U3's rows bitwise in every field: old rows keep their
+     split, order and values, so the per-row draw weights carry over; old files' rows come first.
+  3. per new file (not with --res): SEED - 4.2e9 plus the file's missing_rows = paths.GEN/rows_n1.npy / rows_n2.npy;
+     start types are design types only; cache entries are distinct groups of the file; groups - entries - step-cap groups
+     (end_case 3) >= 0, and summed over the new files it equals the cache's new rawtraj rejects (meta group_rejects minus
+     U3's).
+    python check_u4.py <U4 dir> <U3 dir> <raw dir>          (12-species or 53-species caches)
+    python check_u4.py --res <U4 res dir> <U3 res dir>        (files and prefix identity only)
+Prints CHECK-U4 OK / CHECK-U4-RES OK, else ... FAIL."""
 import json
 import sys
 from pathlib import Path
@@ -62,10 +57,10 @@ for s in ("train", "validation", "test"):
     chk(np.all(fi[:n0] < nf) and np.all(fi[n0:] >= nf), f"{s}: old files' rows first, new files' after")
     for k in names:
         names[k][s] = zn["name"][fi == k].tolist()
-    print(f"  {s}: U2 {n0} rows, U3 {zn['seed'].size} (+{zn['seed'].size - n0}); per new file "
+    print(f"  {s}: U3 {n0} rows, U4 {zn['seed'].size} (+{zn['seed'].size - n0}); per new file "
           + ", ".join(f"{mn['files'][k].replace('-result.h5', '')} {len(names[k][s])}" for k in names), flush=True)
 if not res_mode:
-    rej = sum(mn["group_rejects"].values()) - sum(mo["group_rejects"].values())   # check_u2.py's rule: rejects allowed,
+    rej = sum(mn["group_rejects"].values()) - sum(mo["group_rejects"].values())   # rejects allowed,
     diff = 0                                                                          # but every one accounted for
     for k in names:
         f = mn["files"][k]
@@ -83,6 +78,6 @@ if not res_mode:
         chk(dk >= 0, f"{f}: groups {len(groups)} - entries {len(allnm)} - step cap {cap} = {dk} (rawtraj rejects) >= 0")
         diff += dk
     chk(diff == rej, f"groups not in the cache beyond the step cap, summed over the new files: {diff} = new rejects {rej} "
-                     f"({mn['group_rejects']} vs U2 {mo['group_rejects']})")
+                     f"({mn['group_rejects']} vs U3 {mo['group_rejects']})")
 tag = "CHECK-U4-RES" if res_mode else "CHECK-U4"
 print(f"{tag} OK" if ok else f"{tag} FAIL")

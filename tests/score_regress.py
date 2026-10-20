@@ -1,15 +1,15 @@
 """Stored-output scorers rerun against their stored results (CPU only, no model call, nothing outside the work folder
-written). Every script runs from this repository; the stored results stay in the scale phase's _build (NB below).
+written). Every script runs from this repository; the stored results are read where lib/paths.py puts them (NB = paths.SCALE,
+E = paths.E, DEV = paths.PATHS_V3/dev).
 
   (i)   bench/sweep/score_sweep.py on the four stored sweeps (CBg, LD1, FINAL, LD; labels and folders as recorded in
         the stored score.json) -> every number outside the 'scope' subset equal to the stored score.json, every line of
         score.txt outside the scope tables equal, every array of score_rows.npz but sub_scope equal. (The stored files were
-        made with the old scope, Z 1-100x and C/O <= 1; the scorer's scope is the target Z 0.1-300x, C/O 0.1-1 since
-        2026-10-19. With the old scope line the outputs were byte-identical: _build/h2 of the cleanup.)
+        made with the old scope, Z 1-100x and C/O <= 1; the scorer's scope is the target Z 0.1-300x, C/O 0.1-1. With the
+        old scope line the outputs were byte-identical.)
   (ii)  bench/score_minichem.py 1 20 500 on the stored fig4 benches -> median / max / end of the worst gas per call for
-        CBg and FINAL in the six cases equal the numbers logged in paper-notes/notes.md (entry "2026-10-19: raw-gas cases at
-        1, 20 and 500 s"), LD's two dt-20 cases in the scale phase's log.txt (2026-10-19 14:04), and mini-chem's two dt-20
-        cases at CBg's calls in notes.md (entry "2026-10-19: CBg on two mini-chem paper cases at dt 20 s").
+        CBg and FINAL in the six cases equal the numbers logged in the project notes (raw-gas cases at 1, 20 and 500 s),
+        LD's two dt-20 cases and mini-chem's two dt-20 cases at CBg's calls (FIG4, FIG4_LOG, FIG4_MC below).
   (iii) the CBg verdict: bench/rules_t5.py run as the CBg judge ran it (CBg vs LD with --final LD; CBg vs FINAL with
         --final FINAL and FINAL's T2 files) -> verdict json and txt byte-identical to _build/p/verdict_e13s_CBg_s2_vs_*;
         score_mask's per-row caches are rebuilt in the work folder (SCORE_MASK_CACHE) and compared with the stored ones.
@@ -38,9 +38,9 @@ from pathlib import Path
 import numpy as np
 
 REPO = Path(__file__).resolve().parents[1]
-NB = Path("/home/imalsky/Chemulator_Project/experiments/2026-10-13_e13-scale/_build")
-E = Path("/home/imalsky/Chemulator_Project/experiments/2026-10-03_repo-sweep/_build/g2/E13_gcm")
-DEV = Path("/home/imalsky/Chemulator_Project/experiments/2026-10-09_e13-conservation/_build/paths_v3/dev")
+sys.path.insert(0, str(REPO / "lib"))
+import paths  # noqa: E402  (the scorers themselves run in subprocesses)
+NB, E, DEV = paths.SCALE, paths.E, paths.PATHS_V3 / "dev"
 CB, LD, FIN = "e13s_CBg_s2", "e13s_LD_s3", "e13s_FINw1536_s2"
 ENV = {"CUDA_VISIBLE_DEVICES": "", "SCORE_RULE": "phys", "HARNESS_NORM": "", "PYTHONDONTWRITEBYTECODE": "1",
        "PYTHONPATH": f"{REPO / 'bench'}:{REPO / 'lib'}"}
@@ -49,15 +49,15 @@ RUNNER = ("import runpy, sys; s = sys.argv[1]; sys.argv = sys.argv[1:]; sys.path
           "try:\n    runpy.run_path(s, run_name='__main__')\nfinally:\n"
           "    print('MODULES', {m: getattr(sys.modules.get(m), '__file__', None) for m in ('scoreboard', 'scorerule')})")
 CASES = ["1000K 1mbar", "1500K 1mbar", "2000K 1mbar", "1000K 10bar", "1500K 10bar", "2000K 10bar"]
-# notes.md, 2026-10-19 "raw-gas cases at 1, 20 and 500 s": worst gas per call, median/max/end, the six cases in order
+# project notes, raw-gas cases at 1, 20 and 500 s: worst gas per call, median/max/end, the six cases in order
 FIG4 = {("500", "CBg"): "0.02/0.03/0.02 0.08/0.53/0.12 0.00/2.11/0.00 0.07/0.88/0.07 0.04/0.69/0.04 0.01/0.09/0.01",
         ("500", "FINAL"): "0.08/0.28/0.18 0.12/0.56/0.16 0.00/2.00/0.00 0.13/0.91/0.13 0.02/0.71/0.02 0.00/0.05/0.00",
         ("20", "CBg"): "0.00/0.00/0.00 0.18/0.59/0.13 0.01/1.59/0.00 0.74/1.19/0.61 0.03/0.28/0.01 0.01/0.23/0.01",
         ("20", "FINAL"): "0.00/0.00/0.00 0.11/0.98/0.09 0.00/1.90/0.00 0.35/1.52/0.27 0.11/0.31/0.11 0.00/0.45/0.00",
         ("1", "CBg"): "0.00/0.00/0.00 0.66/1.85/0.45 1.89/4.78/0.31 1.17/1.20/1.14 0.07/1.14/0.06 0.01/2.24/0.01",
         ("1", "FINAL"): "0.00/0.00/0.00 0.32/1.92/0.26 1.44/5.10/0.17 0.33/0.53/0.37 0.22/0.60/0.14 0.00/2.44/0.00"}
-FIG4_LOG = {("20", "LD", "1500K 1mbar"): "0.12/0.85/0.08", ("20", "LD", "1000K 10bar"): "0.41/1.26/0.34"}   # log.txt 14:04
-# notes.md, 2026-10-19 "CBg on two mini-chem paper cases at dt 20 s": mini-chem at CBg's 5,000 calls of 20 s
+FIG4_LOG = {("20", "LD", "1500K 1mbar"): "0.12/0.85/0.08", ("20", "LD", "1000K 10bar"): "0.41/1.26/0.34"}   # the run log
+# project notes, CBg on two mini-chem paper cases at dt 20 s: mini-chem at CBg's 5,000 calls of 20 s
 FIG4_MC = {("20", "CBg", "1500K 1mbar"): "0.91/3.83/0.88", ("20", "CBg", "1000K 10bar"): "0.30/0.30/0.30"}
 
 
@@ -147,8 +147,8 @@ def check_fig4(work):
     bad = [(k, want[k], got.get(k)) for k in want if got.get(k) != want[k]]
     bad += [(("mini-chem",) + k, v, mc.get(k)) for k, v in FIG4_MC.items() if mc.get(k) != v]
     n = len(want) + len(FIG4_MC)
-    print(f"  {n} logged cells (CBg and FINAL x 3 dt x 6 cases from notes.md; LD 2 cells from log.txt; mini-chem 2 cells "
-          f"from notes.md): {n - len(bad)} equal" + ("" if not bad else f"; DIFFER: {bad[:8]}"))
+    print(f"  {n} logged cells (CBg and FINAL x 3 dt x 6 cases and mini-chem 2 cells from the notes; LD 2 cells from the "
+          f"run log): {n - len(bad)} equal" + ("" if not bad else f"; DIFFER: {bad[:8]}"))
     return rc == 0 and not bad
 
 

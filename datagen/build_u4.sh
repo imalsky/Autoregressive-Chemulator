@@ -1,13 +1,11 @@
 #!/bin/bash
-# build_u4.sh (2026-10-17): the training cache U4 = U3's 14 files (links, unchanged order) + run_gcm_z23n1 (78,106 runs) +
-# run_gcm_z23n2 (69,836 listed rows) from today's targeted data (gen/rows_n1.py, rows_n2.py: Z 1-100x, C/O 0.3-1.0, 1e-5 to
-# 100 bar). Same code and steps as t5/build_u3.sh: cache_gcm.py chunks (odd CPUs 41-55) + merge with
-# GCM_KINDS=eq,mix,pert,broad,kick -> caches/arch_gcmU4_all; u4/check_u4.py (prefix identity vs U3_all, per-file
-# accounting, n1 / n2 coverage); cache_align53.py -> caches/arch_gcmU4_all53 (/home); scratch quota >= 17 GiB; cache_res.py
-# -> /scratch/imalsky/arch_gcmU4_res; t_grid check; check_u4.py --res vs U3_res; size < 18 GB. Rerunnable (finished steps
-# and U4-CACHE-DONE are skipped); FATAL on failure. The U3 caches the checks compare with were deleted on 2026-10-19, so a
-# rebuild from scratch stops at check_u4 until they are rebuilt. cache_gcm.py now takes each group's start type from its
-# 'start' attr, so the generator's extended gcm.py is no longer needed (its check is dropped).
+# The training cache U4 (CBg's): U3's 14 files (links, unchanged order) + run_gcm_z23n1 (78,106 runs) + run_gcm_z23n2
+# (69,836 listed rows) of targeted data (Z 1-100x, C/O 0.3-1.0, 1e-5 to 100 bar). Steps: cache_gcm.py chunks (odd CPUs
+# 41-55) + merge with GCM_KINDS=eq,mix,pert,broad,kick -> caches/arch_gcmU4_all; check_u4.py (prefix identity vs U3_all,
+# per-file accounting, n1 / n2 coverage); cache_align53.py -> caches/arch_gcmU4_all53; scratch quota >= 17 GiB;
+# cache_res.py -> $CHEM_SCRATCH/arch_gcmU4_res; t_grid check; check_u4.py --res vs U3_res; size < 18 GB. Rerunnable
+# (finished steps and U4-CACHE-DONE are skipped); FATAL on failure. The U3 caches the checks compare with no longer exist,
+# so a rebuild from scratch stops at check_u4 until they are rebuilt.
 #   setsid nohup bash build_u4.sh > build_u4.log 2>&1 &
 set -u
 source "$(dirname "$(dirname "$(readlink -f "$0")")")/run/env.sh"

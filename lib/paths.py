@@ -1,8 +1,8 @@
 """Every absolute data location the code reads or writes. Scripts import this module (after putting this lib folder first
-on sys.path) and take their paths from it. Note: the E13_gcm bench folder holds an unrelated paths.py (the v1 path
-generator); lib must come first on sys.path for 'import paths' to find this one.
+on sys.path) and take their paths from it. Note: the E13_gcm bench folder holds an unrelated paths.py; lib must come
+first on sys.path for 'import paths' to find this one. The data are not part of this repository.
 
-Two roots come from the environment (empty = unset), with the daw defaults:
+Two roots come from the environment (empty = unset), with the defaults of the machine the model was trained on:
   CHEM_PROJECT   the project folder: experiment data, runs, truth sets, the frozen snapshot   (/home/imalsky/Chemulator_Project)
   CHEM_SCRATCH   the fast disk: training caches, development and holdout truth tags            (/scratch/imalsky)
 Other overrides: ARCH_CACHE (data.CACHE, rawtraj.CACHE_DIR; default ARCH_TESTS), HARNESS_NORM (data.NORM; default NORM12),
@@ -29,7 +29,7 @@ PATHS_V2S, PATHS_V2L, PATHS_V2X = E / "paths_v2s", E / "paths_v2l", E / "paths_v
 
 PATHS_V3 = PROJECT / "experiments/2026-10-09_e13-conservation/_build/paths_v3"   # chain sets: dev (DEV, PD), hold (PH),
                                                          # train_a, train_b; hold2 = PH2 is sealed (never list or read it)
-SCALE = PROJECT / "experiments/2026-10-13_e13-scale/_build"     # scale phase: the current runs and decision data
+SCALE = PROJECT / "experiments/2026-10-13_e13-scale/_build"     # the current runs and decision data
 RUNS = SCALE / "runs"                                    # training runs (CBg, its stage 1 CBS1, FINAL, LD, LD1); speed.py
 OUT = Path(os.environ.get("HARNESS_OUT") or SCALE / "bench")   # board / scorer / judge / speed / 1000-day outputs
 T2 = SCALE / "t2"                                        # T2 snap-back test: jobs_sel.json, tag/, times_t2.npy, score_t2*.json

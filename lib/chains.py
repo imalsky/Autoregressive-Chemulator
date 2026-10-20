@@ -1,8 +1,8 @@
-"""E13 conservation phase (2026-10-09, plan Day 1 item 7): GPU-resident changing-condition chains (paths_v3 sets) for
-train.py's chain term, in the entry set of the normalization file (the 12 species, or a reservoir set under
-HARNESS_NORM), and the mixing rule that the training rollout and lhbench's arm P share.
+"""GPU-resident changing-condition chains (path folders of <p>.npz) for train.py's chain term, in the entry set of the
+normalization file, and the mixing rule that the training rollout and lhbench's arm P share.
 
-A paths_v3 path of n calls (gen/paths_v3.py): x [n+1, 53], x[k] = the state before call k (after call k - 1, before any
+A path of n calls (written by the data generator, not in this repository): x [n+1, 53 species], species, T [n],
+Pbar [n], dt [n] and optionally mix_k, mix_f, mix_x; x[k] = the state before call k (after call k - 1, before any
 mix of call k). Call k (0-based) first mixes if k is in mix_k (x <- (1 - f) x + f mix_x), then runs at T[k], Pbar[k] for
 dt[k]; its truth is x[k + 1]. The store keeps z of every state x[0..n] (data.take, floored at EPS, normalized) and, per
 call: g (data.norm_globals of the call's P, T), dt_norm (data.dt_norm_of), log10 number density (cm^-3, the scored mask),

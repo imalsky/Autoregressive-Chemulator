@@ -1,5 +1,5 @@
-"""E13: harness cache from the packed gcm.py raw files (blocks 0 to K-1), through rawtraj._work unchanged
-(RAWTRAJ_FLOOR=1: floored, no drop_below rejection; production's split by file and group name; the 12 tracked
+"""Training cache from the generator's packed raw files (blocks 0 to K-1), through rawtraj._work unchanged
+(RAWTRAJ_FLOOR=1: floored, no drop_below rejection; the 12-species code's split by file and group name; the 12 tracked
 species). GCM_KINDS (comma list of eq, mix, pert, broad, kick; default eq, mix, pert, broad) keeps only groups of those
 start types (the group's 'start' attr, which every packed group carries). Groups that hit VULCAN's step cap (end_case 3:
 truncated, then held constant) are left out. GCM_SPECIES=all caches every network species (the packs' 'species' attr,
@@ -25,7 +25,7 @@ import rawtraj as R  # noqa: E402
 assert R.FLOOR
 RAW = Path(os.environ.get("GCM_RAW", str(paths.RAW_GCM)))  # override: tests
 KINDS = set(os.environ.get("GCM_KINDS", "eq,mix,pert,broad").split(","))
-FILES = os.environ.get("GCM_FILES")  # sprint 2026-10-08: comma list of K raw basenames under GCM_RAW (else run_gcm_bNN)
+FILES = os.environ.get("GCM_FILES")  # comma list of K raw basenames under GCM_RAW (else run_gcm_bNN)
 
 
 def pack_species(f):

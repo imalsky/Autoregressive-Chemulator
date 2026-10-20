@@ -1,5 +1,6 @@
-# Shared environment for this repository's GPU/CPU jobs on daw (sourced by every driver; tmux does not pass the caller's
-# environment). H = this repository; data roots as in lib/paths.py (CHEM_PROJECT, CHEM_SCRATCH); E = the E13 bench folder.
+# Shared environment for this repository's GPU/CPU jobs (sourced by every driver; tmux does not pass the caller's
+# environment); the defaults are those of the machine the model was trained on. H = this repository; data roots as in
+# lib/paths.py (CHEM_PROJECT, CHEM_SCRATCH); E = the E13 bench folder.
 export H=$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")
 export PY=$H/.venv/bin/python
 export PYTHONDONTWRITEBYTECODE=1

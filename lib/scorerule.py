@@ -1,10 +1,9 @@
-"""Which points count and their error, for every board (2026-10-11). SCORE_RULE unset or "phys" (the default since
-2026-10-19; it was flat12): the author's per-gas rule of 2026-10-11 (project CLAUDE.md "Scoring rule"): floors S per gas,
-a resolved point counts if truth or prediction >= S, error |max(pred, S) - max(truth, S)|, so an invented gas counts by
-how far it rises above S. SCORE_RULE=flat12: the 10-08 rule (resolved points with truth or prediction >= 1e-12 mixing
-ratio; error |pred - truth| in dex), a side readout.
-2026-10-19: a non-finite prediction (NaN or +-inf state) on a resolved point is a failure, error +inf, under either rule;
-before, a NaN prediction gave NaN, which every board reads as "not scored" (0 in the worst-gas reductions)."""
+"""Which points count and their error, for every board. SCORE_RULE unset or "phys" (the default): per-gas floors S
+(1e-10 for H2O, CO, CO2, CH4, NH3, HCN, C2H2; 1e-8 for H, OH, O; 1e-6 for H2, N2); a resolved point (number density
+>= 1e-2 cm^-3, the caller's mask) counts if truth or prediction >= S, error |max(pred, S) - max(truth, S)| in dex, so an
+invented gas counts by how far it rises above S. SCORE_RULE=flat12: resolved points with truth or prediction >= 1e-12
+mixing ratio, error |pred - truth| in dex (a side readout). Under either rule a non-finite prediction (NaN or +-inf
+state) on a resolved point is a failure with error +inf."""
 import os
 
 import numpy as np

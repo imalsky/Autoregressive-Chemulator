@@ -1,4 +1,4 @@
-"""Shared E13 definitions (from the 2026-10-13 failure diagnosis; used by build_kicks.py). Read-only on every input.
+"""Shared definitions of build_kicks.py. Read-only on every input.
 Truth sets, the 25-entry definition (datagen/cache_res.py L28-31: 12 reported + He + 7 named tracked,
 reservoirs C/N/O/H atoms and molecule count over the 33 others), per-gas floors, switch timing."""
 import json

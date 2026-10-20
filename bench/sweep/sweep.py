@@ -1,11 +1,12 @@
-"""Step-size sweep runner (2026-10-19; author: "no dt gap"). One GPU run per model evaluates every dt in --dts at once: each
+"""Step-size sweep runner (no step size may be a weak spot). One GPU run per model evaluates every dt in --dts at once: each
 row = (dt, start age, tag job) keeps its own fixed dt for N calls; all rows are batched in one rollout. Arm H machinery of
 lhbench.py in --lib (default: this repository's lib/; <run>/harness/lib = a run's frozen copy; imported read-only): start
 state = the VULCAN tag's own log10 y at the start age (lhbench.vref_logy), g = data.norm_globals(job P, T), truth = the same tag. The per-row dt is
 passed to lhbench.run_arm as a dtsched callable (a constant dt per row), so the npz holds tcum (elapsed time
 per row at each recorded call). Inference policy = the P* bench flags, set exactly as lhbench.main sets its globals for
-  --modes P3 --closed-iters 32 --closed-fallback lm --lm-adaptive   (no --startup-substeps, no --substeps, no --renorm)
-with LHB_BLOCK=50, ARCH_CACHE=/scratch/imalsky/arch_gcm17m_res, HARNESS_NORM=<that cache>/norm.json, TF32 off.
+  --modes P3 --closed-iters 32 --closed-fallback lm --lm-adaptive   (no --startup-substeps)
+with LHB_BLOCK=50, ARCH_CACHE=$CHEM_SCRATCH/arch_gcm17m_res, HARNESS_NORM=<that cache>/norm.json, TF32 off (CHEM_SCRATCH:
+set by run/env.sh).
 Recorded calls: lhbench.ckpt_calls(N, 1) (33 log-spaced calls + 0.9 N + N) plus --lin evenly spaced calls over the second
 half (N/2 .. N) plus --every (every call; tests only).
     python sweep.py <run dir> <out dir> <rows.json> --n N [--dts 1,2,5,10,20,50,100,200,500] [--starts 1e-3,1e6]
@@ -41,7 +42,7 @@ ap.add_argument("--timing", type=int, default=0)
 ap.add_argument("--lib", default=str(Path(__file__).resolve().parents[2] / "lib"))   # lhbench.py's folder
 a = ap.parse_args()
 
-CACHE = str(Path(os.environ.get("CHEM_SCRATCH") or "/scratch/imalsky") / "arch_gcm17m_res")
+CACHE = str(Path(os.environ.get("CHEM_SCRATCH") or sys.exit("CHEM_SCRATCH is not set: source run/env.sh")) / "arch_gcm17m_res")
 os.environ["LHB_BLOCK"] = str(a.block)                   # read by lhbench at import (BLOCK)
 os.environ["ARCH_CACHE"] = CACHE                         # read by data at import (CACHE)
 os.environ["HARNESS_NORM"] = CACHE + "/norm.json"        # read by data at import (NORM: species set, normalization)

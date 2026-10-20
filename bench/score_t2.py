@@ -1,4 +1,4 @@
-"""T2 scorer (rules fixed in protocol.txt before any model result). Reads the model's arm-H bench on the T2 tag (lhbench
+"""T2 snap-back scorer (rules fixed in protocol.txt before any model result). Reads the model's arm-H bench on the T2 tag (lhbench
 --arms H --h-tag <t2/tag> --h-starts 1e-3 --h-dt 500, e.g. E13_gcm/H_t2tag_<label>/H_tag_dt500.npz), the tag's boxes and
 the source jobs' original truths. Per-gas rule (SCORE_RULE=phys, HARNESS_NORM unset), 12 reported species, NaN (no
 scored point) counts as 0. Box clock = elapsed time since the restart (the model starts at 1e-3 s).
@@ -28,8 +28,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "datagen"))
 import build_kicks as K  # noqa: E402  (truth loader, SETS)
 
 KB = 1.380649e-16
-NONFINITE = [0]   # bench rows with any non-finite model state (amendment 2)
-T0 = 0.0  # 2026-10-14 19:4x (verifier, before any model result): the model starts at the kick itself (was 1e-3 s)
+NONFINITE = [0]   # bench rows with any non-finite model state (fail closed)
+T0 = 0.0  # the model starts at the kick itself
 CLASS = {"k1p": "k1", "k1m": "k1", "k2p": "k2", "k2m": "k2", "k3": "k3"}
 BANDS = ("300-650", "650-1300", "1300-2000", "2000-3000")
 
@@ -60,7 +60,7 @@ def main():
     jobs = json.loads((Path(tag) / "jobs.json").read_text())
     B = SB.bench(f)
     st, vt = B["st"], B["vt"]                                     # [R, C, 12] model, VULCAN-kicked at the checkpoints
-    NONFINITE[0] = int(np.logical_not(np.isfinite(st)).any(axis=(1, 2)).sum())   # amendment 2: fail closed
+    NONFINITE[0] = int(np.logical_not(np.isfinite(st)).any(axis=(1, 2)).sum())   # fail closed
     st = np.where(np.isfinite(st), st, 10.0)                     # a non-finite prediction scores as a huge error, never as 0
     el = np.asarray(d["calls"], np.float64) * float(d["dt"])
     t0 = np.asarray(d["t0"], np.float64)
@@ -192,7 +192,7 @@ def report(rows, excl, cal, jobs, f):
          f"(CAL): {sum(v > 0.1 for v in cal.values())}; max {max(cal.values()) if cal else float('nan'):.3f}", "",
          "VERDICT (inside env_any+margin):"]
     res_in = rules([r for r in rows if r["region"] == "in"])
-    if excl["no bench row (box missing)"] > 0 or excl["identity partner missing"] > 0:   # amendment 2: fail closed
+    if excl["no bench row (box missing)"] > 0 or excl["identity partner missing"] > 0:   # fail closed
         res_in["T2"] = "INVALID (bench rows missing)"
     L.append(f"bench rows with a non-finite model state (scored as 10 in log10, i.e. a huge error): {NONFINITE[0]}")
     L += fmt_rules("inside env_any+margin", res_in)

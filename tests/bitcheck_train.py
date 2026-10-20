@@ -6,8 +6,8 @@ the optimizer receives (after clipping), the pre-clip gradients and norm whereve
 (timing and memory fields dropped) and the final stage file's weights. Tensors are compared by the sha256 of their bytes,
 so PASS means bit for bit.
 
-Modes (environment as CBg trained: ARCH_CACHE=/scratch/imalsky/arch_gcmU4_res,
-HARNESS_NORM=/scratch/imalsky/arch_gcm17m_res/norm.json; TF32 on, as train.main sets it):
+Modes (environment as CBg trained: ARCH_CACHE=<paths.SCRATCH>/arch_gcmU4_res,
+HARNESS_NORM=<paths.SCRATCH>/arch_gcm17m_res/norm.json; TF32 on, as train.main sets it; runs under paths.RUNS):
   s2  CBg's config: stage 2 from CBS1's stage1.pt (lockstep, fused projection, row clips, fp64 clip norm, non-finite
       guard). Reference: lib/ of git tag e13s_CBg_s2, extracted with git archive into the work folder.
   s1  CBS1's config: stage 1 from scratch. Reference: CBS1's frozen copy, runs/e13s_CBS1_s2/harness/lib.
@@ -18,7 +18,7 @@ chain_K_ramp = chain_pre_ramp = 1: step 0 runs the start of the curriculum (8 ch
 its end (16 calls, 0-80 pre-roll calls); grid sub-steps cycle 1, 2, 3, 4 over steps 0-3.
 Both sides compile with inductor's run-time kernel choices off (torch._inductor.config.triton.autotune_pointwise and
 dynamic_scale_rblock False). With them on, each process times several block sizes for some reduction kernels at their
-first launch and keeps the fastest, so two processes can sum in different orders: seen 2026-10-19 in stage 1, where the
+first launch and keeps the fastest, so two processes can sum in different orders: seen in stage 1, where the
 layer-norm backward of the first block (a register-heavy reduction that dynamic_scale_rblock gives a second, smaller
 block size) gave different input-layer gradients in about 1 process in 10, the same code and data each time. With one
 kernel config each, the two sides run the same kernels whenever they trace the same graph. Training keeps both on, so
@@ -46,13 +46,6 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-RUNS = Path("/home/imalsky/Chemulator_Project/experiments/2026-10-13_e13-scale/_build/runs")
-ENV = {"ARCH_CACHE": "/scratch/imalsky/arch_gcmU4_res", "HARNESS_NORM": "/scratch/imalsky/arch_gcm17m_res/norm.json",
-       "PYTHONDONTWRITEBYTECODE": "1"}
-MODES = {"s2": {"config": RUNS / "e13s_CBg_s2" / "config.json", "ref": "tag:e13s_CBg_s2",
-                "over": {"s2_steps": None, "chain_K_ramp": 1, "chain_pre_ramp": 1}},
-         "s1": {"config": RUNS / "e13s_CBS1_s2" / "config.json", "ref": str(RUNS / "e13s_CBS1_s2" / "harness" / "lib"),
-                "over": {"s1_steps": None}}}
 COMMON = {"log_every": 1, "val_every": 10 ** 9, "val_windows": 2048, "ckpt_every": 0, "resume": False,
           "path_readout": None, "traj_weights_file": None}
 DROP = {"time", "s_per_step", "peak_mem_gb"}          # log fields that are not numerics
@@ -114,6 +107,20 @@ def worker(lib, run, out):
 
 
 # ----------------------------------------------------------------------------------------------------- orchestrator
+def setup():
+    """The environment and the modes, from this repository's lib/paths.py. Imported here, in the orchestrator only: a
+    worker must import the modules of the lib it tests (a cached 'paths' would leak into a reference copy)."""
+    sys.path.insert(0, str(REPO / "lib"))
+    import paths
+    env = {"ARCH_CACHE": str(paths.SCRATCH / "arch_gcmU4_res"),
+           "HARNESS_NORM": str(paths.SCRATCH / "arch_gcm17m_res" / "norm.json"), "PYTHONDONTWRITEBYTECODE": "1"}
+    modes = {"s2": {"config": paths.RUNS / "e13s_CBg_s2" / "config.json", "ref": "tag:e13s_CBg_s2",
+                    "over": {"s2_steps": None, "chain_K_ramp": 1, "chain_pre_ramp": 1}},
+             "s1": {"config": paths.RUNS / "e13s_CBS1_s2" / "config.json",
+                    "ref": str(paths.RUNS / "e13s_CBS1_s2" / "harness" / "lib"), "over": {"s1_steps": None}}}
+    return env, modes
+
+
 def gpu_idle():
     idx = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     if idx != "1":
@@ -209,7 +216,7 @@ def compare(name, a, b, verbose=True):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=sorted(MODES))
+    ap.add_argument("mode", choices=["s1", "s2"])
     ap.add_argument("--steps", type=int, default=4)
     ap.add_argument("--ref", default=None, help="reference lib folder (default: the mode's reference)")
     ap.add_argument("--repeat", action="store_true")
@@ -217,6 +224,7 @@ def main():
     ap.add_argument("--work", default=None)
     a = ap.parse_args()
     gpu_idle()
+    ENV, MODES = setup()
     m = MODES[a.mode]
     tmp = os.environ.get("TMPDIR")
     assert tmp and not tmp.startswith("/tmp"), "TMPDIR must be set to your own scratch (run/env.sh)"

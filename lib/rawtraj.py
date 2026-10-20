@@ -1,9 +1,9 @@
-"""Build the raw-trajectory cache for the architecture tests.
+"""Raw-trajectory cache builder (datagen/cache_gcm.py reuses _work, _cfg, CACHE_DIR and SPLITS for the generator's packs).
 
-Every raw group that Auto-Chem's preprocessing keeps (same rejects, same frozen-tail cut, same
-split, same frozen_tail_no_window rule) is stored with its full raw grid as log10 mixing ratio
-(float64), so the GPU sampler can interpolate windows at any (t_start, dt, K) with the exact
-production interpolant. Uses processing/preprocessing.py's own functions.
+Every raw group that the 12-species preprocessing keeps (same rejects, same frozen-tail cut, same split, same
+frozen_tail_no_window rule) is stored with its full raw grid as log10 mixing ratio (float64), so the GPU sampler can
+interpolate windows at any (t_start, dt, K) with the exact interpolant. Uses that preprocessing's own functions
+(processing/preprocessing.py and configs/stage1.json of the pinned snapshot, paths.SNAPSHOT).
 
 Run (no multiprocessing: its spawn semaphores live on the shared RAM disk), one process per chunk:
     for i in 0..7: taskset -c <cpu_i> python rawtraj.py chunk i 8   (writes CACHE_DIR/part_<i>.npz)
@@ -27,7 +27,7 @@ sys.path.insert(0, str(paths.SNAP_PROCESSING))
 import preprocessing as PP  # noqa: E402
 
 CACHE_DIR = Path(os.environ.get("ARCH_CACHE", str(paths.ARCH_TESTS)))
-FLOOR = os.environ.get("RAWTRAJ_FLOOR") == "1"  # E8: keep groups with values below drop_below (floored at epsilon)
+FLOOR = os.environ.get("RAWTRAJ_FLOOR") == "1"  # keep groups with values below drop_below (floored at epsilon)
 CFG_PATH = REPO / "configs" / "stage1.json"
 SPLITS = ("train", "validation", "test")
 LO_BY_FILE = {"run6050-result.h5": -20.0}  # sampler lower bound; -25 for the other files

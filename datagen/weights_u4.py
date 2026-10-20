@@ -1,10 +1,10 @@
-"""NOTE (2026-10-19): its second argument, the U2 reservoir cache /scratch/imalsky/arch_gcmU2_res, was deleted on
-2026-10-19; until that cache is rebuilt from the raw packs this script cannot regenerate w_U4_s1 / w_U4_s2.
-U4 copy (2026-10-17) of t5/weights_u3.py: the same rule on U4 (U2 prefix + y21b + kicks + n1 + n2; every row after the
-U2 prefix that is not a kick joins its stratum like y21b did). Optional 6th argument: the kicked share (default 0.20 as D;
-0 for a stage-1 file, as FINAL's stage 1 had no kicks; old strata then get 1 - that share). Original docstring follows.
-Draw weights w_U3_s2 for arm D (T5, plan.txt sec. 3 + AMENDMENT (reviews)).
-Strata as caches/weights_u2.py (its strata() copied unchanged below): six T bands (0-650-800-1300-1800-2300-inf K) x
+"""Per-row draw weights of CBg's training cache U4 (w_U4_s1, w_U4_s2; train.py traj_weights_file). Note: its second
+argument, the U2 reservoir cache ($CHEM_SCRATCH/arch_gcmU2_res), no longer exists; until it is rebuilt from the raw packs
+this script cannot regenerate the weight files.
+U4 = the U2 prefix + y21b + kicks + n1 + n2; every row after the U2 prefix that is not a kick joins its stratum like y21b.
+Optional 6th argument: the kicked share (default 0.20; 0 for a stage-1 file; old strata then get 1 - that share).
+The rule (written for U3 = U2 + y21b + kicks; U4 adds n1, n2 as above):
+Strata (strata() below): six T bands (0-650-800-1300-1800-2300-inf K) x
 event flag for non-M rows, plus the M rows x event flag (14 strata); the kicked rows (run_gcm_z22k) form four more strata
 by band (300-650, 650-1300, 1300-2000, 2000-3000 K).
   old strata: FINAL's realised stage-2 shares (bincount over U2 train rows with w_U2_s2) x 0.80, spread uniformly over the
@@ -13,7 +13,8 @@ by band (300-650, 650-1300, 1300-2000, 2000-3000 K).
   kick strata: 0.20 x (0.30, 0.45, 0.15, 0.10), uniform over the band's usable kicked rows.
 Usable: old rows w_U2_s2 > 0 (U3's train prefix is U2's train, asserted here on seed and name and, for the event flags,
 on the strata themselves); new rows elem_drift <= 1e-2, read from the raw groups' attrs (y21b and z22k).
-    python weights_u3.py <U3 res cache> <U2 res cache> <w_U2_s2.npy> <U3 raw dir> <out .npy>   (refuses to overwrite)"""
+    python weights_u4.py <U4 res cache> <U2 res cache> <w_U2_s2.npy> <U4 raw dir> <out .npy> [kicked share]
+                                                                                              (refuses to overwrite)"""
 import json
 import sys
 from pathlib import Path
@@ -33,7 +34,7 @@ OLD_SHARE = 1.0 - KICK_SHARE
 
 
 def strata(c):
-    """(copied from caches/weights_u2.py) Per train row: stratum index (band * 2 + event for non-M rows, 12 + event for M
+    """Per train row: stratum index (band * 2 + event for non-M rows, 12 + event for M
     rows); also returns the cache arrays."""
     meta = json.loads((c / "meta.json").read_text())
     files, spc = meta["files"], meta["species"]

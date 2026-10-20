@@ -1,15 +1,15 @@
-"""Candidate judge: a run X against a reference R (the 2026-10-18 CBg judge, scale-phase p/judge_cbg.py, with the run names
-as arguments). No model call, no GPU.
+"""Candidate judge: a run X against a reference R (the rule CBg was judged by, with the run names as arguments). No model
+call, no GPU.
   X vs R by rules_t5.py (fixed-condition rows of G, Gc, H2, H2c, H3, H3c; the five path sets; numerics; T2 snap-back);
   X vs FINAL by rules_t5.py with FINAL's T2 files (readout; --final names another anchor, whose T2 score is
   paths.T2/score_t2_<FINAL>.json, or score_t2.json for e13s_FINw1536_s2, which kept that name);
   small steps from evolved states (sd_score.py, dt 1 s) vs R;
   speed (paths.OUT/speed_<X>_idle_keep.json, us per cell at 1e5 cells) and the 1000-day run (paths.OUT/cyc1000_<X>.json),
   when present.
-Pass rule: helps() below, as the CBg judge (rules_t5 ADOPT, or lasting > 0.5 inside X <= 0.90 x R with fixed >= 2 x broken,
+Pass rule: helps() below (rules_t5 ADOPT, or lasting > 0.5 inside X <= 0.90 x R with fixed >= 2 x broken,
 late > 0.5 inside X <= R, P3 and every guard G1-G7); then SD (non-finite rows 0, rows > 0.5 inside <= 1.10 x R + 3, rows > 2
 <= R + 1), speed <= 10 us per cell and a bounded 1000-day run (finite, nothing rejected, no kept input, last five cycle
-changes <= 0.1 dex). The later pass rule v2 (pass_v2.py: large misses as readouts, author 2026-10-19) is not wired in.
+changes <= 0.1 dex). The later pass rule v2 (pass_v2.py: large misses as readouts) is not wired in.
 Inputs: the benches of X, R and FINAL in paths.E (run/bench_dev.sh, all sets incl. T2 and SD1), X's T2 score
 paths.T2/score_t2_<X>.json. Writes <out>/verdict_<X>_vs_<R>.{txt,json}, <out>/verdict_<X>_vs_<FINAL>.{txt,json} and
 <out>/judge_<X>.txt; last line VERDICT.

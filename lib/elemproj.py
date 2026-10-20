@@ -1,10 +1,12 @@
-"""E13: element-ratio projection for complete species sets (all network species, He included), shared by the closed
-head (models.RelaxClosedHead) and the training labels (data.RawSplit.logy_at).
+"""Element-ratio projection for complete entry sets (every network species or reservoir, He included), shared by the
+closed head (models.RelaxClosedRHead) and the training labels (data.RawSplit.logy_at).
 
 project_ln(ln_y, lr, na, nh): ln y [..., S] (natural log mixing ratios), lr [..., 4] target log ratios to H of
 (C, N, O, He); returns ln y' = ln y + na lam - logsumexp(.), the multiplicative change y exp(na lam) that meets the
-ratios (lam [..., 4] from damped Newton, unrolled, fp64), normalised so sum y' = 1, plus the final max |residual| in
-log-ratio units per state (to detect non-convergence).
+ratios (lam [..., 4] from damped Newton, unrolled, fp64), normalised so sum y' = 1 (over the entries in mol), plus the
+final max |residual| in log-ratio units per state (to detect non-convergence). It makes the training labels: its
+arithmetic must stay as it is. project_ln_fused: the same mathematics for compiled training code. project_lm: the same
+solution family by Levenberg-Marquardt, the rescue for rows where Newton fails.
 """
 import re
 
@@ -52,17 +54,16 @@ def project_ln(ln_y, lr, na, nh, iters=12, clip=2.0, mol=None):
     return w - torch.logsumexp(w if mol is None else torch.index_select(w, -1, mol), -1, keepdim=True), res
 
 
-PIVOT_TINY = 1e-100   # 2026-10-17 (fastt, fuse review issue 1): _solve4 divisors at or below this magnitude flag the row
+PIVOT_TINY = 1e-100   # _solve4 divisors at or below this magnitude flag the row
 
 
 def _solve4(J, b):
     """J [..., n, n] x = b [..., n] (n = 4) by unrolled Gaussian elimination with partial pivoting, elementwise torch ops
     only (no cuBLAS / cuSOLVER call), so torch.compile can fuse the whole solve into one kernel. Pivot: before eliminating
     column k, row k is swapped with each later row whose |entry k| is larger (strict >: the first maximum wins, as
-    LAPACK's getrf). 2026-10-17 (fastt, fuse review issue 1): a pivot with |p| <= PIVOT_TINY (zero, subnormal or NaN)
-    is replaced by 1 before it divides and flags its row; a flagged row returns step 0 (what nan_to_num made of the LU
-    solve's inf / NaN), and its backward stays finite (the division's backward was 0 * inf = NaN). Rows without a flag:
-    the same arithmetic as before."""
+    LAPACK's getrf). A pivot with |p| <= PIVOT_TINY (zero, subnormal or NaN) is replaced by 1 before it divides and
+    flags its row; a flagged row returns step 0 (what nan_to_num makes of an LU solve's inf / NaN), and its backward
+    stays finite (a division by 0 would give 0 * inf = NaN)."""
     n = J.shape[-1]
     a = [[J[..., i, j] for j in range(n)] + [b[..., i]] for i in range(n)]
     piv, bad = [None] * n, None
@@ -89,8 +90,7 @@ def _solve4(J, b):
 
 
 def project_ln_fused(ln_y, lr, na, nh, iters=12, clip=2.0, mol=None):
-    """2026-10-17 (fuse study, models.RelaxClosedRHead fused=True): project_ln's mathematics written for torch.compile
-    fusion. The four element log-sums and the H log-sum are one logsumexp over [..., 5, S] (rows C, N, O, He, then H);
+    """project_ln's mathematics written for torch.compile fusion (models.RelaxClosedRHead fused=True, training only). The four element log-sums and the H log-sum are one logsumexp over [..., 5, S] (rows C, N, O, He, then H);
     the Jacobian's two products (inner dim S) are one broadcast multiply-sum over [..., 5, S, 4]; lam @ na.T is a broadcast
     multiply-sum (inner dim 4); the 4x4 Newton solve is _solve4 (unrolled elimination, partial pivoting, no cuBLAS);
     nan_to_num, the step clamp, the residual and the mol normalisation as project_ln. Same returns; equal to project_ln up
@@ -116,12 +116,11 @@ def project_ln_fused(ln_y, lr, na, nh, iters=12, clip=2.0, mol=None):
 
 
 def project_lm(ln_y, lr, na, nh, iters=32, clip=2.0, mol=None):
-    """2026-10-12 (fixes phase): project_ln's solution family (ln y + na lam, normalised), found by Levenberg-Marquardt on
+    """project_ln's solution family (ln y + na lam, normalised), found by Levenberg-Marquardt on
     |F|^2: regularised normal equations (J^T J + d I) step = -J^T F, a step is taken only if it lowers |F|^2 (damping d
     x0.3 after a success, x10 after a failure, d in [1e-12, 1e12]), fixed iterations, no host sync. project_ln's clipped
-    Newton cycles (componentwise clip of an ill-conditioned step: a non-descent direction) on very large moves (13-17 dex first calls of the sealed H2 jobs 606 and
-    218: residual 6-10 after 32 iterations); this solve converges there within 24 iterations (fixes-phase
-    checks/freeze/solvers.txt, lm_iters.txt). Same returns as project_ln."""
+    Newton can cycle (a componentwise clip of an ill-conditioned step is not a descent direction) on very large moves
+    (first calls that change some entries by 13-17 dex); this solve converges there. Same returns as project_ln."""
     la, lh = torch.log(na), torch.log(nh)
     eye = torch.eye(lr.shape[-1], dtype=ln_y.dtype, device=ln_y.device)
 

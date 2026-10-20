@@ -1,9 +1,9 @@
-"""T2 snap-back test, step 2 (scale phase, 2026-10-14): element-preserving kicks of the full 53-species truth state, written
+"""T2 snap-back test, step 2: element-preserving kicks of the full 53-species truth state, written
 as an arm-H tag (jobs.json in vulcan_ref.box format + extra metadata per box; the boxes' <i>.npz are written on the
 generator side, training-data-generator/e13/drive_t2.py).
 
 Restart state: the source job's stored VULCAN step nearest (in log t) to t_target = 1.5e3, 1e5, 1e7 s (all 53 species,
-floored at 1e-30); t_r = that step's time (as diag/build_w1.py). VULCAN settings: the truth job's cfg with rtol 0.005
+floored at 1e-30); t_r = that step's time. VULCAN settings: the truth job's cfg with rtol 0.005
 (G and Gc truths ran at the default 0.05, H2 / H2c / H3 / H3c at 0.005), runtime = trun_min = 1e8 s (covers 1000 days =
 8.64e7 s after the restart; lhbench.vref_index needs t[-1] >= runtime), plus dt_var_max = DT_VAR_MAX when set (VULCAN's
 step-growth cap only, for >= 10 output points per decade; decided from the smoke test, recorded in protocol.txt).
@@ -11,14 +11,14 @@ step-growth cap only, for >= 10 output points per decade; decided from the smoke
 Element conservation. The re-match is match2.py (x_i = h_i exp(W_i . lam), Newton on the dual) on the four ATOM
 totals C, N, O, H (cols 0-3), He held fixed; the molecule count is left free, because chemistry does not conserve it
 (CH4 + H2O <-> CO + 3 H2 changes it by 2): holding it too (a 5-total match) forced trace species to absorb the
-molecule-count change and dropped 2,925 of 4,482 kicks in a dry run (10-14 18:5x). Checked on the state VULCAN starts
+molecule-count change and dropped 2,925 of 4,482 kicks in a dry run. Checked on the state VULCAN starts
 from (floored at 1e-30, divided by its sum, as vulcan_ref.box does), against the identity restart's started state:
   preserved to <= 1e-10 (max relative difference): the element FRACTIONS, atoms of C, N, O, H, He per atom (equivalently
     every element ratio, C/He, O/H, ...): what defines the gas at fixed T, P;
   not preserved: the absolute per-volume totals, which scale by S0/S' (S = the 53-species sum before renormalisation)
     because VULCAN starts every box at n = P/kT while the kick changes the molecule count. Recorded per box as
     abs_factor = S0/S' - 1; kicks with |abs_factor| > 1e-2 are DROPPED (a > 1 % molecule-count change is not a kick).
-    Within the cap this is equivalent to a <= 1 % pressure shift of the attractor (I: negligible against 0.1-dex rules).
+    Within the cap this is equivalent to a <= 1 % pressure shift of the attractor (negligible against 0.1-dex rules).
 
 Kicks per (job, t_r):
   k0   identity (control).

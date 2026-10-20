@@ -1,6 +1,7 @@
-"""Rows of the step-size sweep (2026-10-19): a seeded subsample of the combined development tag devall6 (G, Gc, H2, H2c, H3,
+"""Rows of the step-size sweep: a seeded subsample of the combined development tag devall6 (G, Gc, H2, H2c, H3,
 H3c; the opened fixed-condition sets) plus the six fig4 raw-gas cases. Categories (rules_t5 / late judge definitions):
-scope = inside the GCM envelope (select_jobs.env_margin: env_any +- 100 K, +- 0.1 dex) AND Z 1-100x AND C/O <= 1;
+scope = inside the GCM envelope (select_jobs.env_margin: env_any +- 100 K, +- 0.1 dex) AND Z 1-100x AND C/O <= 1 (the
+target when the stored rows_main.json was drawn; score_sweep.py's scope is wider);
 inside-other = inside, outside that composition; outside = not inside. Within each category jobs are drawn uniformly at
 random (seed 20261019) from the dev sets, so set, T and P mix follow the sets' own design; the cooler stratum (300 <= T <
 1300 K, 1e-5 <= P <= 100 bar) is not quota'd and is reported as a subset.
