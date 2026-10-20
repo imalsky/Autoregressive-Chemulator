@@ -57,7 +57,7 @@ def truth(set_, j):
 
 
 def interp(t, x, times):
-    """linear-in-t interpolation of linear x (score.vtruth's rule) -> [len(times), S]"""
+    """linear-in-t interpolation of linear x (scoreboard.vtruth's rule) -> [len(times), S]"""
     return np.stack([np.interp(times, t, x[:, k]) for k in range(x.shape[1])], -1)
 
 

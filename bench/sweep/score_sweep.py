@@ -1,6 +1,6 @@
 """Score step-size sweeps (sweep.py outputs) with the project rule and combine the nine dt with equal weight (2026-10-19).
-Truth = the row's VULCAN tag at t0 + tcum (score.vtruth, as scoreboard.bench with tcum); states cut to the 12 reported gases
-(analyze_e13.cut12); error = scorerule.err with SCORE_RULE=phys (per-gas floors) on resolved points (truth or prediction
+Truth = the row's VULCAN tag at t0 + tcum (scoreboard.vtruth, as scoreboard.bench with tcum); states cut to the 12 reported gases
+(scoreboard.cut12); error = scorerule.err with SCORE_RULE=phys (per-gas floors) on resolved points (truth or prediction
 number density >= 1e-2 cm^-3). Per row: w(call) = worst-gas error at a recorded call (NaN -> 0);
   lasting = w at the last call N;  late = max w over recorded calls >= N / 2;  mean = mean of w over the recorded calls
   (log-spaced + the second-half grid);  at tau = w at the recorded call where the row's elapsed time equals tau (1e3, 1e4 s:
@@ -22,7 +22,7 @@ import numpy as np
 
 assert os.environ.get("SCORE_RULE") == "phys", "set SCORE_RULE=phys"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # bench/
-import scoreboard as S  # noqa: E402  (A = analyze_e13: cut12, KB, SC.vtruth; SR = scorerule; SP = the 12 gases)
+import scoreboard as S  # noqa: E402  (cut12, vtruth, KB; SR = scorerule; SP = the 12 gases)
 from select_jobs import env_margin  # noqa: E402
 
 assert S.SR.RULE == "phys" and len(S.SP) == 12
@@ -32,11 +32,11 @@ STARTS = {1e-3: "raw (t0 1e-3 s)", 1e6: "evolved (t0 1e6 s)"}
 
 def score(d):
     """Per-row values for one sweep npz."""
-    st = S.A.cut12(d["states"]).transpose(1, 0, 2)                          # [R, C, 12]
+    st = S.cut12(d["states"]).transpose(1, 0, 2)                          # [R, C, 12]
     el = d["tcum"].T                                                       # [R, C]
     tags = [str(t) for t in d["tags"]]
-    vt = np.stack([S.A.SC.vtruth(tags[ti], j, t0 + e) for ti, j, t0, e in zip(d["tagi"], d["job"], d["t0"], el)])
-    lnd = np.log10(d["P"] / (S.A.KB * d["T"]))[:, None, None]
+    vt = np.stack([S.vtruth(tags[ti], j, t0 + e) for ti, j, t0, e in zip(d["tagi"], d["job"], d["t0"], el)])
+    lnd = np.log10(d["P"] / (S.KB * d["T"]))[:, None, None]
     e = S.SR.err(vt, st, ((vt + lnd) >= -2.0) | ((st + lnd) >= -2.0), S.SP)
     w = np.nan_to_num(e, nan=0.0, posinf=np.inf).max(-1)                                  # [R, C] worst gas per recorded call
     calls = d["calls"]

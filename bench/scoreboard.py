@@ -1,5 +1,5 @@
 """Overall-error scoreboard (2026-10-08 methods audit; author: "the target is best overall error ... any big error is a
-problem"). Per run, on resolved points (truth or prediction >= 1e-2 cm^-3, as analyze_e13) with a mixing-ratio floor
+problem"). Per run, on resolved points (truth or prediction >= 1e-2 cm^-3) with a mixing-ratio floor
 (lib/scorerule.py: the per-gas floors, SCORE_RULE=phys, the default since 2026-10-19; flat12 = the old 1e-12 floor) so
 that near-threshold trace noise does not dominate the tails:
   G dt500 per T band: pooled late-max p90, worst species (late-max p90) and its name, late-max p99, max, rows with any
@@ -17,25 +17,50 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import paths  # noqa: E402
-import scorerule as SR  # noqa: E402  (2026-10-11: SCORE_RULE selects the scoring rule)
+import data as D  # noqa: E402
+import scorerule as SR  # noqa: E402
+
+assert len(D.SHORT) == 12, "run without HARNESS_NORM: the reported set is the production 12 species"
 E = paths.E
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import analyze_e13 as A  # noqa: E402
-import score_sprint as SS  # noqa: E402
+OUT = paths.OUT
+KB = 1.380649e-16                               # Boltzmann constant (erg / K); P in barye
+EDGES = [300, 800, 1300, 1800, 2300, 3001]      # T bands (K)
+SP = list(D.SHORT)
+SPRES = [s.replace("_evolution", "") for s in json.loads(paths.RES_NORM.read_text())["species_variables"]]   # 25 entries
+_VCACHE = {}
 
-OUT = paths.OUT   # outputs (2026-10-09: were written beside this file)
 
-FLOOR = -12.0
-SP = list(A.D.SHORT)
-EDGES = A.EDGES
+def cut12(st):
+    """States [..., entries] of a 12-species or 25-entry (reservoir) model -> the 12 reported species (data.SHORT order)."""
+    if st.shape[-1] == len(SP):
+        return st
+    if st.shape[-1] == len(SPRES):
+        return st[..., [SPRES.index(s) for s in SP]]
+    raise ValueError(f"states with {st.shape[-1]} entries: neither the 12 reported species nor the 25-entry set")
+
+
+def vtruth(tag, job, times):
+    """log10 of the 12 reported mixing ratios of a VULCAN tag's job at times (s): linear in t between VULCAN steps,
+    floored at data.EPS. tag: a name under paths.VREF or an absolute folder."""
+    key = (tag, int(job))
+    if key not in _VCACHE:
+        r = np.load(paths.VREF / tag / f"{int(job)}.npz")
+        sp = list(r["species"])
+        _VCACHE[key] = (r["t"], r["x"][:, [sp.index(s) for s in D.SHORT]])
+    t, x = _VCACHE[key]
+    return np.log10(np.maximum(np.stack([np.interp(times, t, x[:, j]) for j in range(x.shape[1])], -1), D.EPS))
+
+
+def bands(T):
+    return [(f"{lo}-{hi}", (T >= lo) & (T < hi)) for lo, hi in zip(EDGES[:-1], EDGES[1:])]
 
 
 def bench(f):
     d = np.load(f)
-    st = A.cut12(d["states"][:, 2]).transpose(1, 0, 2)
+    st = cut12(d["states"][:, 2]).transpose(1, 0, 2)
     el = d["tcum"].T if "tcum" in d.files else np.broadcast_to(d["calls"][None, :] * float(d["dt"]), (d["t0"].size, d["calls"].size))
-    vt = np.stack([A.SC.vtruth(str(d["tag"]), j, d["t0"][i] + el[i]) for i, j in enumerate(d["job"])])
-    lnd = np.log10(d["P"] / (A.KB * d["T"]))[:, None, None]
+    vt = np.stack([vtruth(str(d["tag"]), j, d["t0"][i] + el[i]) for i, j in enumerate(d["job"])])
+    lnd = np.log10(d["P"] / (KB * d["T"]))[:, None, None]
     e = SR.err(vt, st, ((vt + lnd) >= -2.0) | ((st + lnd) >= -2.0), SP)
     late = np.median(el, 0) >= 1e3
     return {"e": e[:, late], "e1": e[:, np.logical_not(late)], "st": st, "vt": vt, "T": d["T"], "P": d["P"] / 1e6,
@@ -97,15 +122,15 @@ def path_board(run, pat):
     f = E / pat.format(run) / "P_paths.npz"
     if not f.exists():
         return None
-    d = np.load(f)                                         # as score_sprint.paths_errors, keeping the truth for the floor
-    st, calls = A.cut12(d["states"][:, 2]), d["calls"]
+    d = np.load(f)                                         # every call scored against the chained VULCAN truth
+    st, calls = cut12(d["states"][:, 2]), d["calls"]
     pdir = Path(str(d["p_dir"]))
     vt, res = [], []
     for k, p in enumerate(d["path"]):
         q = np.load(pdir / f"{int(p)}.npz")
-        cols = [list(q["species"]).index(s) for s in A.D.SHORT]
-        x = np.log10(np.maximum(q["x"][calls][:, cols], A.D.EPS))
-        n = q["Pbar"][calls - 1] * 1e6 / (A.KB * q["T"][calls - 1])
+        cols = [list(q["species"]).index(s) for s in D.SHORT]
+        x = np.log10(np.maximum(q["x"][calls][:, cols], D.EPS))
+        n = q["Pbar"][calls - 1] * 1e6 / (KB * q["T"][calls - 1])
         vt.append(x)
         res.append((x + np.log10(n)[:, None] >= -2.0) | (st[:, k] + np.log10(n)[:, None] >= -2.0))
     vt, res = np.stack(vt, 1), np.stack(res, 1)
@@ -113,7 +138,7 @@ def path_board(run, pat):
     Tm = d["T"].mean(1)
     late = calls >= 50
     out = {}
-    for b, m in [("all", np.ones_like(Tm, bool))] + SS.bands(Tm):
+    for b, m in [("all", np.ones_like(Tm, bool))] + bands(Tm):
         if not m.any():
             continue
         el = e[late][:, m]

@@ -37,7 +37,7 @@ import scorerule as SR  # noqa: E402
 
 assert os.environ.get("SCORE_RULE") == "phys" and not os.environ.get("HARNESS_NORM")
 CACHE = Path(os.environ.get("SCORE_MASK_CACHE") or paths.T5_DESIGN)   # per-row caches rows_<label>.npz
-A, E, SP = S.A, S.E, S.SP
+E, SP = S.E, S.SP
 LABS = {"FINAL": "e13s_FINw1536_s2", "F2": "e13f_F2ev19_s2_fx", "B": "e13s_FINw1024_s2", "G1": "e13s_G1w1536_s2",
         "A": "e13s_S2U2w1536_s2"}
 HSETS = {"G": ("g500", "H_gtest_dt500.npz"), "Gc": ("gc500", "H_gtest_cold_dt500.npz"), "H2": ("h2", "H_h2_dt500.npz"),
@@ -97,14 +97,14 @@ def rows(label):
 def paths(label, pre):
     """Per-gas error [C, paths, 12] (NaN = not scored), per-call T [paths, C] and P in bar, as scoreboard.path_board."""
     d = np.load(E / f"{pre}_{label}" / "P_paths.npz")
-    st, calls = A.cut12(d["states"][:, 2]), d["calls"]
+    st, calls = S.cut12(d["states"][:, 2]), d["calls"]
     pdir = Path(str(d["p_dir"]))
     vt, res = [], []
     for k, p in enumerate(d["path"]):
         q = np.load(pdir / f"{int(p)}.npz")
-        cols = [list(q["species"]).index(s) for s in A.D.SHORT]
-        x = np.log10(np.maximum(q["x"][calls][:, cols], A.D.EPS))
-        n = np.log10(q["Pbar"][calls - 1] * 1e6 / (A.KB * q["T"][calls - 1]))[:, None]
+        cols = [list(q["species"]).index(s) for s in S.D.SHORT]
+        x = np.log10(np.maximum(q["x"][calls][:, cols], S.D.EPS))
+        n = np.log10(q["Pbar"][calls - 1] * 1e6 / (S.KB * q["T"][calls - 1]))[:, None]
         assert np.allclose(d["T"][k], q["T"][calls - 1]) and np.allclose(d["Pbar"][k], q["Pbar"][calls - 1])
         vt.append(x)
         res.append((x + n >= -2.0) | (st[:, k] + n >= -2.0))

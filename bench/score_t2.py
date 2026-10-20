@@ -22,7 +22,7 @@ sys.dont_write_bytecode = True
 assert os.environ.get("SCORE_RULE") == "phys" and not os.environ.get("HARNESS_NORM"), "SCORE_RULE=phys, HARNESS_NORM unset"
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # bench/
 import scoreboard as SB  # noqa: E402
-SR, A = SB.SR, SB.A
+SR = SB.SR
 SP = SB.SP
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "datagen"))
 import build_kicks as K  # noqa: E402  (truth loader, SETS)
@@ -99,8 +99,8 @@ def main():
         # VULCAN fine grid: the kicked box's own steps in [1e-3, 1e-3 + 8.64e7]
         tk = np.load(Path(tag) / f"{ti}.npz")["t"]
         tf = np.concatenate([[T0], tk[(tk > T0) & (tk <= T0 + 8.64e7)]])
-        vk_f = A.SC.vtruth(tag, ti, tf)
-        v0_f = A.SC.vtruth(tag, p0, tf)
+        vk_f = SB.vtruth(tag, ti, tf)
+        v0_f = SB.vtruth(tag, p0, tf)
         s0_f = err(vk_f, v0_f, lnd)
         D0 = float(qsel(s0_f[0], q))
         s0 = err(vt[r], vt[r0], lnd)                              # [C, 12] at the checkpoints

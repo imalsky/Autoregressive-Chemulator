@@ -43,7 +43,7 @@ CRITIC_ROWS = SCALE / "research/critic/rows_e13s_FINw1536_s2.npz"   # FINAL's pe
 GEN = SCALE / "gen"                                      # targeted row lists rows_*.npy (never-rerun rule)
 
 ARCH_TESTS = SCRATCH / "arch_gcm17m_res"                 # default ARCH_CACHE (its raw_test.npz is lhbench's test split)
-RES_NORM = SCRATCH / "arch_gcm16_res/norm.json"          # reservoir-set (25-entry) species list (analyze_e13.cut12, path_board)
+RES_NORM = SCRATCH / "arch_gcm16_res/norm.json"          # reservoir-set (25-entry) species list (scoreboard.cut12, path_board)
 DEVALL6 = SCRATCH / "e13_scaledev/devall6"               # combined dev tag G + Gc + H2 + H2c + H3 + H3c (dev benches, sweep)
 HOLDOUTS = {"h2": SCRATCH / "e13_holdout/h2", "h2c": SCRATCH / "e13_holdout/h2c",      # opened fixed-condition sets
             "h3": SCRATCH / "e13_holdout3/h3", "h3c": SCRATCH / "e13_holdout3/h3c",
