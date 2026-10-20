@@ -1,6 +1,7 @@
 """Overall-error scoreboard (2026-10-08 methods audit; author: "the target is best overall error ... any big error is a
 problem"). Per run, on resolved points (truth or prediction >= 1e-2 cm^-3, as analyze_e13) with a mixing-ratio floor
-(truth or prediction >= 1e-12) so that near-threshold trace noise does not dominate the tails:
+(lib/scorerule.py: the per-gas floors, SCORE_RULE=phys, the default since 2026-10-19; flat12 = the old 1e-12 floor) so
+that near-threshold trace noise does not dominate the tails:
   G dt500 per T band: pooled late-max p90, worst species (late-max p90) and its name, late-max p99, max, rows with any
     species > 0.5 dex at a late checkpoint; low-P cell (P < 1e-3 bar) pooled p90; first checkpoint (500 s) max and rows
     > 0.5 dex (excluded from the late window); C/O and N/O |dlog10| p99 at 1000 days (12 tracked species); max sum12.
