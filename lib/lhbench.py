@@ -127,11 +127,16 @@ def vref_index(tag):
     t >= runtime; with trun_min = runtime the convergence stop cannot fire earlier). tag may be an absolute
     directory (VREF / absolute path is that path)."""
     jobs = json.loads((VREF / tag / "jobs.json").read_text())
-    out = {}
+    out, drop = {}, []
     for i, j in enumerate(jobs):
         f = VREF / tag / f"{i}.npz"
         if f.exists() and float(np.load(f)["t"][-1]) >= float(j["cfg"]["runtime"]) * (1 - 1e-9):
             out[i] = j
+        else:
+            drop.append(i)
+    if drop:   # 2026-10-19: said, not dropped silently (which jobs are used is unchanged)
+        print(f"vref_index {tag}: {len(drop)} of {len(jobs)} jobs missing or short of their runtime, not used; first ids "
+              f"{drop[:10]}", file=sys.stderr, flush=True)
     return out
 
 
