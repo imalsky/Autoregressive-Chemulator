@@ -42,8 +42,8 @@ def bench(f):
 
 
 def lmax(e, q):
-    v = [np.nanpercentile(e[:, c], q) for c in range(e.shape[1]) if np.isfinite(e[:, c]).any()]
-    return float(max(v)) if v else float("nan")
+    v = [np.nanpercentile(e[:, c], q) for c in range(e.shape[1]) if (~np.isnan(e[:, c])).any()]
+    return float(np.max(v)) if v else float("nan")   # inf / NaN when a column holds a failed (non-finite) prediction
 
 
 def cells(B, m):
@@ -51,13 +51,14 @@ def cells(B, m):
     per = {s: lmax(e[:, :, j:j + 1], 90) for j, s in enumerate(SP)}
     w = max(per, key=lambda s: np.nan_to_num(per[s], nan=-1))
     out = {"p90": lmax(e, 90), "worst_sp_p90": per[w], "worst_sp": w, "p99": lmax(e, 99),
-           "max": float(np.nanmax(e)) if np.isfinite(e).any() else float("nan"),
-           "rows_gt0.5": int((np.nan_to_num(e, nan=0.0).max(axis=(1, 2)) > 0.5).sum()), "rows": int(m.sum())}
+           "max": float(np.nanmax(e)) if (~np.isnan(e)).any() else float("nan"),
+           "rows_gt0.5": int((np.nan_to_num(e, nan=0.0).max(axis=(1, 2)) > 0.5).sum()), "rows": int(m.sum()),
+           "nonfinite_rows": int((np.isinf(e).any(axis=(1, 2)) | np.isinf(B["e1"][m]).any(axis=(1, 2))).sum())}
     lp = m & (B["P"] < 1e-3)
     out["lowP_p90"] = lmax(B["e"][lp], 90) if lp.any() else float("nan")
     e1 = B["e1"][m]
     if e1.size:
-        out["call1_max"] = float(np.nanmax(e1)) if np.isfinite(e1).any() else float("nan")
+        out["call1_max"] = float(np.nanmax(e1)) if (~np.isnan(e1)).any() else float("nan")
         out["call1_rows_gt0.5"] = int((np.nan_to_num(e1, nan=0.0).max(axis=(1, 2)) > 0.5).sum())
     return out
 
@@ -115,11 +116,12 @@ def path_board(run, pat):
         if not m.any():
             continue
         el = e[late][:, m]
-        q = el[np.isfinite(el)]
+        q = el[~np.isnan(el)]   # inf (a failed, non-finite prediction) stays in
         out[b] = {"pool_p90": float(np.percentile(q, 90)) if q.size else float("nan"),
                   "p99": float(np.percentile(q, 99)) if q.size else float("nan"),
                   "max": float(q.max()) if q.size else float("nan"),
-                  "paths_gt0.5": int((np.nan_to_num(e[:, m], nan=0.0).max(axis=(0, 2)) > 0.5).sum()), "paths": int(m.sum())}
+                  "paths_gt0.5": int((np.nan_to_num(e[:, m], nan=0.0).max(axis=(0, 2)) > 0.5).sum()), "paths": int(m.sum()),
+                  "nonfinite_paths": int(np.isinf(e[:, m]).any(axis=(0, 2)).sum())}
     return out
 
 
@@ -135,15 +137,18 @@ def main(tag, runs):
             c = g[b]
             print(f"  G {b:9s} p90 {c['p90']:.3f} | worst sp {c['worst_sp']} {c['worst_sp_p90']:.2f} | p99 {c['p99']:.3f} | max {c['max']:.2f}"
                   f" | rows>0.5 {c['rows_gt0.5']}/{c['rows']} | lowP p90 {c['lowP_p90']:.3f} | call1 max {c.get('call1_max', float('nan')):.2f},"
-                  f" rows>0.5 {c.get('call1_rows_gt0.5', -1)}")
+                  f" rows>0.5 {c.get('call1_rows_gt0.5', -1)}"
+                  + (f" | NON-FINITE predictions in {c['nonfinite_rows']} rows" if c["nonfinite_rows"] else ""))
         for b, c in (cold or {}).items():
             print(f"  G+Gc {b:9s} p90 {c['p90']:.3f} | worst sp {c['worst_sp']} {c['worst_sp_p90']:.2f} | p99 {c['p99']:.3f} | max {c['max']:.2f}"
-                  f" | rows>0.5 {c['rows_gt0.5']}/{c['rows']}")
+                  f" | rows>0.5 {c['rows_gt0.5']}/{c['rows']}"
+                  + (f" | NON-FINITE predictions in {c['nonfinite_rows']} rows" if c["nonfinite_rows"] else ""))
         print(f"  composition C/O p99 {g['composition']['CO_p99']:.3f}, N/O p99 {g['composition']['NO_p99']:.3f}, sum12 max "
               f"{g['composition']['sum12_max']:.3f} | worst point {g['worst']}")
         for s in ("v2s", "v2l"):
             for b, c in (res[run][s] or {}).items():
-                print(f"  {s} {b:9s} pool p90 {c['pool_p90']:.3f} | p99 {c['p99']:.3f} | max {c['max']:.2f} | paths>0.5 {c['paths_gt0.5']}/{c['paths']}")
+                print(f"  {s} {b:9s} pool p90 {c['pool_p90']:.3f} | p99 {c['p99']:.3f} | max {c['max']:.2f} | paths>0.5 {c['paths_gt0.5']}/{c['paths']}"
+                      + (f" | NON-FINITE predictions in {c['nonfinite_paths']} paths" if c["nonfinite_paths"] else ""))
         (OUT / f"scoreboard_{tag}.json").write_text(json.dumps(res, indent=1))
 
 
