@@ -908,9 +908,9 @@ def run_stage(stage, cfg, model, train, vy, vdt, vg, mu, sd, run, log, pr=None):
         sys.exit(f"stage {stage}: non-finite weights at the end; stage file not written")
     for d, e in zip(cfg["ema_extra"], extras):   # before stage<N>.pt, whose existence the queues read as "done"
         if finite(model, e.shadow):
-            torch.save({"state_dict": e.shadow.state_dict(), "cfg": cfg, "stage": stage, "ema": d}, run / f"stage{stage}_ema{d}.pt")
-    torch.save({"state_dict": ema.shadow.state_dict(), "cfg": cfg, "stage": stage,
-                "seconds": time.time() - t0}, run / f"stage{stage}.pt")
+            save_atomic({"state_dict": e.shadow.state_dict(), "cfg": cfg, "stage": stage, "ema": d}, run / f"stage{stage}_ema{d}.pt")
+    save_atomic({"state_dict": ema.shadow.state_dict(), "cfg": cfg, "stage": stage,   # 2026-10-19: atomic, as the checkpoints
+                 "seconds": time.time() - t0}, run / f"stage{stage}.pt")
     if ck.exists():
         ck.unlink()   # the stage file supersedes the checkpoint
     model.load_state_dict(ema.shadow.state_dict())  # stage 2 starts from the EMA weights (production)
