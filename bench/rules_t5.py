@@ -23,7 +23,7 @@ import numpy as np
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-import score_mask as M  # noqa: E402  (rows(), paths(), path_cells(); per-gas rule; row caches: SCORE_MASK_CACHE)
+import score_mask as M  # noqa: E402  (rows(), path_scores(), path_cells(); per-gas rule; row caches: SCORE_MASK_CACHE)
 import paths  # noqa: E402
 from select_jobs import env_margin  # noqa: E402
 import score_t2 as ST  # noqa: E402  (rules(): the T2 protocol's five rules)
@@ -112,7 +112,7 @@ pth = {}
 for pre in M.PSETS:
     pth[pre] = {}
     for lab in (X, R):
-        e, calls, _, _ = M.paths(lab, pre)
+        e, calls, _, _ = M.path_scores(lab, pre)
         c = M.path_cells(e, calls, np.ones(e.shape[:2], bool), M.PSETS[pre])
         pth[pre][lab] = {"late_p99": c["late_p99"], "max_all": c["max_all"]}
     L.append(f"path {pre:3s}: late p99 X {pth[pre][X]['late_p99']:.3f} R {pth[pre][R]['late_p99']:.3f} | max X "

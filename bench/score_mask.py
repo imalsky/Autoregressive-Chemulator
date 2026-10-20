@@ -94,7 +94,7 @@ def rows(label):
     return r
 
 
-def paths(label, pre):
+def path_scores(label, pre):
     """Per-gas error [C, paths, 12] (NaN = not scored), per-call T [paths, C] and P in bar, as scoreboard.path_board."""
     d = np.load(E / f"{pre}_{label}" / "P_paths.npz")
     st, calls = S.cut12(d["states"][:, 2]), d["calls"]
@@ -145,7 +145,7 @@ def table(label, inside, path_sets=tuple(PSETS)):
                      for k in HSETS},
          "paths": {}}
     for pre in path_sets:
-        e, calls, T, P = paths(label, pre)
+        e, calls, T, P = path_scores(label, pre)
         cin = inside(T, P).T                                               # [C, paths]
         last = np.nan_to_num(e[-1], nan=0.0, posinf=np.inf).max(-1)                       # [paths]
         t["paths"][pre] = {"in": path_cells(e, calls, cin, PSETS[pre]), "out": path_cells(e, calls, np.logical_not(cin), PSETS[pre]),
