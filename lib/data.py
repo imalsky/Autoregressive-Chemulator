@@ -6,9 +6,11 @@ set on one stored log-time grid t_grid.npy, end = last valid row, P, T, file_idx
 ranges and the dt range; z = (log10 y - mu) / sd.
 Samplers (RawSplit.sample, sample_grid, sample_jump_pairs) draw on a torch.Generator in a fixed order; one-step windows:
 dt log-uniform in DT_LOG, the start anchored at the first positive stored time with probability ANCHOR_P or log-uniform
-in [t_lo, t_end - FIT_STEPS dt]; candidates that do not fit are dropped by a stable sort (no host sync). Values between
-stored rows are the log-log interpolant (log10 y linear in log10 t), computed in fp64; for a complete entry set (He
-included) the interpolated labels are projected back onto each trajectory's element ratios and sum 1 (elemproj.project_ln).
+in [t_lo, t_end - FIT_STEPS dt]; optional row-0 starts (t = 0) of one-step windows and jump pairs, each row with its own
+probability (RawSplit.p0_anchor, p0_jump; one extra draw per candidate, made only when set); candidates that do not fit
+are dropped by a stable sort (no host sync). Values between stored rows are the log-log interpolant (log10 y linear in
+log10 t), computed in fp64; for a complete entry set (He included) the interpolated labels are projected back onto each
+trajectory's element ratios and sum 1 (elemproj.project_ln).
 """
 import json
 import math
@@ -29,8 +31,6 @@ CLOSED = "He" in SHORT  # a complete entry set (He included): labels are project
 FIT_STEPS = 99          # every window must fit 99 transitions before the trajectory's end
 ANCHOR_P = 0.25         # share of one-step windows anchored at the first positive stored time (train.py anchor_p)
 DT_LOG = (-1.0, 3.0)    # window dt, log10 s; train.py sets it from dt_min_s / dt_max_s
-X0_ANCHOR_P = 0.0       # share of the windows of rows flagged in RawSplit.x0 that start at row 0 (t = 0)
-X0_JUMP_P = 0.0         # share of the jump pairs of flagged rows that start at row 0
 EPS = float(NORM["epsilon"])
 
 
@@ -97,7 +97,8 @@ class RawSplit:
             self.lr = EP.log_ratios(self.logy[:, 0] * math.log(10.0), self.na, self.nh)   # [N, 4], from the start row
 
     w = None   # per-trajectory draw weights [n] (train.py traj_weights_file); None = uniform
-    x0 = None  # bool [n]: rows whose row 0 (the start, t = 0) can be a training input (train.py x0_file)
+    p0_anchor = None  # fp32 [n]: each row's probability that a one-step window starts at row 0 (t = 0); None = never
+    p0_jump = None    # fp32 [n]: the same for jump pairs (train.py x0_anchor / x0_jump, or x0_file with x0_*_p)
 
     def draw(self, m, gen):
         """m trajectory indices: uniform (the original randint draw) unless self.w is set."""
@@ -170,8 +171,8 @@ class RawSplit:
         anchor = torch.rand(m, device=dev, generator=gen) < ANCHOR_P
         ts = torch.where(anchor, t_lo.expand(m), ts)
         a0 = None
-        if X0_ANCHOR_P > 0 and self.x0 is not None:  # windows from row 0 (t = 0); drawn after the default draws
-            a0 = self.x0[idx] & (torch.rand(m, device=dev, generator=gen) < X0_ANCHOR_P)
+        if self.p0_anchor is not None:  # windows from row 0 (t = 0) at each row's probability; drawn after the default draws
+            a0 = torch.rand(m, device=dev, generator=gen) < self.p0_anchor[idx]
             ok = torch.where(a0, self.t[self.end[idx]] - max(FIT_STEPS, K) * dt > 0, ok)
             ts = torch.where(a0, torch.zeros_like(ts), ts)
         torch._assert_async(ok.sum() >= B, "sample: fewer than B windows fit")   # on the device, no host sync
@@ -206,8 +207,8 @@ def sample_jump_pairs(split, B, gen, d_min, d_max):
     lo, hi = torch.log10(t_lo), torch.log10(torch.clamp(t_hi, min=t_lo * (1 + 1e-12)))
     t0 = torch.pow(10.0, lo + u * (hi - lo))
     a0 = None
-    if X0_JUMP_P > 0 and split.x0 is not None:  # pairs from row 0 (t = 0); drawn after the default draws
-        a0 = split.x0[idx] & (torch.rand(m, device=dev, generator=gen) < X0_JUMP_P)
+    if split.p0_jump is not None:  # pairs from row 0 (t = 0) at each row's probability; drawn after the default draws
+        a0 = torch.rand(m, device=dev, generator=gen) < split.p0_jump[idx]
         ok = torch.where(a0, t_hi >= 0, ok)
         t0 = torch.where(a0, torch.zeros_like(t0), t0)
     torch._assert_async(ok.sum() >= B, "sample_jump_pairs: fewer than B pairs fit")   # on the device, no host sync
