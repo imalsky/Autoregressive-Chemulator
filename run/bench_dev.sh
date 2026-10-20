@@ -1,7 +1,7 @@
 #!/bin/bash
 # Development benches of one model (scale phase q/bench6.sh, plus the T2 and SD sets of the candidate drivers p/cbg.sh and
 # p/cbgp.sh, same flags). Every set runs this repository's lib/lhbench.py with the P* inference policy (--modes P3
-# --closed-iters 32 --closed-fallback lm --lm-adaptive), ARCH_CACHE and HARNESS_NORM = arch_gcm17m_res; path sets with
+# --closed-iters 32 --closed-fallback lm --lm-adaptive), HARNESS_NORM = arch_gcm17m_res/norm.json; path sets with
 # LHB_BLOCK 50, the combined and T2 / SD arm-H benches with LHB_BLOCK ${BLK_H:-10} (memory). Never change the rows per call
 # of a bench: results differ by up to 7e-4 dex across batch shapes. A bench whose meta.json exists is skipped.
 #   PD PX P2l P2s PH   path sets: DEV (paths_v3/dev), xlong (paths_v2x), v2l, v2s, the opened path holdout (paths_v3/hold)
@@ -27,7 +27,7 @@ mkdir -p $LOGS
 lb() {  # lb <block> <out> <args...>
   local blk=$1 out=$2; shift 2
   [ -e $out/meta.json ] && return 0
-  LHB_BLOCK=$blk ARCH_CACHE=$CHEM_SCRATCH/arch_gcm17m_res HARNESS_NORM=$NORM taskset -c $A $PY $H/lib/lhbench.py $M $out SP \
+  LHB_BLOCK=$blk HARNESS_NORM=$NORM taskset -c $A $PY $H/lib/lhbench.py $M $out SP \
     --ckpt stage2.pt --modes P3 --closed-iters 32 --closed-fallback lm --lm-adaptive "$@" > $LOGS/$(basename $out).log 2>&1 \
     || { echo "$(date '+%F %T') FAILED $(basename $out)"; return 1; }
   echo "$(date '+%F %T') done $(basename $out): $(grep -h 'projection failures' $LOGS/$(basename $out).log | tail -1)"

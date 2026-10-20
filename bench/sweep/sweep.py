@@ -2,7 +2,7 @@
 row = (dt, start age, tag job) keeps its own fixed dt for N calls; all rows are batched in one rollout. Arm H machinery of
 lhbench.py in --lib (default: this repository's lib/; <run>/harness/lib = a run's frozen copy; imported read-only): start
 state = the VULCAN tag's own log10 y at the start age (lhbench.vref_logy), g = data.norm_globals(job P, T), truth = the same tag. The per-row dt is
-passed to lhbench.run_arm as a dtsched callable (as make_dtsched 'const', but per row), so the npz holds tcum (elapsed time
+passed to lhbench.run_arm as a dtsched callable (a constant dt per row), so the npz holds tcum (elapsed time
 per row at each recorded call). Inference policy = the P* bench flags, set exactly as lhbench.main sets its globals for
   --modes P3 --closed-iters 32 --closed-fallback lm --lm-adaptive   (no --startup-substeps, no --substeps, no --renorm)
 with LHB_BLOCK=50, ARCH_CACHE=/scratch/imalsky/arch_gcm17m_res, HARNESS_NORM=<that cache>/norm.json, TF32 off.
@@ -58,8 +58,9 @@ out = Path(a.out)
 if not a.timing:
     assert not (out / "sweep.npz").exists(), f"refusing to overwrite {out}"
 
-# lhbench.main's globals for --modes P3 --lm-adaptive (no substeps, no startup substeps, no post step)
-LB.NM, LB.P4, LB.SUBSTEPS, LB.ADAPTIVE, LB.STARTUP, LB.POST = 1, False, 1, True, None, None
+# lhbench.main's globals for --lm-adaptive without startup substeps. NM = 1 (P3) matters only for an older frozen copy given
+# with --lib, whose lhbench still has the P1 / P2 modes (its other mode globals default to off)
+LB.NM, LB.ADAPTIVE, LB.STARTUP = 1, True, None
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 torch.set_float32_matmul_precision("highest")
@@ -97,7 +98,7 @@ dtr = torch.as_tensor(np.array([r[0] for r in rows]), dtype=torch.float64, devic
 dtn = D.dt_norm_of(dtr).float()                                      # as run_H: dt_norm_of(fp64 dt).float(), clamped
 
 
-def sched(e):                                                        # per-row constant dt (make_dtsched 'const' per row)
+def sched(e):                                                        # per-row constant dt
     e.dtn3.copy_(dtn)
     e.t += dtr
 

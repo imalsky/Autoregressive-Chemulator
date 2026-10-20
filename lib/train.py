@@ -373,7 +373,6 @@ def readout_setup(p_dir, dev):
     number density of the scored mask, computed once. Window: calls >= 3000 (the 58-day set's late window; calls >= 50
     for sets of at most 3000 calls)."""
     import lhbench as L
-    L.NM = 1                                                       # P3 only (the bench's --modes P3)
     rep = [s.replace("_evolution", "") for s in json.loads(paths.NORM12.read_text())["species_variables"]]
     Ps = [np.load(f) for f in sorted(Path(p_dir).glob("[0-9]*.npz"), key=lambda f: int(f.stem))]
     n = min(len(p["T"]) for p in Ps)

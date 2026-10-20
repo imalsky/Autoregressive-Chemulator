@@ -3,8 +3,9 @@ the call being the GCM's step: fp64 normalized state z -> model.delta(z fp32, dt
 GPU: CUDA graph of the whole step, TF32 off, 200 timed replays after warm-up. CPU: eager, 1 and 8 threads. Inputs are
 random in the normalized ranges (cost does not depend on values). Writes paths.OUT/speed_<run>.json.
     python speed.py <run> [<closed heads' Newton iterations>]
-<run>: a run name under paths.RUNS, a run folder or an lhbench spec (ensmed:...; SPEED_NAME then names the output); the
-state width is the normalization file's entry count (lhbench: M.S).
+<run>: a run name under paths.RUNS or a run folder (SPEED_NAME names the output instead of the folder); the state width is
+the normalization file's entry count (lhbench: M.S). SPEED_FALLBACK=lm times the closed head with the LM rescue on every
+row; SPEED_GPU_ONLY=1 skips the CPU timings.
 """
 import json
 import os
@@ -19,7 +20,7 @@ import paths  # noqa: E402
 import lhbench as LB  # noqa: E402
 
 SPEC = sys.argv[1] if "/" in sys.argv[1] else str(paths.RUNS / sys.argv[1])
-RUN = os.environ.get("SPEED_NAME") or Path(SPEC).name   # 2026-10-11: SPEED_NAME names ensmed specs
+RUN = os.environ.get("SPEED_NAME") or Path(SPEC).name
 NEWTON = int(sys.argv[2]) if len(sys.argv) > 2 else None
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
