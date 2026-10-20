@@ -27,8 +27,8 @@ for d, *_ in cols[1:]:
 flag = np.zeros(d0["job"].size, bool)
 for _, lm, fm, _ in cols:
     flag |= (lm > 2) | (np.maximum(lm, fm) > 5)
-SP = list(S.SP) if hasattr(S, "SP") else None
+SP = list(S.SP)
 print(f"{k}: rows flagged (late > 2 or any > 5) in any of {labels}: {int(flag.sum())}; columns late / first (worst species)")
 for i in np.flatnonzero(flag):
-    s = "  ".join(f"{lm[i]:5.2f} / {fm[i]:5.2f} ({SP[w[i]] if SP else w[i]})" for _, lm, fm, w in cols)
+    s = "  ".join(f"{lm[i]:5.2f} / {fm[i]:5.2f} ({SP[w[i]]})" for _, lm, fm, w in cols)
     print(f"  job {int(d0['job'][i]):>10d} t0 {d0['t0'][i]:7.0e} {d0['T'][i]:5.0f} K {d0['P'][i] / 1e6:8.2e} bar   {s}")

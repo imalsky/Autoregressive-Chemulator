@@ -140,7 +140,6 @@ def main():
                             a_, b_ = C[lab][(t0, sn, dt)][metric], C[ref][(t0, sn, dt)][metric]
                             rr.append("-" if a_ == 0 and b_ == 0 else ("inf" if b_ == 0 else f"{a_ / b_:.2f}"))
                         L.append(f"   {lab + '/' + ref:18s} " + " ".join(f"{x:>7s}" for x in rr))
-    # headline: equal-weight counts, raw + evolved
     L.append("")
     L.append("== headline (scope, inside, cooler): equal-weight mean over dt of rows > 0.5; raw + evolved summed; worst dt")
     head = {}
@@ -154,7 +153,6 @@ def main():
             L.append(f"   {sn:7s} {metric:7s} " + " | ".join(f"{lab} {head[(lab, sn, metric)][0]:.1f} (worst dt "
                                                              f"{head[(lab, sn, metric)][1]:g}: {max(head[(lab, sn, metric)][2])})"
                                                              for lab in labs))
-    # fig4 cases per dt (raw start): worst-gas lasting / late per case, then the matched elapsed times
     f4 = np.flatnonzero((d0["tagi"] == 1) & (d0["t0"] == 1e-3))
     names = ["1000K 1mbar", "1500K 1mbar", "2000K 1mbar", "1000K 10bar", "1500K 10bar", "2000K 10bar"]
     if f4.size:
@@ -168,7 +166,6 @@ def main():
                 idx = sorted([i for i in f4 if d0["dtrow"][i] == dt], key=lambda i: int(d0["job"][i]))
                 L.append("   " + f"{dt:>5g} " + " ".join(f"{R[lab]['lasting'][i]:6.2f}/{R[lab]['late'][i]:<6.2f}" for i in idx)
                          + " || " + " ".join(f"{R[lab]['at1000'][i]:6.2f}/{R[lab]['at10000'][i]:<6.2f}" for i in idx))
-    # headline per dt for the coordinator's question: equal weight, raw + evolved, matched times
     txt = "\n".join(L)
     Path(str(stem) + ".txt").write_text(txt + "\n")
     js = {lab: {f"{t0:g}|{sn}|{dt:g}": c for (t0, sn, dt), c in C[lab].items()} for lab in labs}

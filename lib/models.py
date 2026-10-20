@@ -36,7 +36,6 @@ def mu_sd(zlo, zhi):
 
 
 def _init_linear_xavier(linear, *, scale=1.0):
-    """Variance-preserving init; optionally scales weights."""
     nn.init.xavier_uniform_(linear.weight)
     if linear.bias is not None:
         nn.init.zeros_(linear.bias)
@@ -77,7 +76,6 @@ class ResidualMLP(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        # Xavier init throughout + conservative scaling on the residual branch.
         n_layers = max(1, len(self.linears))
         residual_scale = 1.0 / math.sqrt(float(n_layers))
 

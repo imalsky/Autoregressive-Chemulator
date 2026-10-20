@@ -71,13 +71,11 @@ assert np.array_equal(s3[:n2], s2), "strata of the U2 prefix differ"
 assert np.all(fidx3[n2:] >= len(f2)), "new rows not after the old ones"
 usable = np.ones(s3.size, bool)
 usable[:n2] = w2 > 0
-drift = np.full(s3.size, np.nan)
 for k in range(len(f2), len(f3)):
     idx = np.flatnonzero(fidx3 == k)
     nm = name3[idx]
     with h5py.File(raw / f3[k], "r") as h:
         dr = np.array([float(h[str(q)].attrs["elem_drift"]) for q in nm])
-    drift[idx] = dr
     usable[idx] = dr <= 1e-2
     print(f"{f3[k]}: {idx.size} train rows, elem_drift > 1e-2: {int((dr > 1e-2).sum())} (max {dr.max():.3g})")
 kick = fidx3 == f3.index("run_gcm_z22k-result.h5")

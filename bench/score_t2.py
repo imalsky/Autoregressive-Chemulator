@@ -1,4 +1,4 @@
-"""T2 snap-back scorer (rules fixed in protocol.txt before any model result). Reads the model's arm-H bench on the T2 tag (lhbench
+"""T2 snap-back scorer. Reads the model's arm-H bench on the T2 tag (lhbench
 --arms H --h-tag <t2/tag> --h-starts 1e-3 --h-dt 500, e.g. E13_gcm/H_t2tag_<label>/H_tag_dt500.npz), the tag's boxes and
 the source jobs' original truths. Per-gas rule (SCORE_RULE=phys, HARNESS_NORM unset), 12 reported species, NaN (no
 scored point) counts as 0. Box clock = elapsed time since the restart (the model starts at 1e-3 s).
@@ -96,7 +96,6 @@ def main():
             orig[key] = (t, x[:, [sp.index(s) for s in SP]])
         to, xo = orig[key]
         lo = np.log10(np.maximum(np.stack([np.interp(b["t_r"] + tc, to, xo[:, k]) for k in range(12)], -1), 1e-30))
-        # VULCAN fine grid: the kicked box's own steps in [1e-3, 1e-3 + 8.64e7]
         tk = np.load(Path(tag) / f"{ti}.npz")["t"]
         tf = np.concatenate([[T0], tk[(tk > T0) & (tk <= T0 + 8.64e7)]])
         vk_f = SB.vtruth(tag, ti, tf)
@@ -123,7 +122,7 @@ def main():
                      "s0_end": float(s0q[-1]), "s0_end12": float(s0[-1].max()), "sO_end12": float(sO[-1].max()),
                      "hV": hV, "hVg": hVg, "hM": hM,
                      "Ek_first": float(Ek[i500]), "Ek_late": float(Ek[late].max()), "Ek_end": float(Ek[-1]),
-                     "Ek_late_sp": SP[int(np.unravel_index(np.argmax(err(st[r], vt[r], lnd)[late]), (late.sum(), 12))[1])],
+                     "Ek_late_sp": SP[int(np.unravel_index(np.argmax(Eks[late]), (late.sum(), 12))[1])],
                      "E0_late": float(E0[late].max()), "X0_rowmax": float(Ek[late].max() - E0[late].max()),
                      "X0": float(xs[late].max()), "Xc": float(xs[i500:].max()),
                      "growth": float(Ek[late].max() - Ek[i500]), "A_max": float(Amp[late].max()), "A_end": float(Amp[-1])})
