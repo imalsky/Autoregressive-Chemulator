@@ -81,3 +81,6 @@ CLAUDE.md
 CLAUDE.local.md
 todo.md
 .claude/
+
+# Built C extension of the CPU projection
+lib/_build/
