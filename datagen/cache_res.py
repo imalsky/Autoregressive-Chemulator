@@ -3,7 +3,9 @@ P, T, seed). Entries: the 12 reported species (production order), He, the 7 spec
 added first on eq/mix states (C, N, CH3, H2CN, C2H6, CN, O2), and 5 reservoirs over the remaining 33 species: C_res,
 N_res, O_res, H_res (atoms of each element) and M_res (molecule count). log10 max(value, 1e-30). Element ratios to H
 and sum 1 over molecules (tracked + M_res) equal those of the full 53-species state. The normalization is the
-12-species file with the species entries replaced by training-split statistics (log_std floored at 0.5).
+12-species file with the species entries replaced by training-split statistics (log_std floored at 0.5), and its
+units/species text replaced by a statement that holds for this entry set (He is an entry; the He/H range of the training
+split's row 0).
 
     python cache_res.py <53-species cache dir> <out dir>
 """
@@ -53,12 +55,19 @@ for split in ("train", "validation", "test"):
         m = np.arange(d["logy"].shape[1])[None, :] <= d["end"][:, None]
         pts = d["logy"][m]
         stats = (pts.mean(0), np.maximum(pts.std(0), 0.5), pts.shape[0])
+        he_h = (y[:, 0] @ a[:, 3]) / (y[:, 0] @ h)                               # He/H per training row (row 0)
 shutil.copy(src / "t_grid.npy", out / "t_grid.npy")
 meta.update({"species": names, "derived_from": str(src), "note": "cache_res.py: reservoir set"})
 (out / "meta.json").write_text(json.dumps(meta, indent=1))
 norm["species_variables"] = [s + "_evolution" for s in names]
 for k, s in enumerate(norm["species_variables"]):
     norm["per_key_stats"][s] = {**norm["per_key_stats"].get(s, {}), "log_mean": float(stats[0][k]), "log_std": float(stats[1][k])}
+norm["units"]["species"] = (
+    "mixing ratio relative to the whole gas: y_i = n_i / n_total over all species of the generator run, He and untracked "
+    "species included; entries: the tracked species (He among them) and the reservoirs C_res, N_res, O_res, H_res (atoms "
+    "of each element in the untracked species) and M_res (their molecule count), so the element ratios to H and the sum "
+    "over molecules (tracked + M_res) equal those of the full state; He/H is set per run by its composition (training "
+    f"split, row 0: {he_h.min():.4g} to {he_h.max():.4g}); model outputs use the same denominator")
 norm["e13_note"] = f"species stats from {out} raw_train.npz ({stats[2]} grid points); other entries from {SNAP}"
 (out / "norm.json").write_text(json.dumps(norm, indent=1))
 print(f"wrote {out}/norm.json: log_std range {stats[1].min():.3g}-{stats[1].max():.3g}")

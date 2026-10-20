@@ -1,7 +1,8 @@
 """Training cache from the generator's packed raw files (blocks 0 to K-1), through rawtraj._work unchanged
 (RAWTRAJ_FLOOR=1: floored, no drop_below rejection; the 12-species code's split by file and group name; the 12 tracked
-species). GCM_KINDS (comma list of eq, mix, pert, broad, kick, raw; default eq, mix, pert, broad) keeps only groups of
-those start types (the group's 'start' attr, which every packed group carries). Groups that hit VULCAN's step cap
+species). GCM_KINDS (comma list of start types; default eq, mix, pert, broad) keeps only groups of those start types (the
+group's 'start' attr, which every packed group carries): eq, mix, pert, broad, kick, raw in the gcm.py packs; eqt, eqn,
+eqf, mix, pert, rawA, rawB in the clean.py packs (raw_clean). Groups that hit VULCAN's step cap
 (end_case 3: truncated, then held constant) are left out. GCM_SPECIES=all caches every network species (the packs'
 'species' attr, the generator's order, He included) instead of the 12. Each block file is cut into n_per chunks. Reads the
 packed files only (no generator import). merge lists the files (meta.json 'files', the rows' file_idx) in the order
