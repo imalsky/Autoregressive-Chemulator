@@ -147,7 +147,10 @@ class RawSplit:
         chains that end at the trajectory's last row (0: none; draws nothing extra)."""
         dev = self.device
         last = self.t.numel() - 1
-        r_lo = int(torch.searchsorted(self.t, torch.tensor([t_min], dtype=self.t.dtype, device=dev)).item())
+        rlo = self.__dict__.setdefault("_r_lo", {})   # 2026-10-19: first stored row at t >= t_min, found once per t_min
+        if t_min not in rlo:                           # (the .item() was a host sync on every call)
+            rlo[t_min] = int(torch.searchsorted(self.t, torch.tensor([t_min], dtype=self.t.dtype, device=dev)).item())
+        r_lo = rlo[t_min]
         assert r_lo + stride * K <= last, (r_lo, stride, K)
         idx = self.draw(B, gen)
         top = torch.clamp(torch.clamp(self.end[idx], max=last) - stride * K, min=r_lo)
@@ -182,6 +185,7 @@ class RawSplit:
             a0 = self.x0[idx] & (torch.rand(m, device=dev, generator=gen) < X0_ANCHOR_P)
             ok = torch.where(a0, self.t[self.end[idx]] - max(FIT_STEPS, K) * dt > 0, ok)
             ts = torch.where(a0, torch.zeros_like(ts), ts)
+        torch._assert_async(ok.sum() >= B, "sample: fewer than B windows fit")   # 2026-10-19: on the device, no host sync
         order = torch.sort(torch.logical_not(ok).to(torch.int8), stable=True).indices[:B]
         idx, ts, dt = idx[order], ts[order], dt[order]
         if a0 is not None:
@@ -228,6 +232,7 @@ def sample_jump_pairs(split, B, gen, d_min, d_max, with_idx=False):
         a0 = split.x0[idx] & (torch.rand(m, device=dev, generator=gen) < X0_JUMP_P)
         ok = torch.where(a0, t_hi >= 0, ok)
         t0 = torch.where(a0, torch.zeros_like(t0), t0)
+    torch._assert_async(ok.sum() >= B, "sample_jump_pairs: fewer than B pairs fit")   # 2026-10-19: on the device, no sync
     order = torch.sort(torch.logical_not(ok).to(torch.int8), stable=True).indices[:B]
     idx, t0, Dt = idx[order], t0[order], Dt[order]
     if a0 is None:
