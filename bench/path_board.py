@@ -3,8 +3,8 @@ lhbench arm P (2026-10-09 conservation phase: the paths_v3 DEV set, whose record
     python path_board.py <paths dir> <run> [<run> ...] [--prefix PD] [--windows 50-1000,1000-2500,2500-] [--vs <run>]
 A run's bench is E/<prefix>_<run>/P_paths.npz; the prefix defaults from the folder name (dev -> PD, paths_v2x -> PX,
 paths_v2l -> P2l, paths_v2s -> P2s). Truth: the folder's own path files (x[c] after c calls). Points as xlong_board: the 12
-reported species (from 12-species, reservoir-set or 53-species states), truth or prediction >= 1e-2 cm^-3 and truth or
-prediction >= 1e-12 mixing ratio. Per window of calls (the last one may be open-ended: to the path end): p50, p90, p99,
+reported species (from 12-species, reservoir-set or 53-species states), truth or prediction >= 1e-2 cm^-3 and the
+mixing-ratio floor of lib/scorerule.py (per-gas floors, SCORE_RULE=phys, the default since 2026-10-19). Per window of calls (the last one may be open-ended: to the path end): p50, p90, p99,
 max and paths with any point > 0.5 dex; per-path maxima over calls >= the first window's start, with the path's mean T;
 the worst point. --vs <run>: each run minus <run> on the late (last) window, paired over paths, 1000 bootstrap resamples
 of the paths (seed 0), 95% percentile intervals: (a) per-path p50 and p99, mean over paths of the differences; (b) the
