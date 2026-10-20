@@ -4,8 +4,9 @@
                                    done.json, manifest.json and norm.json)
 
 Stage 1 (s1_*): one-step windows from the cache's training trajectories (data.RawSplit.sample: dt log-uniform in
-[dt_min_s, dt_max_s], start anchored at the first stored time with probability anchor_p, optional row-0 starts of the
-x0_file rows, optional per-trajectory draw weights traj_weights_file), loss on the increment.
+[dt_min_s, dt_max_s], start anchored at the first stored time with probability anchor_p, optional row-0 starts with a
+probability per cache file (x0_anchor, x0_jump; row0_probs), optional per-trajectory draw weights traj_weights_file), loss
+on the increment.
 Stage 2 (s2_*, usually branched from a stage-1 file with init_from): four terms whose model calls run in lockstep (fewer,
 larger calls; lock_terms): the one-step windows; long-jump pairs (z(t), z(t + D)), D log-uniform in [jump_min_s,
 jump_max_s] (weight jump_w); grid chains of grid_K stored log-time intervals from t >= grid_t_min, each made of 1..grid_sub
@@ -63,9 +64,11 @@ DEFAULTS = {
     "dt_min_s": 0.1, "dt_max_s": 1e3,   # one-step window dt range (s)
     "cache": None,              # the ARCH_CACHE this run must use (asserted; None = not checked)
     "traj_weights_file": None,  # .npy of per-train-row draw weights (every sampler)
-    "x0_file": None,            # raw file name(s) (cache meta.json 'files') whose rows may start at row 0 (t = 0)
-    "x0_anchor_p": 0.0,         # with x0_file: share of those rows' windows that start at row 0 (data.X0_ANCHOR_P)
-    "x0_jump_p": 0.0,           # with x0_file: share of those rows' jump pairs that start at row 0 (data.X0_JUMP_P)
+    "x0_anchor": None,          # {cache file name (meta.json 'files'): p}: share of that file's one-step windows that start
+    "x0_jump": None,            # at row 0 (t = 0); x0_jump likewise for its jump pairs (row0_probs; other files: 0)
+    "x0_file": None,            # older form, exclusive with x0_anchor / x0_jump: raw file name(s) whose rows may start at
+    "x0_anchor_p": 0.0,         # row 0, each with probability x0_anchor_p (one-step windows) and x0_jump_p (jump pairs)
+    "x0_jump_p": 0.0,
     "ckpt_every": 0,            # every n steps save run/ckpt_stage<N>.pt (atomic); removed once stage<N>.pt is written. 0 = off
     "resume": False,            # skip a stage whose stage<N>.pt exists, continue one from its ckpt_stage<N>.pt
     "val_source": "cache",      # validation windows from the cache's validation split (data.cache_val; the only source)
@@ -274,6 +277,30 @@ def path_readout(model, pr):
     q = np.percentile(e, [50, 90, 99]) if e.size else [float("nan")] * 3
     return {"path_p50": float(q[0]), "path_p90": float(q[1]), "path_p99": float(q[2]),
             "path_max": float(e.max()) if e.size else float("nan"), "path_s": time.time() - t}
+
+
+def row0_probs(cfg, split):
+    """Per-row probabilities (fp32 [n], on the split's device) that a one-step window and a jump pair of a training row
+    start at its row 0 (t = 0): x0_anchor / x0_jump map cache file names (meta.json 'files') to p, rows of other files get
+    0; the older x0_file (one name or a list) gives every named file x0_anchor_p and x0_jump_p. A term whose rows are all
+    0 gets None: its sampler then makes no extra draw (the draws of a run without row-0 starts are unchanged)."""
+    if cfg["x0_file"] is not None:
+        xf = cfg["x0_file"] if isinstance(cfg["x0_file"], list) else [cfg["x0_file"]]
+        per = ({f: cfg["x0_anchor_p"] for f in xf}, {f: cfg["x0_jump_p"] for f in xf})
+    else:
+        per = (cfg["x0_anchor"] or {}, cfg["x0_jump"] or {})
+    if not (per[0] or per[1]):
+        return None, None
+    files = json.loads((D.CACHE / "meta.json").read_text())["files"]
+    out = []
+    for pf in per:
+        p = np.zeros(split.n, np.float32)
+        for f, v in pf.items():
+            m = split.file_idx == files.index(f)
+            assert m.any() and 0.0 <= v <= 1.0, f"x0: file {f} (training rows {int(m.sum())}), probability {v}"
+            p[m] = v
+        out.append(torch.from_numpy(p).to(split.device) if p.any() else None)
+    return out
 
 
 def _ramp(a, b, n, step):
@@ -555,17 +582,15 @@ def main(run):
     dev = torch.device(os.environ.get("HARNESS_DEVICE", "cuda"))
     D.DT_LOG = (math.log10(cfg["dt_min_s"]), math.log10(cfg["dt_max_s"]))
     D.ANCHOR_P = cfg["anchor_p"]
-    D.X0_ANCHOR_P, D.X0_JUMP_P = cfg["x0_anchor_p"], cfg["x0_jump_p"]
+    if (cfg["x0_file"] is not None or cfg["x0_anchor_p"] > 0 or cfg["x0_jump_p"] > 0) and \
+            (cfg["x0_anchor"] is not None or cfg["x0_jump"] is not None):
+        sys.exit(f"{run / 'config.json'}: x0_file / x0_anchor_p / x0_jump_p and x0_anchor / x0_jump are exclusive")
     train = D.RawSplit("train", dev)
     if cfg["traj_weights_file"] is not None:
         w = np.load(cfg["traj_weights_file"]).astype(np.float64)
         assert w.shape == (train.n,) and np.all(w >= 0) and w.sum() > 0, (w.shape, train.n)
         train.w = torch.from_numpy(w).float().to(dev)   # fp32 weights
-    if cfg["x0_file"] is not None:
-        files = json.loads((D.CACHE / "meta.json").read_text())["files"]
-        xf = cfg["x0_file"] if isinstance(cfg["x0_file"], list) else [cfg["x0_file"]]  # one name or a list
-        train.x0 = torch.from_numpy(np.isin(train.file_idx, [files.index(f) for f in xf])).to(dev)
-        assert bool(train.x0.any()), cfg["x0_file"]
+    train.p0_anchor, train.p0_jump = row0_probs(cfg, train)
     mu, sd, zlo, zhi = D.norm_consts(dev)
     model = M.build(cfg["head"], cfg["hidden"], zlo, zhi, newton=cfg["closed_iters"], fallback=cfg["closed_fallback"],
                     fused=cfg["fused_proj"]).to(dev)
