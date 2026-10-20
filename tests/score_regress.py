@@ -18,7 +18,11 @@ E = paths.E, DEV = paths.PATHS_V3/dev).
         json must be equal; keys only in the new json are listed.
   (v)   bench/judge.py e13s_CBg_s2 e13s_LD_s3 (out: the work folder) -> both verdicts byte-identical to the stored ones and
         judge_e13s_CBg_s2.txt equal to the stored _build/p/judge_cbg.txt with the run names written out (CB, LD, FINAL ->
-        their labels; "CB-VERDICT" -> "VERDICT").
+        their labels; "CB-VERDICT" -> "VERDICT"), plus the two readout lines JUDGE_V2 below each verdict line and the
+        lines JUDGE_VERDICT in place of the stored decision line. Why: the stored text was written when the judge decided
+        by helps(); the judge's DEV / G / Gc verdict is now pass rule v2 (bench/pass_v2.py: large misses are readouts,
+        the author's rule), under which CBg passes against LD, and helps() is printed as a readout. That verdict is a
+        continuity readout: adoption between models is decided by the yardstick under rule v3.1 (bench/yardstick.py).
 Every scorer imports the boards and scorerule from this repository (the module each one loaded is printed), with
 SCORE_RULE=phys, HARNESS_NORM unset and no GPU.
     taskset -c <cpus> $PY tests/score_regress.py [--work DIR] [--boards-save DIR | --boards-check DIR]
@@ -59,6 +63,22 @@ FIG4 = {("500", "CBg"): "0.02/0.03/0.02 0.08/0.53/0.12 0.00/2.11/0.00 0.07/0.88/
 FIG4_LOG = {("20", "LD", "1500K 1mbar"): "0.12/0.85/0.08", ("20", "LD", "1000K 10bar"): "0.41/1.26/0.34"}   # the run log
 # project notes, CBg on two mini-chem paper cases at dt 20 s: mini-chem at CBg's 5,000 calls of 20 s
 FIG4_MC = {("20", "CBg", "1500K 1mbar"): "0.91/3.83/0.88", ("20", "CBg", "1000K 10bar"): "0.30/0.30/0.30"}
+# judge readout lines under pass rule v2, inserted below the stored verdict line of CBg vs LD and of CBg vs FINAL
+JUDGE_V2 = {LD: ["  pass rule v2 (DEV / G / Gc verdict): PASS (late fixed 116, broken 37; cooler late > 0.5 64 vs 138); earlier rule "
+                 "helps() (readout): fail",
+                 "  large misses (readout): inside late > 2 6 vs 4, lasting > 2 4 vs 1, first > 2 0 vs 2; cooler late > 2 7 "
+                 "vs 4; new late > 2 rows 6 (invented switches 0); paths PD late p99 0.101 vs 0.105 (max 1.41 vs 1.60); PX "
+                 "late p99 1.114 vs 0.471 (max 2.17 vs 2.53); P2l late p99 0.197 vs 0.251 (max 1.37 vs 1.84); P2s late p99 "
+                 "0.059 vs 0.068 (max 0.32 vs 0.55); PH late p99 0.142 vs 0.154 (max 1.67 vs 2.18)"],
+            FIN: ["  pass rule v2 (readout): PASS (late fixed 146, broken 40; cooler late > 0.5 64 vs 166); earlier rule "
+                  "helps() (readout): fail",
+                  "  large misses (readout): inside late > 2 6 vs 4, lasting > 2 4 vs 1, first > 2 0 vs 0; cooler late > 2 7 "
+                  "vs 4; new late > 2 rows 6 (invented switches 0); paths PD late p99 0.101 vs 0.112 (max 1.41 vs 1.58); PX "
+                  "late p99 1.114 vs 0.453 (max 2.17 vs 2.37); P2l late p99 0.197 vs 0.277 (max 1.37 vs 1.78); P2s late p99 "
+                  "0.059 vs 0.077 (max 0.32 vs 0.65); PH late p99 0.142 vs 0.150 (max 1.67 vs 2.20)"]}
+JUDGE_VERDICT = ["adoption between models is decided by the yardstick under rule v3.1 (bench/yardstick.py) with the path-set "
+                 "check; the verdict below is the DEV / G / Gc continuity readout",
+                 f"VERDICT (DEV / G / Gc, pass rule v2): {CB} passes vs {LD}"]
 
 
 def run(script, args, cwd, log, env_extra=None):
@@ -190,8 +210,12 @@ def check_judge(work):
     want = (NB / "p" / "judge_cbg.txt").read_text().replace("CB-VERDICT", "VERDICT")
     for a, b in (("CB", CB), ("LD", LD), ("FINAL", FIN)):
         want = re.sub(rf"\b{a}\b", b, want)
+    lines = want.splitlines()
+    assert lines[0].startswith(f"{CB} vs {LD}: ") and lines[1].startswith(f"{CB} vs {FIN}: ") and lines[-1].startswith("VERDICT: ")
+    want = "\n".join([lines[0], *JUDGE_V2[LD], lines[1], *JUDGE_V2[FIN], *lines[2:-1], *JUDGE_VERDICT]) + "\n"
     got = (out / f"judge_{CB}.txt").read_text() if (out / f"judge_{CB}.txt").exists() else ""
-    print(f"  judge_{CB}.txt vs stored judge_cbg.txt (names written out): {'equal' if got == want else 'DIFFERS'}")
+    print(f"  judge_{CB}.txt vs stored judge_cbg.txt (names written out, pass rule v2 lines): "
+          f"{'equal' if got == want else 'DIFFERS'}")
     if got != want:
         print("    stored:", want, "    new:", got, sep="\n")
     print("  " + (got.splitlines()[-1] if got else "(no judge output)"))
