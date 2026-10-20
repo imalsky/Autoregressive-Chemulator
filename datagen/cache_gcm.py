@@ -1,10 +1,11 @@
 """Training cache from the generator's packed raw files (blocks 0 to K-1), through rawtraj._work unchanged
 (RAWTRAJ_FLOOR=1: floored, no drop_below rejection; the 12-species code's split by file and group name; the 12 tracked
-species). GCM_KINDS (comma list of eq, mix, pert, broad, kick; default eq, mix, pert, broad) keeps only groups of those
-start types (the group's 'start' attr, which every packed group carries). Groups that hit VULCAN's step cap (end_case 3:
-truncated, then held constant) are left out. GCM_SPECIES=all caches every network species (the packs' 'species' attr,
-the generator's order, He included) instead of the 12. Each block file is cut into n_per chunks. Reads the packed files
-only (no generator import).
+species). GCM_KINDS (comma list of eq, mix, pert, broad, kick, raw; default eq, mix, pert, broad) keeps only groups of
+those start types (the group's 'start' attr, which every packed group carries). Groups that hit VULCAN's step cap
+(end_case 3: truncated, then held constant) are left out. GCM_SPECIES=all caches every network species (the packs'
+'species' attr, the generator's order, He included) instead of the 12. Each block file is cut into n_per chunks. Reads the
+packed files only (no generator import). merge lists the files (meta.json 'files', the rows' file_idx) in the order
+given (GCM_FILES), so a file appended last leaves the other files' indices unchanged.
 
     RAWTRAJ_FLOOR=1 ARCH_CACHE=<dir> [GCM_KINDS=eq,mix] python cache_gcm.py chunk <K> <n_per> <i>
     RAWTRAJ_FLOOR=1 ARCH_CACHE=<dir> python cache_gcm.py merge <K> <n_per>
@@ -72,7 +73,7 @@ def chunk(K, n_per, i):
 
 def merge(K, n_per):
     res = [pickle.load(open(R.CACHE_DIR / f"part_{i}.pkl", "rb")) for i in range(K * n_per)]
-    files = sorted({r[0] for r in res})
+    files = list(dict.fromkeys(r[0] for r in res))   # the jobs' file order (GCM_FILES), not re-sorted
     t_grid = res[0][3]
     rel = max(float(np.max(np.abs(r[3] / t_grid - 1)[1:])) for r in res)
     assert rel < 1e-12, rel
