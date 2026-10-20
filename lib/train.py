@@ -1012,8 +1012,8 @@ def main(run):
         train.x0 = torch.from_numpy(np.isin(train.file_idx, [files.index(f) for f in xf])).to(dev)
         assert bool(train.x0.any()), cfg["x0_file"]
     mu, sd, zlo, zhi = D.norm_consts(dev)
-    model = M.build(cfg["head"], cfg["hidden"], zlo, zhi, cfg["latent"], cfg["dec_hidden"], newton=cfg["closed_iters"],
-                fallback=cfg["closed_fallback"], fused=cfg["fused_proj"]).to(dev)
+    model = M.build(cfg["head"], cfg["hidden"], zlo, zhi, newton=cfg["closed_iters"], fallback=cfg["closed_fallback"],
+                    fused=cfg["fused_proj"]).to(dev)
     assert cfg["val_source"] in ("shards", "cache"), cfg["val_source"]
     if len(D.SPECIES) == 12 and cfg["val_source"] == "shards":
         vy, vdt, vg = D.load_val_shards(cfg["val_windows"], cfg["s2_K"] + 1, dev)
