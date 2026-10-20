@@ -42,6 +42,7 @@ Evaluation-only extensions (all off by default; the default arms are unchanged):
                   eps); the call's input (--elemproj target) is the mixed state; meta.json records it ('mixing').
 """
 import argparse
+import hashlib
 import json
 import os
 import math
@@ -241,6 +242,13 @@ def load_model(spec, ckpt, dev, newton=None):
         sd = {k[len("model."):]: v for k, v in blob["ema_state_dict"].items() if k.startswith("model.")}
         m.m.load_state_dict(sd, strict=True)
         return m.eval(), {"head": "delta", "hidden": hidden, "source": str(run / ckpt)}
+    man = run / "manifest.json"
+    if man.exists():   # 2026-10-19 (train.write_manifest): only the normalization file the model was trained with
+        want = json.loads(man.read_text())["norm"]["sha256"]
+        got = hashlib.sha256(D.NORM_PATH.read_bytes()).hexdigest()
+        if got != want:
+            sys.exit(f"{run}: the normalization in use, {D.NORM_PATH} (sha256 {got[:16]}), is not the one this model was "
+                     f"trained with ({want[:16]}, saved as {run / 'norm.json'}); set HARNESS_NORM to that file")
     blob = torch.load(run / ckpt, map_location=dev)
     cfg = blob["cfg"]
     _, _, zlo, zhi = D.norm_consts(dev)
