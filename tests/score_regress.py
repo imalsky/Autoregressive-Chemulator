@@ -1,5 +1,5 @@
-"""The scorer (bench/score.py) on hand-made cases and on the stored yardstick inputs (CPU only, no model call; nothing
-outside the work folder is written).
+"""The scorer (bench/score.py) on hand-made cases and on the stored yardstick inputs (CPU, no model call), and with --gpu
+the model runner (bench/score_run.py) against CBg's stored outputs. Nothing outside the work folder is written.
 
 (a) Synthetic cases with hand values, through the scorer's own functions and, for the whole pipeline, through tiny
     design and states folders written into the work folder:
@@ -25,11 +25,16 @@ outside the work folder is written).
     score_v31/score.json as float64 values (formatting ignored), and CBg must print segments +0.031 [+0.023, +0.038].
     The other free-run numbers differ from score-1 on purpose (rule v3.1 weights dt values equally, score-1 weights
     bins): listed, not tested.
-    taskset -c <cpus> $PY tests/score_regress.py [--work DIR]   (about 2 min)
+(d) --gpu (an idle GPU1, CBg with its run's norm.json, LHB_BLOCK 50): score_run reproduces bit for bit, at the stored
+    batch shapes, CBg's stored yardstick parts b00, b01 (with kept-input rows) and b14 (every field but the seconds), and
+    in path mode on the PD design (one batch of the 47 dev paths) CBg's stored arm-P bench of the same paths at every
+    saved call: the 12 gases, the engine time, the per-row counters and the LM redo count.
+    taskset -c <cpus> $PY tests/score_regress.py [--work DIR] [--gpu]   (about 1 min; --gpu adds about 7-10 min)
 Exit 0 = PASS."""
 import argparse
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -47,7 +52,11 @@ import score as S  # noqa: E402
 YARD = paths.PROJECT / "experiments/2026-10-19_minichem-yardstick/_build"
 V31 = paths.PROJECT / "experiments/2026-10-20_t0-fix/_build/score_v31/score.json"
 MODELS = ("CBg", "FINAL", "LD1")
-BINS = [(1, 2), (2, 5), (5, 10), (10, 20), (20, 50), (50, 100), (100, 200), (200, 500)]
+CBG = paths.RUNS / "e13s_CBg_s2"
+YBATCH = (0, 1, 14)                                          # stored yardstick batches reproduced by (d)
+PD_DESIGN = paths.PROJECT / "experiments/2026-10-20_clean-state/_build/designs/PD"
+PD_REF = paths.E / "PD_e13s_CBg_s2"                          # CBg's arm-P bench of paths_v3/dev (P_paths.npz)
+BINS =[(1, 2), (2, 5), (5, 10), (10, 20), (20, 50), (50, 100), (100, 200), (200, 500)]
 ROWK = ("first_newton", "first_kept", "first_guard", "first_nonfin", "first_fail", "newton_n", "kept_n", "guard_n", "nonfin_n")
 
 
@@ -371,9 +380,57 @@ def v31_checks(work):
     return res
 
 
+def bitwise(a, b):
+    a, b = np.asarray(a), np.asarray(b)
+    if a.shape != b.shape or a.dtype != b.dtype:
+        return False
+    return np.array_equal(a.view(np.uint64), b.view(np.uint64)) if a.dtype == np.float64 else np.array_equal(a, b)
+
+
+def gpu_checks(work):
+    """(d): score_run on GPU1 vs CBg's stored yardstick parts and its stored arm-P bench of the PD paths."""
+    res = []
+    oy, op = work / "d_yardstick", work / "d_PD"
+    assert not oy.exists() and not op.exists(), f"{work}: (d) needs a work folder without d_yardstick and d_PD"
+    env = dict(os.environ, LHB_BLOCK="50", HARNESS_NORM=str(CBG / "norm.json"))
+    sr = str(REPO / "bench" / "score_run.py")
+    subprocess.run([sys.executable, sr, str(CBG), str(YARD / "design"), str(oy), "--groups", str(YARD / "run" / "groups.npz"),
+                    "--batches", ",".join(str(b) for b in YBATCH)], env=env, check=True)
+    for bi in YBATCH:
+        mine = np.load(oy / "parts" / f"seg_b{bi:02d}.npz")
+        ref = np.load(YARD / "run" / "CBg" / "parts" / f"seg_b{bi:02d}.npz")
+        keys = sorted(set(ref.files) - {"seconds"})
+        diff = sorted(set(ref.files) ^ set(mine.files)) + [k for k in keys if k in mine.files and not bitwise(mine[k], ref[k])]
+        check(res, f"yardstick batch b{bi:02d} bit for bit", not diff,
+              f"rows {int(ref['rows_in_batch'])}, calls {int(ref['nrun'])}, points {ref['pts'].size}, {len(keys)} fields, "
+              f"redo blocks {int(mine['nredo'])}, rows kept input {int((mine['kept_n'] > 0).sum())}"
+              f"{', differ: ' + ', '.join(diff) if diff else ''}; {float(mine['seconds']):.0f} s (stored {float(ref['seconds']):.0f} s)")
+    subprocess.run([sys.executable, sr, str(CBG), str(PD_DESIGN), str(op)], env=env, check=True)
+    st, part, ref = np.load(op / "states.npz"), np.load(op / "parts" / "b000.npz"), np.load(PD_REF / "P_paths.npz")
+    rows, sv = np.load(PD_DESIGN / "rows.npz"), np.load(PD_DESIGN / "saved.npz")
+    k, row = sv["k"].astype(np.int64), sv["row"].astype(np.int64)
+    n = int(ref["calls"].size)
+    same_rows = np.array_equal(ref["calls"], np.arange(1, n + 1)) and np.array_equal(ref["path"], rows["job"]) and int(rows["N"].max()) == n
+    want = ref["states"][k - 1, 2, row]                       # [saved, 25] at the saved calls
+    pts = part["pts"].astype(np.int64)
+    f2 = ref["first"][2]
+    got = {"logy12": (st["logy12"], want[:, :12]), "t_engine": (part["t_engine"], ref["tcum"][k[pts] - 1, row[pts]]),
+           "newton_n": (st["newton_n"], ref["projfail"][0, :, 0]), "kept_n": (st["kept_n"], ref["projfail"][0, :, 1]),
+           "guard_n": (st["guard_n"], ref["nint"][2]), "first_guard": (st["first_guard"], np.where((f2 > 0) & (f2 <= n), f2, -1)),
+           "nonfin_n": (st["nonfin_n"], np.bincount(row, weights=~np.isfinite(want).all(1), minlength=rows["N"].size).astype(np.int64)),
+           "nredo": (st["batch_nredo"][0], np.int64(ref["nredo"]))}
+    diff = [nm for nm, (a, b) in got.items() if not bitwise(a, b)]
+    check(res, "PD path mode bit for bit", same_rows and not diff,
+          f"{rows['N'].size} paths x {n} calls in one batch, {k.size} saved points; fields {', '.join(got)}"
+          f"{'' if same_rows else '; rows or calls differ'}{', differ: ' + ', '.join(diff) if diff else ''}; "
+          f"{float(part['seconds']):.0f} s (stored bench {float(ref['seconds']):.0f} s)")
+    return res
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", default=None)
+    ap.add_argument("--gpu", action="store_true", help="(d): the model runner against CBg's stored outputs (idle GPU1)")
     a = ap.parse_args()
     tmp = os.environ.get("TMPDIR")
     assert tmp and not tmp.startswith("/tmp"), "TMPDIR must be set to your own scratch (run/env.sh)"
@@ -390,6 +447,11 @@ def main():
     ok_b = all(rb)
     print(f"(b) {'PASS' if ok_b else 'FAIL'} ({sum(rb)} of {len(rb)} checks)", flush=True)
     ok = ok_a and ok_b
+    if a.gpu:
+        print("(d) the model runner against CBg's stored outputs (GPU):", flush=True)
+        rd = gpu_checks(work)
+        print(f"(d) {'PASS' if all(rd) else 'FAIL'} ({sum(rd)} of {len(rd)} checks)", flush=True)
+        ok = ok and all(rd)
     print(f"total {time.time() - t0:.0f} s")
     print(f"RESULT score_regress: {'PASS' if ok else 'FAIL'}")
     sys.exit(0 if ok else 1)
