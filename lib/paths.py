@@ -6,7 +6,7 @@ Two roots come from the environment (empty = unset), with the defaults of the ma
   CHEM_PROJECT   the project folder: experiment data, runs, truth sets, the frozen snapshot   (/home/imalsky/Chemulator_Project)
   CHEM_SCRATCH   the fast disk: training caches, development and holdout truth tags            (/scratch/imalsky)
 Other overrides: ARCH_CACHE (data.CACHE, rawtraj.CACHE_DIR; default ARCH_TESTS), HARNESS_NORM (data.NORM; default NORM12),
-GCM_RAW (cache_gcm; default RAW_GCM), HARNESS_OUT (where the boards, scorers and speed.py write; default OUT).
+GCM_RAW (cache_gcm; default RAW_GCM), HARNESS_OUT (where speed.py writes; default OUT).
 """
 import os
 from pathlib import Path
@@ -14,12 +14,13 @@ from pathlib import Path
 HARNESS = Path(__file__).resolve().parents[1]           # this repository
 LIB = HARNESS / "lib"
 RAW_GCM = HARNESS / "data/raw_gcm"                       # packed gcm.py raw files (cache_gcm default GCM_RAW; gitignored)
+RAW_CLEAN = HARNESS / "data/raw_clean"                   # packed clean-design raw files (build_clean.sh GCM_RAW; gitignored)
 
 PROJECT = Path(os.environ.get("CHEM_PROJECT") or "/home/imalsky/Chemulator_Project")
 SCRATCH = Path(os.environ.get("CHEM_SCRATCH") or "/scratch/imalsky")
 
 SWEEP = PROJECT / "experiments/2026-10-03_repo-sweep/_build"   # VULCAN references, snapshot, E13 benches and truth sets
-VREF = SWEEP / "vulcan"                                  # VULCAN reference tags: where a tag NAME given to lhbench / scoreboard resolves
+VREF = SWEEP / "vulcan"                                  # VULCAN reference tags: where a tag NAME given to lhbench resolves
 SNAPSHOT = SWEEP / "snapshot"                            # frozen Auto-Chem snapshot (orphaned commit 7d5b036), pinned dependency
 SNAP_PROCESSING = SNAPSHOT / "processing"                # preprocessing.py (rawtraj)
 NORM12 = SNAPSHOT / "data/processed/normalization.json"  # production normalization (12 species); data.NORM default
@@ -31,18 +32,17 @@ PATHS_V3 = PROJECT / "experiments/2026-10-09_e13-conservation/_build/paths_v3"  
                                                          # train_a, train_b; hold2 = PH2 is sealed (never list or read it)
 SCALE = PROJECT / "experiments/2026-10-13_e13-scale/_build"     # the current runs and decision data
 RUNS = SCALE / "runs"                                    # training runs (CBg, its stage 1 CBS1, FINAL, LD, LD1); speed.py
-OUT = Path(os.environ.get("HARNESS_OUT") or SCALE / "bench")   # board / scorer / judge / speed / 1000-day outputs
-T2 = SCALE / "t2"                                        # T2 snap-back test: jobs_sel.json, tag/, times_t2.npy, score_t2*.json
-T5_DESIGN = SCALE / "t5/design"                          # score_mask's per-row caches rows_<label>.npz (SCORE_MASK_CACHE)
-FIG4 = SCALE / "fig4"                                    # the six mini-chem paper cases: tag/, mc_c<case>_*.npz, model benches
-DTSWEEP = SCALE / "dtsweep"                              # step-size sweep: rows_main.json, sw_<run>/, score.{json,txt}, score_rows.npz
+OUT = Path(os.environ.get("HARNESS_OUT") or SCALE / "bench")   # speed.py outputs
+T2 = SCALE / "t2"                                        # T2 snap-back test: tag/ (VULCAN boxes, jobs.json; the T2 design's source)
 GCM_TP = SCALE / "research/gcm/gcm_tp.npz"               # GCM T-P occupancy of the published GCMs (the envelope env_any)
-CRITIC_ROWS = SCALE / "research/critic/rows_e13s_FINw1536_s2.npz"   # FINAL's per-row summaries (T2 job selection)
 GEN = SCALE / "gen"                                      # targeted row lists rows_*.npy (never-rerun rule)
+CHAINS_CLEAN = PROJECT / "experiments/2026-10-20_clean-state/_build/chains"   # clean stage-2 training chains (train_a, train_b)
+PANELS = PROJECT / "experiments/2026-10-20_clean-state/_build/panels/decision"   # the decision set's test-set histories
+DESIGNS = PROJECT / "experiments/2026-10-20_clean-state/_build/designs"   # score designs: decision/ (panels S, L, P and readouts),
+                                                         # t2, PD, PH, PX, P2l, P2s (bench/score_design.py)
 
 ARCH_TESTS = SCRATCH / "arch_gcm17m_res"                 # default ARCH_CACHE (its raw_test.npz is lhbench's test split)
-RES_NORM = SCRATCH / "arch_gcm16_res/norm.json"          # reservoir-set (25-entry) species list (scoreboard.cut12, path_board)
-DEVALL6 = SCRATCH / "e13_scaledev/devall6"               # combined dev tag G + Gc + H2 + H2c + H3 + H3c (dev benches, sweep)
+ARCH_CLEAN = SCRATCH / "arch_clean_res"                  # the clean training cache (25 entries; build_clean.sh)
 HOLDOUTS = {"h2": SCRATCH / "e13_holdout/h2", "h2c": SCRATCH / "e13_holdout/h2c",      # opened fixed-condition sets
             "h3": SCRATCH / "e13_holdout3/h3", "h3c": SCRATCH / "e13_holdout3/h3c",
             "h4": SCRATCH / "e13_holdout4/h4", "h4c": SCRATCH / "e13_holdout4/h4c"}   # h4, h4c: sealed (never list or read)
