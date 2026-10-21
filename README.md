@@ -52,7 +52,7 @@ Loss: log10 MAE plus a z-space MSE. AdamW, linear warmup then cosine decay; the 
 stage 1's EMA weights.
 
     source run/env.sh
-    ARCH_CACHE=$CHEM_SCRATCH/arch_gcmU4_res HARNESS_NORM=$CHEM_SCRATCH/arch_gcm17m_res/norm.json \
+    ARCH_CACHE=$CHEM_DATA/caches/arch_gcmU4_res HARNESS_NORM=$CHEM_DATA/caches/arch_gcm17m_res/norm.json \
         $PY lib/train.py <run dir>          # <run dir>/config.json: keys of train.DEFAULTS (unknown keys are refused)
 
 A run writes `stage1.pt` / `stage2.pt`, `log.csv`, `done.json` and `manifest.json` (checkpoint hashes, the resolved config,
@@ -113,13 +113,14 @@ same weights. CBg's stage 2 continued from step 10,000 of a run with the same se
                 check_clean.py), draw weights
     run/        env.sh (sourced by every driver), score_candidate.sh, runner.sh (a job runner)
     tests/      bitcheck_train.py, score_regress.py
+    data/       not in git: raw/, caches/, truth/, sealed/, runs/, benches/, ref/, gen/
 
 ## Data and components not included
 
-The VULCAN runs, caches, truth sets, benches and checkpoints are not in this repository. `lib/paths.py` locates them
-from two environment variables, `CHEM_PROJECT` and `CHEM_SCRATCH` (defaults are those of the machine the model was
-trained on; `run/env.sh` exports them). The cache builder (`lib/rawtraj.py`) also imports `processing/preprocessing.py`
-of the 12-species code at commit 7d5b036 (from the history before the repository was rewritten; not on GitHub), checked out at `paths.SNAPSHOT`, whose `normalization.json` is the default
+The VULCAN runs, caches, truth sets, benches and checkpoints are not in this repository. They live in the git-ignored
+`data/` folder, which `lib/paths.py` locates from one environment variable, `CHEM_DATA` (default: `data/` in this
+repository; `run/env.sh` exports it). The cache builder (`lib/rawtraj.py`) also imports `processing/preprocessing.py`
+of the 12-species code at commit 7d5b036 (from the history before the repository was rewritten; not on GitHub), checked out at `paths.SNAPSHOT` (`data/ref/snapshot`), whose `normalization.json` is the default
 12-species normalization.
 
 Two components are separate and not included, because they are GPL-licensed: the training-data generator (a 0-D wrapper

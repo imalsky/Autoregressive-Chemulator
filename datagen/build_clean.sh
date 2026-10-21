@@ -11,9 +11,9 @@
 # CLEAN_KEEP=1 keeps all12 and all53. Rerunnable: each finished step leaves a marker in $CLEAN_WORK/markers and is
 # skipped; CLEAN_RES is refused if it exists and this work folder did not start it. CLEAN-CACHE-DONE ends a build;
 # FATAL on any failure.
-# Environment (defaults = the full clean set): GCM_RAW ($H/data/raw_clean), GCM_FILES (run_clean_b00-result.h5 ... b11),
-# GCM_K (12), GCM_NPER (2; cache_gcm.py asserts GCM_K x GCM_NPER chunks), CLEAN_RES ($CHEM_SCRATCH/arch_clean_res),
-# CLEAN_DESIGN_MAP ($CHEM_PROJECT/code/training-data-generator/_build/clean/design_map.npy), CLEAN_CPUS (54,...,61).
+# Environment (defaults = the full clean set): GCM_RAW ($CHEM_DATA/raw/raw_clean), GCM_FILES (run_clean_b00-result.h5 ...
+# b11), GCM_K (12), GCM_NPER (2; cache_gcm.py asserts GCM_K x GCM_NPER chunks), CLEAN_RES ($CHEM_DATA/caches/arch_clean_res),
+# CLEAN_DESIGN_MAP ($CHEM_DATA/gen/clean/design_map.npy), CLEAN_CPUS (54,...,61).
 # CLEAN_WORK (no default) holds all12, all53, the check outputs, markers and deletion lists.
 #   CLEAN_WORK=<dir> setsid nohup bash build_clean.sh > <dir>/build_clean.log 2>&1 < /dev/null &
 set -u
@@ -23,11 +23,11 @@ f() { echo "$(date '+%F %T') FATAL build_clean: $*"; exit 1; }
 say() { echo "$(date '+%F %T') $*"; }
 [ -n "${CLEAN_WORK:-}" ] || f "CLEAN_WORK is not set"
 W=$CLEAN_WORK
-RAW=${GCM_RAW:-$H/data/raw_clean}
+RAW=${GCM_RAW:-$CHEM_DATA/raw/raw_clean}
 FILES=${GCM_FILES:-$(for b in $(seq -w 0 11); do echo run_clean_b$b-result.h5; done | paste -sd,)}
 K=${GCM_K:-12}; NPER=${GCM_NPER:-2}
-CR=${CLEAN_RES:-$CHEM_SCRATCH/arch_clean_res}
-DMAP=${CLEAN_DESIGN_MAP:-$CHEM_PROJECT/code/training-data-generator/_build/clean/design_map.npy}
+CR=${CLEAN_RES:-$CHEM_DATA/caches/arch_clean_res}
+DMAP=${CLEAN_DESIGN_MAP:-$CHEM_DATA/gen/clean/design_map.npy}
 IFS=, read -r -a CPUS <<< "${CLEAN_CPUS:-54,55,56,57,58,59,60,61}"
 IFS=, read -r -a FL <<< "$FILES"
 KINDS=eqt,eqn,eqf,mix,pert,rawA,rawB
@@ -45,7 +45,7 @@ say "files ($K, $NPER chunks each, CPUs ${CPUS[*]}): $FILES"
 delcache() {  # delcache <cache dir> <name>
   local d=$1 m=$W/delete_$2.txt fs="meta.json raw_test.npz raw_train.npz raw_validation.npz t_grid.npy"
   if [ ! -e $d ] && [ -s $m ]; then say "$d already deleted (list $m)"; return 0; fi
-  case "$d" in /home/imalsky/*|/scratch/imalsky/*) ;; *) f "delete $d: outside /home/imalsky and /scratch/imalsky" ;; esac
+  case "$d" in /home/imalsky/*) ;; *) f "delete $d: outside /home/imalsky" ;; esac
   [ "$(ls -A $d | LC_ALL=C sort | paste -sd' ')" = "$fs" ] || f "delete $d: the folder holds other files: $(ls -A $d | paste -sd' ')"
   : > $m || f "write $m"
   for x in $fs; do
@@ -103,7 +103,7 @@ if [ ! -e $MK/res.done ]; then
   [ $free_kb -ge $((17 * 1024 * 1024)) ] || f "free $free_kb KiB < 17 GiB on $dev"
   touch $MK/res.started
   taskset -c ${CPUS[0]} $PY $H/datagen/cache_res.py $C53 $CR || f "res"
-  cmp $CR/t_grid.npy $CHEM_SCRATCH/arch_gcm17m_res/t_grid.npy || f "t_grid differs from arch_gcm17m_res's"
+  cmp $CR/t_grid.npy $CHEM_DATA/caches/arch_gcm17m_res/t_grid.npy || f "t_grid differs from arch_gcm17m_res's"
   SZ=$(du -sb $CR | cut -f1); say "res cache $CR: $SZ bytes"
   [ $SZ -lt 18000000000 ] || f "res cache $SZ bytes >= 18 GB"
   touch $MK/res.done

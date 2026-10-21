@@ -1,5 +1,5 @@
 """Per-row draw weights of CBg's training cache U4 (w_U4_s1, w_U4_s2; train.py traj_weights_file). Note: its second
-argument, the U2 reservoir cache ($CHEM_SCRATCH/arch_gcmU2_res), no longer exists; until it is rebuilt from the raw packs
+argument, the U2 reservoir cache ($CHEM_DATA/caches/arch_gcmU2_res), no longer exists; until it is rebuilt from the raw packs
 this script cannot regenerate the weight files.
 U4 = the U2 prefix + y21b + kicks + n1 + n2; every row after the U2 prefix that is not a kick joins its stratum like y21b.
 Optional 6th argument: the kicked share (default 0.20; 0 for a stage-1 file; old strata then get 1 - that share).

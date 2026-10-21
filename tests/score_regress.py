@@ -49,12 +49,12 @@ import paths  # noqa: E402
 sys.path.insert(0, str(REPO / "bench"))
 import score as S  # noqa: E402
 
-YARD = paths.PROJECT / "experiments/2026-10-19_minichem-yardstick/_build"
-V31 = paths.PROJECT / "experiments/2026-10-20_t0-fix/_build/score_v31/score.json"
+YARD = paths.DATA / "benches/yardstick"                 # mini-chem yardstick: design/, run/, panel/
+V31 = YARD / "score_v31/score.json"                      # rule v3.1 on the yardstick (t0-fix score_v31)
 MODELS = ("CBg", "FINAL", "LD1")
 CBG = paths.RUNS / "e13s_CBg_s2"
 YBATCH = (0, 1, 14)                                          # stored yardstick batches reproduced by (d)
-PD_DESIGN = paths.PROJECT / "experiments/2026-10-20_clean-state/_build/designs/PD"
+PD_DESIGN = paths.DESIGNS / "PD"
 PD_REF = paths.E / "PD_e13s_CBg_s2"                          # CBg's arm-P bench of paths_v3/dev (P_paths.npz)
 BINS =[(1, 2), (2, 5), (5, 10), (10, 20), (20, 50), (50, 100), (100, 200), (200, 500)]
 ROWK = ("first_newton", "first_kept", "first_guard", "first_nonfin", "first_fail", "newton_n", "kept_n", "guard_n", "nonfin_n")

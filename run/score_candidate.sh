@@ -26,8 +26,8 @@ done
 [ $# = 5 ] && [ "${1#*=}" != "$1" ] && [ "${2#*=}" != "$2" ] || { sed -n '2,3p' "$0"; exit 2; }
 A=${1%%=*} RA=$(readlink -m ${1#*=}) B=${2%%=*} RB=$(readlink -m ${2#*=}) DS=$(readlink -m $3) O=$(readlink -m $4) C=$5
 [ "$A" != "$B" ] || { echo "the two models need different names"; exit 2; }
-YARD=$CHEM_PROJECT/experiments/2026-10-19_minichem-yardstick/_build
-F1=$CHEM_PROJECT/experiments/2026-10-20_t0-fix/_build/f1
+YARD=$CHEM_DATA/benches/yardstick
+F1=$CHEM_DATA/benches/f1
 DEC=$DS/decision
 READOUTS="t2 PD PH PX P2l P2s"
 log() { echo "$(date '+%F %T') $*"; }

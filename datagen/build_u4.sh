@@ -2,19 +2,18 @@
 # The training cache U4 (CBg's): U3's 14 files (links, unchanged order) + run_gcm_z23n1 (78,106 runs) + run_gcm_z23n2
 # (69,836 listed rows) of targeted data (Z 1-100x, C/O 0.3-1.0, 1e-5 to 100 bar). Steps: cache_gcm.py chunks (odd CPUs
 # 41-55) + merge with GCM_KINDS=eq,mix,pert,broad,kick -> caches/arch_gcmU4_all; check_u4.py (prefix identity vs U3_all,
-# per-file accounting, n1 / n2 coverage); cache_align53.py -> caches/arch_gcmU4_all53; scratch quota >= 17 GiB;
-# cache_res.py -> $CHEM_SCRATCH/arch_gcmU4_res; t_grid check; check_u4.py --res vs U3_res; size < 18 GB. Rerunnable
+# per-file accounting, n1 / n2 coverage); cache_align53.py -> caches/arch_gcmU4_all53; quota >= 17 GiB on its file system;
+# cache_res.py -> $CHEM_DATA/caches/arch_gcmU4_res; t_grid check; check_u4.py --res vs U3_res; size < 18 GB. Rerunnable
 # (finished steps and U4-CACHE-DONE are skipped); FATAL on failure. The U3 caches the checks compare with no longer exist,
 # so a rebuild from scratch stops at check_u4 until they are rebuilt.
 #   setsid nohup bash build_u4.sh > build_u4.log 2>&1 &
 set -u
 source "$(dirname "$(dirname "$(readlink -f "$0")")")/run/env.sh"
 export CUDA_VISIBLE_DEVICES=""
-N=$CHEM_PROJECT/experiments/2026-10-13_e13-scale/_build
-U=$N/u4
-DA=$H/data
+U=$(dirname "$(dirname "$H")")/experiments/2026-10-13_e13-scale/_build/u4   # the build's record folder (H = <project>/code/Auto-Chem)
+DA=$CHEM_DATA/raw
 RD=$DA/raw_gcm_n/U4
-C12=$N/caches/arch_gcmU4_all; C53=$N/caches/arch_gcmU4_all53; CR=$CHEM_SCRATCH/arch_gcmU4_res
+C12=$CHEM_DATA/caches/arch_gcmU4_all; C53=$CHEM_DATA/caches/arch_gcmU4_all53; CR=$CHEM_DATA/caches/arch_gcmU4_res
 f() { echo "$(date '+%F %T') FATAL build_u4: $*"; exit 1; }
 [ -e $U/build/U4-CACHE-DONE ] && { echo "$(date '+%F %T') U4-CACHE-DONE exists"; exit 0; }
 mkdir -p $RD || f "mkdir $RD"
@@ -45,24 +44,25 @@ fi
 echo "$(date '+%F %T') 12-species cache done"
 mkdir -p $U/build
 if ! grep -q "CHECK-U4 OK" $U/build/check_u4.txt 2>/dev/null; then
-  taskset -c 57 $PY $H/datagen/check_u4.py $C12 $N/caches/arch_gcmU3_all $RD > $U/build/check_u4.txt 2>&1
+  taskset -c 57 $PY $H/datagen/check_u4.py $C12 $CHEM_DATA/caches/arch_gcmU3_all $RD > $U/build/check_u4.txt 2>&1
   grep -q "CHECK-U4 OK" $U/build/check_u4.txt || f "check_u4 (see u4/build/check_u4.txt)"
 fi
 echo "$(date '+%F %T') CHECK-U4 OK"
 [ -e $C53/meta.json ] || taskset -c 57 $PY $H/datagen/cache_align53.py $C12 $C53 $RD || f "align53"
 echo "$(date '+%F %T') 53-species cache done"
 if [ ! -e $CR/meta.json ]; then
-  read used limit <<< $(quota -w 2>/dev/null | awk '$1 == "/dev/nvme0n1p1" {gsub(/\*/, "", $2); print $2, $4}')
-  [ -n "${used:-}" ] && [ -n "${limit:-}" ] || f "cannot read the /scratch quota"
-  free_kb=$((limit - used)); echo "$(date '+%F %T') /scratch quota: used $used KiB of $limit KiB, free $free_kb KiB"
-  [ $free_kb -ge $((17 * 1024 * 1024)) ] || f "/scratch free $free_kb KiB < 17 GiB"
+  dev=$(df --output=source $(dirname $CR) | tail -1)
+  read used limit <<< $(quota -w 2>/dev/null | awk -v d=$dev '$1 == d {gsub(/\*/, "", $2); print $2, $4}')
+  [ -n "${used:-}" ] && [ -n "${limit:-}" ] || f "cannot read the quota of $dev"
+  free_kb=$((limit - used)); echo "$(date '+%F %T') quota of $dev: used $used KiB of $limit KiB, free $free_kb KiB"
+  [ $free_kb -ge $((17 * 1024 * 1024)) ] || f "free $free_kb KiB < 17 GiB on $dev"
   taskset -c 57 $PY $H/datagen/cache_res.py $C53 $CR || f "res"
 fi
-cmp $CR/t_grid.npy $CHEM_SCRATCH/arch_gcm17m_res/t_grid.npy || f "t_grid differs"
+cmp $CR/t_grid.npy $CHEM_DATA/caches/arch_gcm17m_res/t_grid.npy || f "t_grid differs"
 SZ=$(du -sb $CR | cut -f1); echo "$(date '+%F %T') U4 res cache $SZ bytes"
 [ $SZ -lt 18000000000 ] || f "U4 res cache $SZ bytes >= 18 GB"
 if ! grep -q "CHECK-U4-RES OK" $U/build/check_u4_res.txt 2>/dev/null; then
-  taskset -c 57 $PY $H/datagen/check_u4.py --res $CR $CHEM_SCRATCH/arch_gcmU3_res > $U/build/check_u4_res.txt 2>&1
+  taskset -c 57 $PY $H/datagen/check_u4.py --res $CR $CHEM_DATA/caches/arch_gcmU3_res > $U/build/check_u4_res.txt 2>&1
   grep -q "CHECK-U4-RES OK" $U/build/check_u4_res.txt || f "check_u4 --res (see u4/build/check_u4_res.txt)"
 fi
 echo "$(date '+%F %T') CHECK-U4-RES OK"

@@ -6,11 +6,15 @@ the optimizer receives (after clipping), the pre-clip gradients and norm whereve
 (timing and memory fields dropped) and the final stage file's weights. Tensors are compared by the sha256 of their bytes,
 so PASS means bit for bit.
 
-Modes (environment as CBg trained: ARCH_CACHE=<paths.SCRATCH>/arch_gcmU4_res,
-HARNESS_NORM=<paths.SCRATCH>/arch_gcm17m_res/norm.json; TF32 on, as train.main sets it; runs under paths.RUNS):
+Modes (environment as CBg trained: ARCH_CACHE=<paths.DATA>/caches/arch_gcmU4_res,
+HARNESS_NORM=<paths.DATA>/caches/arch_gcm17m_res/norm.json; TF32 on, as train.main sets it; runs under paths.RUNS):
   s2  CBg's config: stage 2 from CBS1's stage1.pt (lockstep, fused projection, row clips, fp64 clip norm, non-finite
       guard). Reference: lib/ of git tag e13s_CBg_s2, extracted with git archive into the work folder.
-  s1  CBS1's config: stage 1 from scratch. Reference: CBS1's frozen copy, runs/e13s_CBS1_s2/harness/lib.
+  s1  CBS1's config: stage 1 from scratch. Reference: CBS1's frozen copy, runs/e13s_CBS1_s2/harness/lib, copied into the
+      work folder.
+The stored configs and reference libs name data locations from before the data moved under paths.DATA; the config's
+paths and the reference copy's paths.py constants are mapped to where those data are now (paths.moved), in the work
+folder only.
 Short-run overrides, the same on both sides: N steps (default 4); log_every 1; validation (2048 windows) at the last step
 only; no checkpoints, resume or path readout; traj_weights_file None, because CUDA multinomial draws do not repeat from one
 generator state (uniform randint draws do), so the weighted trajectory draw is the one path not covered. s2 also sets
@@ -34,6 +38,7 @@ The work folder (default under TMPDIR) keeps each side's config, log and record;
 """
 import argparse
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -110,13 +115,13 @@ def setup():
     worker must import the modules of the lib it tests (a cached 'paths' would leak into a reference copy)."""
     sys.path.insert(0, str(REPO / "lib"))
     import paths
-    env = {"ARCH_CACHE": str(paths.SCRATCH / "arch_gcmU4_res"),
-           "HARNESS_NORM": str(paths.SCRATCH / "arch_gcm17m_res" / "norm.json"), "PYTHONDONTWRITEBYTECODE": "1"}
+    env = {"ARCH_CACHE": str(paths.DATA / "caches/arch_gcmU4_res"),
+           "HARNESS_NORM": str(paths.DATA / "caches/arch_gcm17m_res/norm.json"), "PYTHONDONTWRITEBYTECODE": "1"}
     modes = {"s2": {"config": paths.RUNS / "e13s_CBg_s2" / "config.json", "ref": "tag:e13s_CBg_s2",
                     "over": {"s2_steps": None, "chain_K_ramp": 1, "chain_pre_ramp": 1}},
              "s1": {"config": paths.RUNS / "e13s_CBS1_s2" / "config.json",
                     "ref": str(paths.RUNS / "e13s_CBS1_s2" / "harness" / "lib"), "over": {"s1_steps": None}}}
-    return env, modes
+    return env, modes, paths.moved
 
 
 def gpu_idle():
@@ -129,14 +134,26 @@ def gpu_idle():
         sys.exit(f"GPU{idx} holds other processes {q}: not starting")
 
 
-def ref_lib(spec, work):
-    if not spec.startswith("tag:"):
-        return Path(spec)
-    blob = subprocess.run(["git", "-C", str(REPO), "archive", "--format=tar", spec[4:], "lib"], capture_output=True,
-                          check=True).stdout
-    with tarfile.open(fileobj=io.BytesIO(blob)) as t:
-        t.extractall(work / "ref_tag", filter="data")
-    return work / "ref_tag" / "lib"
+def ref_lib(spec, work, moved):
+    """The reference lib as a copy in the work folder; its paths.py gets one line per Path constant that names moved data,
+    pointing it at the data's place now (moved = paths.moved)."""
+    if spec.startswith("tag:"):
+        blob = subprocess.run(["git", "-C", str(REPO), "archive", "--format=tar", spec[4:], "lib"], capture_output=True,
+                              check=True).stdout
+        with tarfile.open(fileobj=io.BytesIO(blob)) as t:
+            t.extractall(work / "ref_tag", filter="data")
+        lib = work / "ref_tag" / "lib"
+    else:
+        lib = work / "ref_copy" / "lib"
+        shutil.copytree(spec, lib, ignore=shutil.ignore_patterns("__pycache__"))
+    sp = importlib.util.spec_from_file_location("ref_paths", lib / "paths.py")
+    ref = importlib.util.module_from_spec(sp)
+    sp.loader.exec_module(ref)
+    new = {k: moved(str(v)) for k, v in vars(ref).items() if isinstance(v, Path) and moved(str(v)) != str(v)}
+    with open(lib / "paths.py", "a") as f:
+        f.write("\n# bitcheck_train.py: these locations moved (paths.PATHMAP)\n"
+                + "".join(f"{k} = Path({v!r})\n" for k, v in sorted(new.items())))
+    return lib
 
 
 def neg_lib(work):
@@ -222,17 +239,17 @@ def main():
     ap.add_argument("--work", default=None)
     a = ap.parse_args()
     gpu_idle()
-    ENV, MODES = setup()
+    ENV, MODES, moved = setup()
     m = MODES[a.mode]
     tmp = os.environ.get("TMPDIR")
     assert tmp and not tmp.startswith("/tmp"), "TMPDIR must be set to your own scratch (run/env.sh)"
     work = Path(a.work) if a.work else Path(tempfile.mkdtemp(prefix=f"bitcheck_{a.mode}_", dir=tmp))
     work.mkdir(parents=True, exist_ok=True)
-    cfg = json.loads(m["config"].read_text())
+    cfg = {k: moved(v) for k, v in json.loads(m["config"].read_text()).items()}
     cfg.update(COMMON)
     cfg.update({k: (a.steps if v is None else v) for k, v in m["over"].items()})
     env = {**os.environ, **ENV}
-    sides = [("ref", ref_lib(a.ref or m["ref"], work)), ("cur", REPO / "lib")]
+    sides = [("ref", ref_lib(a.ref or m["ref"], work, moved)), ("cur", REPO / "lib")]
     if a.repeat:
         sides.append(("ref2", sides[0][1]))
     if a.negative:
