@@ -74,37 +74,45 @@ same weights. CBg's stage 2 continued from step 10,000 of a run with the same se
 
 ## Benchmarks and scoring
 
-- `lib/lhbench.py`: rollouts on the GPU. Arm H starts from a VULCAN tag's own states at fixed T, P and dt; arm P follows
-  changing-condition paths (T, P and dt change every call, with recorded mixing). The decision benches use
-  `--modes P3 --closed-iters 32 --closed-fallback lm --lm-adaptive` (and `--startup-substeps 5:1` on arm H). Results
-  differ by up to 7e-4 dex across batch shapes, so a bench keeps its rows per call.
-- `run/bench_dev.sh`: the development sets (fixed-condition sets as one combined arm-H bench, five path sets, the T2
-  snap-back test, small steps from evolved states, the mini-chem cases); `run/bench_candidate.sh` adds speed, a
-  1000-day run (`bench/cyc1000.py`) and the judge.
-- Step-size sweep: `run/run_sweep.sh` (`bench/sweep/sweep.py`: 606 jobs x 9 step sizes from 1 to 500 s x 2 start ages,
-  10,000 calls) and `bench/sweep/score_sweep.py`.
-- `bench/score_minichem.py`: the six mini-chem paper cases (Tsai et al. 2022, Fig. 4) against VULCAN, for model benches and
-  for stored mini-chem predictions.
-- `bench/yardstick.py`: models and stored mini-chem predictions against VULCAN on the yardstick design (histories at fixed
-  T and P, run as restarted segments and as free runs, steps 1-500 s), paired per condition with bootstrap intervals;
-  `--rule v3.1` (default: only unrecovered steps fail; exact log-time quadrature split at decade edges) or `--rule v3`.
-- Scoring (`lib/scorerule.py`): per-gas floors (1e-10 for H2O, CO, CO2, CH4, NH3, HCN, C2H2; 1e-8 for H, OH, O; 1e-6 for
-  H2, N2); a point counts where the truth or the prediction is above its floor and resolved (>= 1e-2 cm^-3); the error is
-  |log10 max(pred, floor) - log10 max(truth, floor)|. Boards and rules: `bench/scoreboard.py`, `bench/path_board.py`,
-  `bench/board6.py`, `bench/rules_t5.py`, `bench/judge.py`, `bench/pass_v2.py`.
-- `tests/bitcheck_train.py` (training, bit for bit against a reference code copy), `tests/score_regress.py` (scorers
-  against stored results) and `tests/yardstick_regress.py` (the yardstick scorer: rule v3.1 on synthetic inputs, rule v3
-  against its stored result, rule v3.1 against the stored readout it reproduces) are regression checks; they need the
-  stored runs and benches.
+- The pipeline: `bench/score_design.py` turns a test set (VULCAN output files) into a design: rows, saved calls, the
+  truth at those calls, the start states and frozen batches (CPU; it refuses to overwrite a design and refuses a sealed
+  set unless given the decision that opens it). `bench/score_run.py` runs one model on one design on the GPU (P3 state,
+  32 Newton iterations with the adaptive LM rescue, one model call per step, 50 calls per CUDA graph, TF32 off) and
+  keeps its states at the saved calls. `bench/score.py` (NumPy) scores them. `run/score_candidate.sh` checks speed, then
+  runs a candidate and the incumbent on the decision set's designs and scores them; `--final` adds the final-pick
+  readouts.
+- The score: three panels with equal weight: constant-condition segments (restarted at 17 ages from 0 to 3e7 s),
+  long uninterrupted runs, and changing-condition paths (T and P change between holds of up to 1,500 s, with mixing).
+  Error is weighted equally per decade of elapsed time (1 s to 1e8 s) and per factor of 10 in dt over 1-500 s (eight
+  bins); starts in equilibrium at the cell's own conditions count 0.55 and starts from another condition's equilibrium
+  0.45. A panel's score is the 5 % trimmed mean over its conditions, and the score is the mean of the three. Two models
+  are compared by their paired per-condition differences with a bootstrap by condition: better or worse only when the
+  difference is at least 0.005 dex and its 95 % interval excludes zero, otherwise a tie. A failure (an unrecovered step
+  or an invalid state) scores 2 dex from that call on. Readouts, never the outcome: the lasting error, the errors per
+  dt bin, raw-gas starts, large misses, the 1000-day run, speed, mini-chem on its native compositions, breakdowns by
+  condition, and snap-back after a perturbed state (T2).
+- Error per saved call: per-gas floors S (1e-10 for H2O, CO, CO2, CH4, NH3, HCN, C2H2; 1e-8 for H, OH, O; 1e-6 for H2,
+  N2); the error of a gas is |log10 max(pred, S) - log10 max(truth, S)| (0 when both are below S), averaged over the 12
+  reported gases. `lib/scorerule.py` applies the same floors to the training readouts (`t0_readout`, `path_readout`),
+  on resolved points (>= 1e-2 cm^-3).
+- `lib/lhbench.py` is the rollout engine (CUDA graphs, the P3 state and its guard) behind `bench/score_run.py`, the
+  training path readout, `bench/cyc1000.py` and `bench/speed.py`. Results differ by up to 7e-4 dex across batch shapes,
+  so a design keeps its frozen batches.
+- `bench/speed.py`: the cost of one call per cell; `bench/cyc1000.py`: a model-only 1000-day changing-condition run (it
+  checks boundedness, not accuracy).
+- `tests/bitcheck_train.py` (training, bit for bit against a reference code copy) and `tests/score_regress.py` (the
+  scorer on hand-made cases and against a stored result; `--gpu` adds the runner against stored model outputs) are
+  regression checks; they need the stored runs and benches.
 
 ## Layout
 
     lib/        models.py (the head), train.py, data.py (cache and samplers), chains.py, elemproj.py, lhbench.py,
                 scorerule.py, rawtraj.py, paths.py (every data location)
-    bench/      scorers, boards, decision rules, speed, the 1000-day run, the step-size sweep (bench/sweep/)
-    datagen/    cache builders (generator packs -> 12-, 53-species and 25-entry caches), draw weights, T2 kick tags
-    run/        env.sh (sourced by every driver), bench drivers, a job runner
-    tests/      bitcheck_train.py, score_regress.py, yardstick_regress.py
+    bench/      score_design.py, score_run.py, score.py, speed.py, cyc1000.py
+    datagen/    cache builders (generator packs -> 12-, 53-species and 25-entry caches, incl. build_clean.sh and
+                check_clean.py), draw weights
+    run/        env.sh (sourced by every driver), score_candidate.sh, runner.sh (a job runner)
+    tests/      bitcheck_train.py, score_regress.py
 
 ## Data and components not included
 
