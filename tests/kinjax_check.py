@@ -632,9 +632,8 @@ def status():
         _, pull = jax.vjp(g2, *P_)
         bars = pull((J(cx), J(ch)))
         stat = dict(zip(KC.COUNTS, np.asarray(out[5]).tolist()))
-        o = (list(stat.values())[:6] == list(st_j.values()) and st_j == st_v and stat["recovered"] == 0
-             and stat["still_failed"] == 0 and eq(fl_j.astype(np.int32), out[4]) and eq(r[4], dx) and eq(r[5], dh)
-             and all(eq(g[k], b) for k, b in zip(CLS, bars)))
+        o = (stat == st_j == st_v and stat["recomputed"] == 1 and eq(fl_j, out[4]) and eq(r[4], dx)
+             and eq(r[5], dh) and all(eq(g[k], b) for k, b in zip(CLS, bars)))
         ok = ok and o
         txt.append(f"{'A' if adapt else 'F'}: primal status {stat}, ADSolver {st_j}, flags equal and derivatives "
                    f"bitwise {o}")
@@ -655,6 +654,52 @@ def status():
     verdict("status: NaN input, max_steps, dt = 0, T < 300 K", ok and cold and raised,
             "; ".join(txt) + f"; a cell at 250 K: counted cold, not stepped, its tangent finite, the other cells' "
             f"tangents bitwise those of a call without it {cold}, check() raises {raised}")
+
+
+def recovered():
+    """Cells the guard flags (settled starts at dt 1000 s, max_steps 3), redone on the recovery's path: the call with lm
+    = 0 bitwise CudaSolver.launch (flags, counts), with random lm bitwise ADSolver's primal; jit(jvp), vjp and grad
+    bitwise ADSolver (recovered cells' derivatives, NaN on cells still failed), both contracts."""
+    B, ms = 256, 3
+    x0, T, P = yardstick(B, 51, 0.0)
+    xs, hs, _, _ = kc(x0, T, P, full(B, 100.0), full(B, 1e-10))
+    a = (xs, T, P, full(B, 1e3), hs)
+    ref = kc.launch(*a, max_steps=ms)
+    cnt = kc.count.tolist()[1:9]
+    lm = rn(B, NR) * 1e-2
+    v = tangents(a)
+    cx, ch = rn(B, NS), rn(B)
+    f = jax.jit(lambda *p: kj.call(*p, max_steps=ms))
+    P0 = tuple(J(q) for q in a) + (jnp.zeros((B, NR)), RC0)
+    P_ = tuple(J(q) for q in a) + (J(lm), RC0)
+    o0, o1 = f(*P0), f(*P_)
+    r = [ref[0], ref[1], ref[2].int(), ref[3].int(), ref[4]]
+    ok0 = all(eq(p, q) for p, q in zip(r, o0[:5])) and np.asarray(o0[5]).tolist() == cnt
+    rj = ad.jvp(*a, *v[:5], lm=lm, dlm=v[5], drc=v[6], max_steps=ms)
+    st1 = dict(ad.status)
+    ok1 = all(eq(p, q) for p, q in zip((rj[0], rj[1], rj[2].int(), rj[3].int(), ad.flag), o1[:5])) and dict(
+        zip(KC.COUNTS, np.asarray(o1[5]).tolist())) == st1
+    nf = [int((np.asarray(o1[4]) == k).sum()) for k in (1, 2)]
+    bad = []
+    for adapt in (True, False):
+        g2 = lambda *p: kj.call(*p, adapt=adapt, max_steps=ms)[:2]  # noqa: E731
+        r = ad.jvp(*a, *v[:5], lm=lm, dlm=v[5], drc=v[6], adapt=adapt, max_steps=ms)
+        _, (dx, dh) = jax.jit(lambda p, t: jax.jvp(g2, p, t))(P_, tuple(J(q) for q in v))
+        g = ad.vjp(*a, cx, ch, lm=lm, adapt=adapt, max_steps=ms)[4]
+        _, pull = jax.vjp(g2, *P_)
+        bars = pull((J(cx), J(ch)))
+        gr = jax.jit(jax.grad(dot_loss(g2, J(cx), J(ch)), argnums=tuple(range(7))))(*P_)
+        if not (eq(r[4], dx) and eq(r[5], dh)):
+            bad.append(f"jvp {'A' if adapt else 'F'}")
+        if not all(eq(g[k], b) for k, b in zip(CLS, bars)):
+            bad.append(f"vjp {'A' if adapt else 'F'}")
+        if not all(eq(g[k], b) for k, b in zip(CLS, gr)):
+            bad.append(f"grad {'A' if adapt else 'F'}")
+    verdict("recovered cells", ok0 and ok1 and nf[0] > 0 and not bad,
+            f"{B} settled cells at dt 1000 s, max_steps 3: the call with lm = 0 bitwise CudaSolver.launch incl. flags "
+            f"and counts {dict(zip(KC.COUNTS, cnt))}: {ok0}; with random lm bitwise ADSolver's primal, flags and "
+            f"counts {ok1} ({nf[0]} recovered, {nf[1]} still failed); jit(jvp), vjp, grad bitwise ADSolver (both "
+            f"contracts) except {bad or 'none'}")
 
 
 def edges():
@@ -724,7 +769,7 @@ def main():
           f"{KJ._MODULES[kj.module]}", flush=True)
     cs = cases()
     for f, a in ((primal, (cs,)), (parity, (cs,)), (dot_tests, ()), (finite_differences, ()), (transforms, ()),
-                 (scan_window, ()), (end_to_end, ()), (status, ()), (edges, ())):
+                 (scan_window, ()), (end_to_end, ()), (status, ()), (recovered, ()), (edges, ())):
         f(*a)
         print(f"  ({time.time() - t_start:.0f} s)", flush=True)
     print(f"{sum(results)} of {len(results)} cases PASS", flush=True)

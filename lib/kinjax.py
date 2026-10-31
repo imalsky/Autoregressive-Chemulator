@@ -6,15 +6,16 @@ network's species order, T [...] K, P [...] dyn cm^-2, dt [...] s, starting step
 rate multipliers lm [..., R] (each multiplies a reaction's forward and reverse coefficients together) and the Arrhenius
 table rc [R, 9] (default: the network's, as kincuda.tables); float64, any leading shape, flattened into one GPU call.
 Without lm the call is the production call (call kernel, guard, device-side recovery: bitwise CudaSolver.launch); with
-lm it is the tangent kernel with no directions, the same arithmetic (bitwise the call kernel at lm = 0), and the guard
-(flagged cells are not recomputed: the recovery takes no multipliers). The handlers enqueue on the stream XLA gives them
+lm it is the tangent kernel with no directions, the guard and the recovery's path with the multipliers (kincuda_ad's
+jvp_rec), the same arithmetic (bitwise CudaSolver.launch at lm = 0). The handlers enqueue on the stream XLA gives them
 and never synchronise; every buffer a kernel writes is an output (XLA allocates it per invocation). jax_enable_x64 must
 be on; on a shared GPU set XLA_PYTHON_CLIENT_PREALLOCATE=false before JAX starts.
 
 Outputs: x (renormalised), h (the step size to carry to the next call), done (int32), steps (float64, accepted steps),
-flag (int32: 0 passed the guard; without lm 1 recovered, 2 still failed after the recovery; with lm 1 flagged), status
-(int32 [8], counts over the whole primitive call, named by kincuda.COUNTS). The derivative kernels recompute the call
-kernel's result bitwise, not the recovery's: a cell with flag != 0 has the derivative of the kernel's own result.
+flag (int32: 0 passed the guard, 1 recovered, 2 still failed after the recovery), status (int32 [8], counts over the
+whole primitive call, named by kincuda.COUNTS). The derivative kernels recompute the call bitwise, the recovery
+included: a recovered cell has the derivative of the recovered result; a cell with flag 2 has NaN derivatives (and an
+Arrhenius cotangent summed over it is NaN).
 
 Derivatives of x_out and h_out with respect to x, T, P, dt, h, lm and rc, contract A (adapt=True, default: the step
 control differentiated on the branch taken) or F (adapt=False: accepted step sizes frozen; no dt, h or h_out derivative),
@@ -153,7 +154,7 @@ def _call_abstract(x, T, P, dt, h, lm, rc, *tabs, module, rtol, atol, max_steps,
     B, ns = x.shape
     nr = _MODULES[module]["nr"]
     scr = _nw(B, module, "jvp") * (3 * nr + 2) if _has(lm) else _nw(B, module, "call") * (2 * nr + 2)
-    rscr = 0 if _has(lm) else _MODULES[module]["rec"]
+    rscr = _nw(B, module, "jvp") * ns * ns if _has(lm) else _MODULES[module]["rec"]
     i32 = jnp.int32
     return (_sa((B, ns)), _sa((B,)), _sa((B,), i32), _sa((B,)), _sa((B,), i32), _sa((10,), i32), _sa((scr,)),
             _sa((B,), i32), _sa((rscr,)))
@@ -163,22 +164,27 @@ def _lin_abstract(*args, module, rtol, atol, max_steps, adapt, rec_steps):
     x, tx = args[0], args[NP]
     D, (B, ns) = tx.shape[0], x.shape
     nr = _MODULES[module]["nr"]
-    scr = _nw(B, module, "jvp") * (3 * nr + 2 + min(D, KA.DMAX) * (2 * nr + ns))
-    return (_sa((D, B, ns)), _sa((D, B)), _sa((B, ns)), _sa((B,)), _sa((B,), jnp.int32), _sa((B,)),
-            _sa((1,), jnp.int32), _sa((scr,)))
+    nw = _nw(B, module, "jvp")
+    scr = nw * (3 * nr + 2 + min(D, KA.DMAX) * (2 * nr + ns))
+    i32 = jnp.int32
+    return (_sa((D, B, ns)), _sa((D, B)), _sa((B, ns)), _sa((B,)), _sa((B,), i32), _sa((B,)), _sa((B,), i32),
+            _sa((10,), i32), _sa((scr,)), _sa((B,), i32), _sa((nw * ns * ns,)))
 
 
 def _adj_abstract(*args, module, rtol, atol, max_steps, adapt, rec_steps, want_lm, want_rc, groups, cap):
-    if max_steps > KA.CAP ** 2:
-        raise ValueError(f"kinjax: reverse mode needs max_steps <= {KA.CAP ** 2}")
+    if max_steps > cap ** 2 or rec_steps > (2 * cap) ** 2:
+        raise ValueError(f"kinjax: reverse mode needs max_steps <= {cap ** 2} (and the recovery's tries <= "
+                         f"{4 * cap ** 2})")
     x, cx = args[0], args[NP]
     D, (B, ns) = cx.shape[0], x.shape
     nr = _MODULES[module]["nr"]
     nw = _nw(B, module, "vjp")
+    i32 = jnp.int32
     return (_sa((D, B, ns)),) + tuple(_sa((D, B)) for _ in range(4)) + (
         _sa((D, B, nr) if want_lm else (0,)), _sa((D, groups, nr, 9) if want_rc else (0,)),
-        _sa((B, ns)), _sa((B,)), _sa((B,), jnp.int32), _sa((B,)), _sa((1,), jnp.int32), _sa((nw * (12 * nr + 2),)),
-        _sa((nw * 2 * KA.CAP * (ns + 3),)), _sa((0,) if want_lm else (B * nr,)))
+        _sa((B, ns)), _sa((B,)), _sa((B,), i32), _sa((B,)), _sa((B,), i32), _sa((10,), i32),
+        _sa((nw * (12 * nr + 2),)), _sa((nw * 2 * cap * (ns + 3),)), _sa((0,) if want_lm else (B * nr,)),
+        _sa((B,), i32), _sa((nw * ns * ns,)), _sa((nw * 4 * cap * (ns + 3),)))
 
 
 def _lower(target, keep):
@@ -202,8 +208,8 @@ def _prim(name, abstract, target, keep):
 
 _BASE = ("module", "rtol", "atol", "max_steps")
 _call_p = _prim("kinjax_call", _call_abstract, "kinjax_call", _BASE + ("rec_steps",))
-_lin_p = _prim("kinjax_lin", _lin_abstract, "kinjax_jvp", _BASE + ("adapt",))
-_adj_p = _prim("kinjax_adj", _adj_abstract, "kinjax_vjp", _BASE + ("adapt", "groups", "cap"))
+_lin_p = _prim("kinjax_lin", _lin_abstract, "kinjax_jvp", _BASE + ("adapt", "rec_steps"))
+_adj_p = _prim("kinjax_adj", _adj_abstract, "kinjax_vjp", _BASE + ("adapt", "groups", "cap", "rec_steps"))
 
 
 def _zero(o):
@@ -362,7 +368,8 @@ class KinJax:
             wpb = min(32, (optin - len(blob)) // (8 * perwa))
             if wpb < 1:
                 raise RuntimeError(f"the {kind} kernel's work arrays do not fit in shared memory")
-            geo[kind] = [self.ns, self.nr, wpb, 32 * wpb, 8 * wpb * perwa + len(blob), 0, 0] + rounds
+            sm = 8 * wpb * perwa + len(blob)                    # the recovery's kernel: the same grid and layout
+            geo[kind] = [self.ns, self.nr, wpb, 32 * wpb, sm, 32 * wpb, sm] + rounds
             self.src[kind] = KA.source_ad(tab, ext, kind, wpb) + (_ARRHG if kind == "vjp" else "")
         rec = cs.rec_blocks * (2 * self.nr + 2 + (0 if cs.info["rec_w_shared"] else self.ns ** 2))
         del cs

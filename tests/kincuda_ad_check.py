@@ -24,11 +24,19 @@ judged).
 (e) Determinism: the same call twice gives the same bits (every output incl. the Arrhenius reduction); cells permuted,
     and cells run alone, give the same per-cell bits.
 (f) Several tangent directions in one jvp call: bitwise equal to one call per direction.
-(g) Status: a NaN input, a cell stopped by max_steps and a dt = 0 cell among ordinary cells (counts, every other
-    derivative finite); a cell below 300 K raises.
+(g) Status: a NaN input, a cell stopped by max_steps (flagged and redone on the recovery's path: finite derivatives if
+    recovered, NaN if still failed) and a dt = 0 cell among ordinary cells (counts and flags as CudaSolver's, every
+    other derivative finite); a cell below 300 K raises.
 (h) A 30-call panel-P window: carried tangents (x, h; adaptive) against central differences of the whole window.
 (i) The same kind of window in reverse mode (checkpoints of x and h at the call boundaries, each call's vjp with the
     cotangents of x and h carried backwards) against the carried tangents: dot products per path, both contracts.
+(j) Recovered cells (settled starts at dt 1000 s with max_steps 3; cold starts at dt 500 s with max_steps 60; scrambled
+    starts with the element-drift allowance 0): jvp and vjp primal bitwise CudaSolver.launch with its flags and counts;
+    derivatives finite on unflagged and recovered cells, NaN on cells still failed; the unflagged cells as their own
+    batch bitwise; with log multipliers too. The recovered cells' adaptive tangents against central differences of the
+    recovered call (bars as (c), or twice the p90 of the same cells and directions on the ordinary path, max_steps 4000,
+    where those cells take the same steps; the long cold calls sit at that level on both paths); dot products on the
+    recovered cells, both contracts (p99 <= 1e-6).
     taskset -c <cpus> $PY tests/kincuda_ad_check.py      (GPU1; about 5 min idle, 10-15 min on a shared GPU)"""
 import sys
 import time
@@ -93,6 +101,10 @@ CLS = ("x", "T", "P", "dt", "h", "lm", "rc")
 def verdict(name, ok, text):
     results.append(ok)
     print(f"{'PASS' if ok else 'FAIL'}  {name}: {text}", flush=True)
+
+
+def info_line(name, ok, text):
+    print(f"INFO  {name} (within the bars: {ok}): {text}", flush=True)
 
 
 def pct(a):
@@ -233,22 +245,28 @@ def shifted(a, v, e):
             None if v["lm"] is None else e * v["lm"], ad.rc0 if v["rc"] is None else ad.rc0 + e * v["rc"])
 
 
-def fd_case(name, a):
+def fd_case(name, a, max_steps=4000, judge=None, ref=None, info=False):
+    """Central differences of the call (its primal: bitwise CudaSolver.launch, recovered cells included) against the
+    tangents; judge: the cells judged (default all); ref: the errors of another run on the same cells and directions,
+    whose p90 doubled raises a class's bar; info: printed, not judged. Returns the errors per input class."""
     x, T, P, dt, h = a
     B = x.shape[0]
     errs, hs = {}, {}
     for cls in CLS:
         v = direction(cls, *a)
-        xo, ho, _, nok, dxo, dho = ad.jvp(*a, v["x"], v["T"], v["P"], v["dt"], v["h"], dlm=v["lm"], drc=v["rc"])
+        xo, ho, _, nok, dxo, dho = ad.jvp(*a, v["x"], v["T"], v["P"], v["dt"], v["h"], dlm=v["lm"], drc=v["rc"],
+                                          max_steps=max_steps)
+        fl = ad.flag.clone()
         fx, fh, ok = [], [], []
         for e in (1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8):
-            o = []
+            o, f = [], []
             for sg in (1.0, -1.0):
                 x_, T_, P_, dt_, h_, lm_, rc_ = shifted(a, v, sg * e)
-                o.append(ad.jvp(x_, T_, P_, dt_, h_, *zeros_tan(x), lm=lm_, rc=rc_))
+                o.append(ad.jvp(x_, T_, P_, dt_, h_, *zeros_tan(x), lm=lm_, rc=rc_, max_steps=max_steps))
+                f.append(ad.flag.clone())
             fx.append((o[0][0] - o[1][0]) / (2 * e))
             fh.append((o[0][1] - o[1][1]) / (2 * e))
-            ok.append((o[0][3] == nok) & (o[1][3] == nok))
+            ok.append((o[0][3] == nok) & (o[1][3] == nok) & (f[0] == fl) & (f[1] == fl))
         m = xo > 1e-25
         u = torch.where(m, dxo / xo.clamp(min=1e-300), torch.zeros_like(xo))
         sc = u.abs().max(1).values
@@ -265,16 +283,25 @@ def fd_case(name, a):
             agh = (fh[k] - fh[k + 1]).abs() / dho.abs().clamp(min=1e-300)
             best_h = torch.where(stab & (agh < 1e-2), torch.minimum(best_h, hr), best_h)
         sens, sens_h = sc > 1e-6, dho.abs() > 1e-6 * ho      # cells whose output depends on this input
+        if judge is not None:
+            sens, sens_h = sens & judge, sens_h & judge
         fin = torch.isfinite(best_x) & sens
         errs[cls] = (best_x[fin].cpu().numpy(), int(fin.sum()), int(sens.sum()))
         fh_ = torch.isfinite(best_h) & sens_h
         hs[cls] = (best_h[fh_].cpu().numpy(), int(fh_.sum()), int(sens_h.sum()))
-    ok = all(np.quantile(q[0], 0.9) <= (1e-4 if k == "h" else 1e-5) for k, q in errs.items() if len(q[0]))
-    verdict(f"adaptive vs central differences, {name}", ok,
+    bar = {k: max(1e-4 if k == "h" else 1e-5, 2.0 * np.quantile(ref[k][0], 0.9) if ref and len(ref[k][0]) else 0.0)
+           for k in errs}
+    ok = all(np.quantile(q[0], 0.9) <= bar[k] for k, q in errs.items() if len(q[0]))
+    if judge is not None:                       # the judged cells must reach a plateau in every class
+        ok = ok and all(len(q[0]) for q in errs.values())
+    if ref:
+        name += " (bars: 1e-5 / 1e-4 or twice the reference's p90: " + ", ".join(f"{k} {b:.1e}" for k, b in bar.items()) + ")"
+    (info_line if info else verdict)(f"adaptive vs central differences, {name}", ok,
             f"{B} cells; error of d ln x / the cell's largest |d ln x| at the best step (cells with a plateau / cells "
             f"sensitive to the input: largest |d ln x| > 1e-6): "
             + "; ".join(f"{k} {pct(q[0])} ({q[1]}/{q[2]})" for k, q in errs.items() if len(q[0])) + " | h_out rel "
             "(|d h / h| > 1e-6): " + "; ".join(f"{k} {pct(q[0])} ({q[1]}/{q[2]})" for k, q in hs.items() if len(q[0])))
+    return errs
 
 
 def gcm_states(B, ncalls=150, extra=0):
@@ -313,42 +340,58 @@ def dot_tests():
     x0, T, P = yardstick(B, 11, 1.0)
     cases.append(("scrambled 1 dex dt 50", (x0, T, P, full(B, 50.0), full(B, 1e-10))))
     for name, a in cases:
-        x, T, P, dt, h = a
-        far = away_from_balance(x, T, P)
-        for adapt in (False, True):
-            lab = "adaptive" if adapt else "frozen"
-            xo, ho = kc.launch(*a)[:2]
-            cx, ch = rn(B, ad.ns) / xo.clamp(min=1e-30) * (xo > 1e-25), rn(B) / ho     # log-weighted cotangents
-            _, _, _, _, g = ad.vjp(*a, cx, ch, adapt=adapt)
-            for part, lmmask in (("x, T, P, dt, h and lm on reactions away from balance", far),
-                                 ("lm on every reaction (balanced ones are rounding; not judged)", None)):
-                v = dict(x=x * rn(B, ad.ns), T=T * 1e-2 * rn(B), P=P * 1e-2 * rn(B), dt=dt * 1e-2 * rn(B),
-                         h=h * 1e-2 * rn(B), lm=rn(B, ad.nr) * 1e-2 * (far if lmmask is not None else 1.0))
-                if lmmask is None:
-                    v.update({k: v[k] * 0.0 for k in ("x", "T", "P", "dt", "h")})
-                _, _, _, nok, dxo, dho = ad.jvp(*a, v["x"], v["T"], v["P"], v["dt"], v["h"], dlm=v["lm"],
-                                                adapt=adapt)
-                lhs = (cx * dxo).sum(1) + ch * dho
-                terms = [(g[k] * v[k]).reshape(B, -1) for k in ("x", "T", "P", "dt", "h", "lm")]
-                rhs = sum(q.sum(1) for q in terms)
-                sc = torch.maximum((cx * dxo).abs().sum(1) + (ch * dho).abs(), sum(q.abs().sum(1) for q in terms))
-                rel = ((lhs - rhs).abs() / sc).nan_to_num(0.0).cpu().numpy()
-                text = (f"{B} cells, steps mean {float(nok.mean()):.2f} max {int(nok.max())}; |<c,Jv> - <J^T c,v>| / "
-                        f"scale {pct(rel)}; p99 {np.quantile(rel, 0.99):.1e}")
-                if lmmask is None:
-                    print(f"INFO  dot products, {name}, {lab}, {part}: {text}", flush=True)
-                else:
-                    verdict(f"dot products, {name}, {lab}, {part}", np.quantile(rel, 0.99) <= 1e-6, text)
-        for adapt in (False, True):                 # the Arrhenius direction is global: the batch total
-            drc = rn(ad.nr, 9) * 1e-3
-            zx, zb = torch.zeros_like(x), torch.zeros_like(T)
-            xo, ho, _, _, dxo, dho = ad.jvp(*a, zx, zb, zb, zb, zb, drc=drc, adapt=adapt)
-            cx, ch = rn(B, ad.ns) / xo.clamp(min=1e-30) * (xo > 1e-25), rn(B) / ho
-            _, _, _, _, g = ad.vjp(*a, cx, ch, adapt=adapt)
-            l_, r_ = float(((cx * dxo).sum(1) + ch * dho).sum()), float((g["rc"] * drc).sum())
-            sc = float((cx * dxo).abs().sum() + (ch * dho).abs().sum())
-            print(f"INFO  dot products, {name}, Arrhenius table (every reaction), {'adaptive' if adapt else 'frozen'}: "
-                  f"batch total {l_:.10e} vs {r_:.10e} (difference / sum |terms| {abs(l_ - r_) / sc:.1e})", flush=True)
+        dots(name, a)
+
+
+def dots(name, a, max_steps=4000, judge=None, sv=None):
+    """Dot products of one case, both contracts; judge: the cells judged (default all, and the Arrhenius batch totals
+    printed); sv: (ADSolver, CudaSolver), default the module's."""
+    ad_, kc_ = sv or (ad, kc)
+    x, T, P, dt, h = a
+    B = x.shape[0]
+    far = away_from_balance(x, T, P)
+    for adapt in (False, True):
+        lab = "adaptive" if adapt else "frozen"
+        xo, ho = kc_.launch(*a, max_steps=max_steps)[:2]
+        cx, ch = rn(B, ad_.ns) / xo.clamp(min=1e-30) * (xo > 1e-25), rn(B) / ho     # log-weighted cotangents
+        _, _, _, _, g = ad_.vjp(*a, cx, ch, adapt=adapt, max_steps=max_steps)
+        for part, lmmask in (("x, T, P, dt, h and lm on reactions away from balance", far),
+                             ("lm on every reaction (balanced ones are rounding; not judged)", None)):
+            v = dict(x=x * rn(B, ad_.ns), T=T * 1e-2 * rn(B), P=P * 1e-2 * rn(B), dt=dt * 1e-2 * rn(B),
+                     h=h * 1e-2 * rn(B), lm=rn(B, ad_.nr) * 1e-2 * (far if lmmask is not None else 1.0))
+            if lmmask is None:
+                v.update({k: v[k] * 0.0 for k in ("x", "T", "P", "dt", "h")})
+            _, _, _, nok, dxo, dho = ad_.jvp(*a, v["x"], v["T"], v["P"], v["dt"], v["h"], dlm=v["lm"],
+                                             adapt=adapt, max_steps=max_steps)
+            lhs = (cx * dxo).sum(1) + ch * dho
+            terms = [(g[k] * v[k]).reshape(B, -1) for k in ("x", "T", "P", "dt", "h", "lm")]
+            rhs = sum(q.sum(1) for q in terms)
+            sc = torch.maximum((cx * dxo).abs().sum(1) + (ch * dho).abs(), sum(q.abs().sum(1) for q in terms))
+            rel = (lhs - rhs).abs() / sc
+            if judge is not None:
+                rel, nok = rel[judge], nok[judge]
+            rel = rel.nan_to_num(0.0).cpu().numpy()
+            if not rel.size:
+                print(f"INFO  dot products, {name}, {lab}: no judged cell", flush=True)
+                continue
+            text = (f"{rel.size} cells, steps mean {float(nok.mean()):.2f} max {int(nok.max())}; |<c,Jv> - <J^T c,v>| / "
+                    f"scale {pct(rel)}; p99 {np.quantile(rel, 0.99):.1e}")
+            if lmmask is None:
+                print(f"INFO  dot products, {name}, {lab}, {part}: {text}", flush=True)
+            else:
+                verdict(f"dot products, {name}, {lab}, {part}", np.quantile(rel, 0.99) <= 1e-6, text)
+    if judge is not None:
+        return
+    for adapt in (False, True):                 # the Arrhenius direction is global: the batch total
+        drc = rn(ad_.nr, 9) * 1e-3
+        zx, zb = torch.zeros_like(x), torch.zeros_like(T)
+        xo, ho, _, _, dxo, dho = ad_.jvp(*a, zx, zb, zb, zb, zb, drc=drc, adapt=adapt)
+        cx, ch = rn(B, ad_.ns) / xo.clamp(min=1e-30) * (xo > 1e-25), rn(B) / ho
+        _, _, _, _, g = ad_.vjp(*a, cx, ch, adapt=adapt)
+        l_, r_ = float(((cx * dxo).sum(1) + ch * dho).sum()), float((g["rc"] * drc).sum())
+        sc = float((cx * dxo).abs().sum() + (ch * dho).abs().sum())
+        print(f"INFO  dot products, {name}, Arrhenius table (every reaction), {'adaptive' if adapt else 'frozen'}: "
+              f"batch total {l_:.10e} vs {r_:.10e} (difference / sum |terms| {abs(l_ - r_) / sc:.1e})", flush=True)
 
 
 # ---------------------------------------------------------------------------------------------------------------- (e)
@@ -403,30 +446,37 @@ def directions():
 
 
 def status():
-    """A NaN input, a cell stopped by max_steps, a dt = 0 cell among ordinary ones; a cell below 300 K raises."""
+    """A NaN input, a cell stopped by max_steps and redone by the recovery, a dt = 0 cell among ordinary ones; a cell
+    below 300 K raises."""
     B = 64
     x0, T, P = yardstick(B, 31, 0.0)
     xs, hs, _, _ = kc(x0, T, P, full(B, 100.0), full(B, 1e-10))
     x, h, dt = xs.clone(), hs.clone(), full(B, 1.0)
     x[3, 5] = float("nan")
-    x[7], h[7], dt[7] = x0[7], 1e-10, 500.0                   # cold start: stops at max_steps 10
+    x[7], h[7], dt[7] = x0[7], 1e-10, 500.0                   # cold start: stops at max_steps 10, then recovered
     dt[11] = 0.0
     v = (xs * rn(B, ad.ns), T * 1e-2 * rn(B), P * 1e-2 * rn(B), full(B, 1e-2) * rn(B), h * 1e-2 * rn(B))
     cx, ch = rn(B, ad.ns), rn(B)
     ok = True
     for adapt in (False, True):
         xo, ho, done, nok, dxo, dho = ad.jvp(x, T, P, dt, h, *v, adapt=adapt, max_steps=10)
-        st_j = dict(ad.status)
+        st_j, fl_j = dict(ad.status), ad.flag.clone()
         _, _, _, _, g = ad.vjp(x, T, P, dt, h, cx, ch, adapt=adapt, max_steps=10)
         st_v = dict(ad.status)
+        ref = kc.launch(x, T, P, dt, h, max_steps=10)
+        st_k = dict(zip(KC.COUNTS, kc.count.tolist()[1:9]))
         good = torch.ones(B, dtype=torch.bool, device=dev)
         good[[3, 7]] = False
         fin = bool(torch.isfinite(dxo[good]).all()) and bool(torch.isfinite(g["x"][good]).all()) and bool(
-            torch.isfinite(g["lm"][good]).all()) and bool(torch.isfinite(g["rc"]).all())
-        flagged = ad.flag.nonzero().squeeze(1).tolist()
-        ok = ok and st_j == st_v and st_j["bad_input"] == 1 and st_j["unfinished"] == 1 and st_j["cold"] == 0 and (
-            st_j["nonfinite"] == 0) and 7 in flagged and 3 not in flagged and fin and not bool(done[7]) and bool(
-            done[11]) and bool(torch.isfinite(dxo[11]).all())
+            torch.isfinite(g["lm"][good]).all())
+        f7 = int(fl_j[7])                                     # 1 recovered (finite derivatives), 2 still failed (NaN)
+        d7 = [dxo[7], dho[7:8], g["x"][7], g["T"][7:8], g["P"][7:8], g["dt"][7:8], g["h"][7:8], g["lm"][7]]
+        c7 = all(bool(torch.isfinite(q).all()) for q in d7) if f7 == 1 else all(bool(torch.isnan(q).all()) for q in d7)
+        rc_ok = bool(torch.isfinite(g["rc"]).all()) if f7 == 1 else bool(torch.isnan(g["rc"]).all())
+        flagged = fl_j.nonzero().squeeze(1).tolist()
+        ok = ok and st_j == st_v == st_k and torch.equal(fl_j, ref[4]) and st_j["bad_input"] == 1 and (
+            st_j["unfinished"] == 1) and st_j["recomputed"] == 1 and st_j["cold"] == 0 and st_j["nonfinite"] == 0 and (
+            flagged == [7]) and fin and c7 and rc_ok and bool(done[11]) and bool(torch.isfinite(dxo[11]).all())
     T2 = T.clone()
     T2[0] = 250.0
     try:
@@ -435,10 +485,10 @@ def status():
     except ValueError:
         raised = True
     verdict("status: NaN input, max_steps, dt = 0, T < 300 K", ok and raised,
-            f"guard counts {st_j} (jvp) / {st_v} (vjp), flagged cells {flagged}: the NaN cell counted as bad input "
-            f"(not flagged), the stopped cell unfinished and flagged, every other cell's tangent and cotangents "
-            f"finite, "
-            f"the Arrhenius cotangent finite; the dt = 0 cell done; T < 300 K raises: {raised}")
+            f"counts {st_j} (jvp) / {st_v} (vjp) = CudaSolver's; flags {flagged} = launch's: the NaN cell counted as "
+            f"bad input (not flagged), the stopped cell unfinished, flagged and redone (flag {f7}: its derivatives "
+            f"{'finite' if f7 == 1 else 'NaN, and the Arrhenius cotangent NaN'}), every other cell's tangent and "
+            f"cotangents finite; the dt = 0 cell done; T < 300 K raises: {raised}")
 
 
 # ---------------------------------------------------------------------------------------------------------------- (f)
@@ -531,11 +581,73 @@ def window_reverse():
                 f"vs {tr:.10e} ({trel:.1e} of the sum of |terms|)")
 
 
+# ---------------------------------------------------------------------------------------------------------------- (j)
+def recovered():
+    """Cells the guard flags, redone with their derivatives on the recovery's path (dense pivoted Rodas3,
+    REC_STEPS x max_steps tries): forced by a small max_steps, or by an element-drift allowance of 0."""
+    B = 256
+    x0, T, P = yardstick(B, 51, 0.0)
+    xs, hs, _, _ = kc(x0, T, P, full(B, 100.0), full(B, 1e-10))          # settled states
+    cases = [("settled starts dt 1000 s, max_steps 3", (xs, T, P, full(B, 1e3), hs), 3, (ad, kc)),
+             ("cold starts dt 500 s, max_steps 60", (x0, T, P, full(B, 500.0), full(B, 1e-10)), 60, (ad, kc))]
+    drift0 = KC.DRIFT
+    KC.DRIFT = 0.0                                   # every rounding change of an element share is flagged
+    sz = (KA.ADSolver(net, dev), KC.CudaSolver(net, dev))
+    KC.DRIFT = drift0
+    xz, Tz, Pz = yardstick(1024, 2, 1.0)
+    cases.append(("scrambled 1 dex dt 500 s, drift allowance 0", (xz, Tz, Pz, full(1024, 500.0), full(1024, 1e-10)),
+                  4000, sz))
+    for name, a, ms, (ad_, kc_) in cases:
+        n = a[0].shape[0]
+        ref = kc_.launch(*a, max_steps=ms)
+        st_k = dict(zip(KC.COUNTS, kc_.count.tolist()[1:9]))
+        v = (a[0] * rn(n, ad_.ns), a[1] * 1e-2 * rn(n), a[2] * 1e-2 * rn(n), a[3] * 1e-2 * rn(n), a[4] * 1e-2 * rn(n))
+        dlm, drc, lm = rn(n, ad_.nr) * 1e-2, rn(ad_.nr, 9) * 1e-3, rn(n, ad_.nr) * 1e-2
+        cx, ch = rn(n, ad_.ns), rn(n)
+        j = ad_.jvp(*a, *v, dlm=dlm, drc=drc, max_steps=ms)
+        st_j, fl_j = dict(ad_.status), ad_.flag.clone()
+        g = ad_.vjp(*a, cx, ch, max_steps=ms)
+        st_v, fl_v = dict(ad_.status), ad_.flag.clone()
+        same = all(torch.equal(p, q) and torch.equal(p, w) for p, q, w in zip(ref[:4], j[:4], g[:4]))
+        flags = torch.equal(ref[4], fl_j) and torch.equal(ref[4], fl_v) and st_j == st_v == st_k
+        f0, f1, f2 = (ref[4] == k for k in range(3))
+        der = lambda m: [j[4][m], j[5][m]] + [g[4][k][m] for k in ("x", "T", "P", "dt", "h", "lm")]  # noqa: E731
+        fin = all(bool(torch.isfinite(q).all()) for q in der(f0 | f1))
+        nan = all(bool(torch.isnan(q).all()) for q in der(f2))
+        rc_ok = bool(torch.isnan(g[4]["rc"]).all()) if bool(f2.any()) else bool(torch.isfinite(g[4]["rc"]).all())
+        # the unflagged cells alone, as their own batch: per-cell bitwise the same (the redo leaves them unchanged)
+        i0 = f0.nonzero().squeeze(1)
+        sub = lambda q: q[i0]  # noqa: E731
+        ja = ad_.jvp(*map(sub, a), *map(sub, v), dlm=dlm[i0], drc=drc, max_steps=ms)
+        ga = ad_.vjp(*map(sub, a), cx[i0], ch[i0], max_steps=ms)
+        alone = all(torch.equal(p[i0], q) for p, q in zip(j, ja)) and all(
+            torch.equal(g[4][k][i0], ga[4][k]) for k in ("x", "T", "P", "dt", "h", "lm"))
+        # the redone cells with log multipliers (the call with lm runs the recovery too)
+        jl = ad_.jvp(*a, *v, lm=lm, dlm=dlm, max_steps=ms)
+        fl_l = ad_.flag.clone()
+        gl = ad_.vjp(*a, cx, ch, lm=lm, max_steps=ms)
+        lm_ok = torch.equal(fl_l, ad_.flag) and torch.equal(jl[0], gl[0]) and bool((fl_l > 0).sum() > 0) and bool(
+            torch.isfinite(jl[4][fl_l == 1]).all()) and bool(torch.isnan(jl[4][fl_l == 2]).all())
+        verdict(f"recovered cells, {name}: primal, flags, NaN", same and flags and fin and nan and rc_ok and alone and lm_ok,
+                f"{n} cells, counts {st_j}: jvp and vjp (x, h, done, steps) bitwise CudaSolver.launch {same}, flags and "
+                f"counts equal {flags}; derivatives finite on the {int(f0.sum())} unflagged and {int(f1.sum())} "
+                f"recovered cells {fin}, NaN on the {int(f2.sum())} still failed {nan} (the Arrhenius cotangent "
+                f"{'NaN' if bool(f2.any()) else 'finite'} {rc_ok}); the unflagged cells as their own batch bitwise "
+                f"{alone}; with log multipliers (redone cells {int((fl_l > 0).sum())}) jvp and vjp agree on flags and "
+                f"primal, recovered finite, still failed NaN {lm_ok}")
+        if ad_ is ad:           # the recovered cells against the ordinary path on the same cells and directions
+            st = gen.get_state()
+            ref_ = fd_case(f"the same cells on the ordinary path (max_steps 4000), {name}", a, 4000, judge=f1, info=True)
+            gen.set_state(st)
+            fd_case(f"recovered cells, {name}", a, ms, judge=f1, ref=ref_)
+        dots(f"recovered cells, {name}", a, ms, judge=f1, sv=(ad_, kc_))
+
+
 def main():
     t0 = time.time()
     print(f"kernels built; jvp {ad.wpb['jvp']} warps per block, vjp {ad.wpb['vjp']}", flush=True)
     for f in (parity, vs_reference, finite_differences, dot_tests, determinism, directions, status, window,
-              window_reverse):
+              window_reverse, recovered):
         f()
         print(f"  ({time.time() - t0:.0f} s)", flush=True)
     print(f"{sum(results)} of {len(results)} cases PASS", flush=True)
