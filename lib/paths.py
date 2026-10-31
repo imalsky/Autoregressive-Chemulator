@@ -16,8 +16,8 @@ GCM_TP = DATA / "ref/gcm_tp.npz"                         # GCM T-P occupancy of 
 GEN = DATA / "ref/never_rerun"                           # used row lists and SEEDs (new data must avoid them)
 CHAINS_CLEAN = DATA / "truth/chains"                     # clean training chains (train_a, train_b)
 PANELS = DATA / "truth/panels/decision"                  # the decision set's test-set histories
-DESIGNS = DATA / "benches/designs"                       # score designs: decision/ (panels S, L, P and readouts;
-                                                         # bench/score_design.py)
+DESIGNS = DATA / "benches/designs"                       # test designs: decision/P (panel P's rows, starts and
+                                                         # forcing; bench/kintest.py and the checks)
 QUAL = DATA / "truth/qual"                               # the current-domain VULCAN truth set (manifest.json)
 YARD = DATA / "benches/yardstick"                        # mini-chem yardstick: design/, panel/, run/
 # VULCAN's NCHO network and NASA-9 files, read as data (env VULCAN_THERMO; default: the generator checkout beside this
