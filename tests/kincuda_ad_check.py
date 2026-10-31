@@ -26,7 +26,7 @@ judged).
 (f) Several tangent directions in one jvp call: bitwise equal to one call per direction.
 (g) Status: a NaN input, a cell stopped by max_steps (flagged and redone on the recovery's path: finite derivatives if
     recovered, NaN if still failed) and a dt = 0 cell among ordinary cells (counts and flags as CudaSolver's, every
-    other derivative finite); a cell below 300 K raises.
+    other derivative finite); a cell below 300 K is counted and check() raises.
 (h) A 30-call panel-P window: carried tangents (x, h; adaptive) against central differences of the whole window.
 (i) The same kind of window in reverse mode (checkpoints of x and h at the call boundaries, each call's vjp with the
     cotangents of x and h carried backwards) against the carried tangents: dot products per path, both contracts.
@@ -447,7 +447,7 @@ def directions():
 
 def status():
     """A NaN input, a cell stopped by max_steps and redone by the recovery, a dt = 0 cell among ordinary ones; a cell
-    below 300 K raises."""
+    below 300 K is counted and check() raises."""
     B = 64
     x0, T, P = yardstick(B, 31, 0.0)
     xs, hs, _, _ = kc(x0, T, P, full(B, 100.0), full(B, 1e-10))
@@ -479,16 +479,19 @@ def status():
             flagged == [7]) and fin and c7 and rc_ok and bool(done[11]) and bool(torch.isfinite(dxo[11]).all())
     T2 = T.clone()
     T2[0] = 250.0
+    ad.jvp(xs, T2, P, full(B, 1.0), hs, *v)                     # counted on the device, raised by check()
+    cold = ad.status["cold"]
     try:
-        ad.jvp(xs, T2, P, full(B, 1.0), hs, *v)
+        ad.check()
         raised = False
     except ValueError:
         raised = True
+    raised = raised and cold == 1
     verdict("status: NaN input, max_steps, dt = 0, T < 300 K", ok and raised,
             f"counts {st_j} (jvp) / {st_v} (vjp) = CudaSolver's; flags {flagged} = launch's: the NaN cell counted as "
             f"bad input (not flagged), the stopped cell unfinished, flagged and redone (flag {f7}: its derivatives "
             f"{'finite' if f7 == 1 else 'NaN, and the Arrhenius cotangent NaN'}), every other cell's tangent and "
-            f"cotangents finite; the dt = 0 cell done; T < 300 K raises: {raised}")
+            f"cotangents finite; the dt = 0 cell done; T < 300 K counted and check() raises: {raised}")
 
 
 # ---------------------------------------------------------------------------------------------------------------- (f)

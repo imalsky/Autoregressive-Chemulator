@@ -1553,8 +1553,9 @@ class ADSolver:
     status: the counts of kincuda.COUNTS (recomputed = flagged by the guard); flag [B] int32: 0 passed the guard, 1
     recovered, 2 still failed after the recovery (NaN derivatives; with an rc cotangent the reduction over cells is
     NaN too); drift: the element-drift allowance (kincuda's, so the flags are CudaSolver's with the same drift).
-    Cells below 300 K raise. Calls run one at a time on torch's current stream (the rate and record scratch
-    are shared)."""
+    Nothing is read back during a call: status reads the last call's counts (one small copy); cells below 300 K are
+    counted, not stepped, and check() raises for them, as CudaSolver.check. Calls run one at a time on torch's current
+    stream (the rate and record scratch are shared)."""
 
     def __init__(self, net, device, cap=CAP, drift=None):
         self.dev = torch.device(device)
@@ -1610,7 +1611,8 @@ class ADSolver:
                         ctypes.c_int(ext["gt"].shape[0])]
         self._atoms, self._didx = g(tab["atoms"]), g(tab["didx"], np.int16)
         self.count = torch.zeros(10, dtype=torch.int32, device=self.dev)
-        self.status, self.flag = {}, None
+        self.total = torch.zeros(10, dtype=torch.int32, device=self.dev)
+        self.flag = None
 
     def _prep(self, x, T, P, dt, h, lm, rc, max_steps):
         if not all(a.is_cuda and a.dtype == torch.float64 for a in (x, T, P, dt, h)) or x.shape[1] != self.ns:
@@ -1637,12 +1639,21 @@ class ADSolver:
         return redo, lst
 
     def _finish(self, redo):
-        """The counts in status, the per-cell flag; raises for cells below T_MIN."""
-        n = self.count.tolist()
-        if n[2]:
-            raise ValueError(f"{n[2]} cells below {KC.T_MIN:g} K: outside the chemistry solver's domain")
-        self.status = dict(zip(KC.COUNTS, n[1:9]))
+        """The counts added to self.total and the per-cell flag, on the device."""
+        self.total += self.count
         self.flag = redo
+
+    @property
+    def status(self):
+        """The last call's counts (one small copy from the device)."""
+        return dict(zip(KC.COUNTS, self.count[1:9].tolist()))
+
+    def check(self):
+        """The counts since construction (one small copy); raises if any cell was below T_MIN."""
+        n = dict(zip(KC.COUNTS, self.total[1:9].tolist()))
+        if n["cold"]:
+            raise ValueError(f"{n['cold']} cells below {KC.T_MIN:g} K: outside the chemistry solver's domain")
+        return n
 
     def jvp(self, x, T, P, dt, h, dx, dT, dP, ddt, dh, lm=None, dlm=None, rc=None, drc=None, adapt=True, rtol=1e-3,
             atol=1e-18, max_steps=4000):
