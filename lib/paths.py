@@ -11,7 +11,7 @@ from pathlib import Path
 HARNESS = Path(__file__).resolve().parents[1]           # this repository
 LIB = HARNESS / "lib"
 DATA = Path(os.environ.get("CHEM_DATA") or HARNESS / "data")   # all project data (git-ignored)
-RAW_CLEAN = DATA / "raw/raw_clean"                       # packed clean-design VULCAN runs (build_kin.py)
+RAW_CLEAN = DATA / "raw/raw_clean"                       # packed clean-design VULCAN runs (the only copy)
 GCM_TP = DATA / "ref/gcm_tp.npz"                         # GCM T-P occupancy of the published GCMs (the envelope env_any)
 GEN = DATA / "ref/never_rerun"                           # used row lists and SEEDs (new data must avoid them)
 CHAINS_CLEAN = DATA / "truth/chains"                     # clean training chains (train_a, train_b)
