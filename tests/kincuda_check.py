@@ -10,14 +10,15 @@ atol 1e-18, order 3). Each solver advances its own state from the same inputs.
       dt 0.01 / 1 / 50 / 500 s;
     - a 2,000-call chain: decision panel P's 256 paths x 4 offsets (1,024 cells), T, P and dt of the recorded forcing
       every call (mixing events not applied), step sizes carried from call to call.
-(b) Guard. A cell with a NaN input is counted and left non-finite; a cell forced to fail (max_steps 10 for a cold start
-    at dt 500 s among settled cells) and, with the rounding allowance DRIFT set to 0, the cells whose element shares
-    move by more than the clamping allowance are recomputed: their kernel result is replaced, within 1e-6 dex of a
-    separate library call (the library path is not bitwise reproducible: index_add accumulates with atomics); a cell
-    below 300 K raises.
+(b) Guard and recovery. A cell with a NaN input is counted, not recomputed, and left non-finite; a cell forced to fail
+    (max_steps 10 for a cold start at dt 500 s among settled cells) and, with the rounding allowance DRIFT set to 0,
+    the cells whose element shares move by more than the clamping allowance are recomputed on the device: within
+    1e-6 dex of a separate library call with the recovery's tries (REC_STEPS x max_steps; the library path is not
+    bitwise reproducible: index_add accumulates with atomics), counted as recovered or still failed, the other cells
+    bitwise those of a solver that flags none; a cell below 300 K is counted and check() raises.
 (c) Paired timing: GCM-like forcing (panel P's paths at staggered offsets) at 768 and 32,768 cells, 150 library warm-up
     calls, then 50 calls in which both solvers get the same state, T, P, dt and h (state advanced by the library's
-    output); whole calls including rates, the guard and the host sync.
+    output); whole calls including rates, the guard and the recovery kernel, each followed by a device sync.
     taskset -c <cpus> $PY tests/kincuda_check.py <VULCAN thermo folder: NCHO_thermo_network.txt, NASA9/>
 (about 2 min on an idle GPU with a warm compile cache). Exit 0 = every case PASS."""
 import argparse
@@ -173,18 +174,17 @@ def main():
 
     x, h, dt = xs.clone(), hs.clone(), full(B, 1.0)
     x[7], h[7], dt[7] = x0[7], 1e-10, 500.0                             # cell 7: cold start at 500 s
-    yk = kc.launch(x, T, P, dt, h, max_steps=10)[0]
-    y, _, d, n = kc(x, T, P, dt, h, max_steps=10)
+    y, _, d, n, flag = kc.launch(x, T, P, dt, h, max_steps=10)
     fb = dict(kc.fallback)
     i = torch.tensor([7], device=dev)
-    yr, _, dr, nr = kc.library(x[i], T[i], P[i], dt[i], h[i], max_steps=10)
+    yr, _, dr, nr = kc.library(x[i], T[i], P[i], dt[i], h[i], max_steps=10 * KC.REC_STEPS)
     e = float(floored(y[i], yr, gi).max())
-    ok = (fb["unfinished"] == 1 and fb["recomputed"] == 1 and not bool(torch.equal(y[i], yk[i])) and e <= TOL
-          and bool(torch.equal(n[i], nr)) and bool(torch.equal(d[i], dr))
+    ok = (fb["unfinished"] == 1 and fb["recomputed"] == 1 and fb["recovered"] + fb["still_failed"] == 1 and e <= TOL
+          and bool(torch.equal(n[i], nr)) and bool(torch.equal(d[i], dr)) and int(flag[7]) == (1 if bool(dr) else 2)
           and bool(d[torch.arange(B, device=dev) != 7].all()))
     verdict("guard: forced failure (max_steps 10)", ok,
-            f"counts {fb}; cell 7 replaced by the library path's result ({e:.1e} dex from a separate library call, "
-            f"{int(nr)} accepted steps, finished {bool(dr)})")
+            f"counts {fb}; cell 7 recomputed with {10 * KC.REC_STEPS} tries ({e:.1e} dex from a separate library call "
+            f"with those tries, {int(nr)} accepted steps, finished {bool(dr)}, flag {int(flag[7])})")
 
     drift0 = KC.DRIFT
     KC.DRIFT = 0.0                                   # every rounding change of an element share is flagged
@@ -192,26 +192,27 @@ def main():
     KC.DRIFT = drift0
     x0, T, P = yardstick(256, 2, 1.0)
     args = (x0, T, P, full(256, 500.0), full(256, 1e-10))
-    yk, _, _, _, redo = kz.launch(*args)
-    y, _, _, _ = kz(*args)
+    y, _, _, _, flag = kz.launch(*args)
     fb = dict(kz.fallback)
-    i = redo.nonzero().squeeze(1)
-    yr = kz.library(x0[i], T[i], P[i], full(len(i), 500.0), full(len(i), 1e-10))[0]
+    yk, _, _, _, flag0 = kc.launch(*args)                               # the same call, nothing flagged
+    i, o = (flag > 0).nonzero().squeeze(1), flag == 0
+    yr = kz.library(x0[i], T[i], P[i], full(len(i), 500.0), full(len(i), 1e-10), max_steps=4000 * KC.REC_STEPS)[0]
     e = float(floored(y[i], yr, gi).max())
-    ok = (fb["drift"] > 0 and fb["recomputed"] == fb["drift"] and e <= TOL
-          and not bool((y[i] == yk[i]).all(1).any())
-          and bool(torch.equal(y[torch.logical_not(redo)], yk[torch.logical_not(redo)])))
-    verdict("guard: element drift (allowance 0)", ok, f"counts {fb}; the flagged cells replaced by the library path's "
-                                                      f"result ({e:.1e} dex from a separate library call), the others "
-                                                      f"keep the kernel's result")
+    ok = (fb["drift"] > 0 and fb["recomputed"] == fb["drift"] and fb["recovered"] + fb["still_failed"] == fb["drift"]
+          and e <= TOL and int(flag0.sum()) == 0 and bool(torch.equal(y[o], yk[o])))
+    verdict("guard: element drift (allowance 0)", ok,
+            f"counts {fb}; the flagged cells recomputed on the device ({e:.1e} dex from a separate library call; still "
+            f"failing an allowance of 0 is expected), the others bitwise the kernel's result")
 
     T2 = T.clone()
     T2[0] = 250.0
+    y, _, d, _ = kc(*((x0, T2) + args[2:]))
     try:
-        kc(*((x0, T2) + args[2:]))
-        verdict("guard: T < 300 K raises", False, "no error")
+        kc.check()
+        verdict("guard: T < 300 K raises in check()", False, "no error")
     except ValueError as e:
-        verdict("guard: T < 300 K raises", True, f"ValueError: {e}")
+        verdict("guard: T < 300 K raises in check()", kc.fallback["cold"] == 1 and not bool(d[0]),
+                f"cell 0 not stepped; ValueError: {e}")
 
     # (c) paired timing
     for B in (768, 32768):

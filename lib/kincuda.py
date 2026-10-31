@@ -28,14 +28,21 @@ waits for the stiffest one. Results do not depend on the batch size or order.
 The CUDA source is generated from the network at construction and compiled once with NVRTC through ctypes (the library
 of torch's CUDA wheels); the kernel runs on torch's current stream.
 
-Guard: after the call a second small kernel checks every cell (new state finite, call finished, each element's share of
-the atoms unchanged up to rounding and what the clamping of accepted small negatives can add) and counts the failures;
-the host reads the counts (one small copy per call) and recomputes the flagged cells from their inputs by the library
-path (TorchRates + rodas3_step + advance_compact, same arguments). The element test checks the linear solves:
-E^T W = E^T / (gamma h) for the element matrix E (E^T S = 0), so every stage moves the element budget by gamma h E^T
-(residual of its solve); a factor without row exchanges that has lost accuracy shows up there. Cells with non-finite
-inputs are counted, not recomputed (the library returns a non-finite state for them too); cells below 300 K are not
-stepped and the call raises, as TorchRates does. The counts of the last call are in CudaSolver.fallback.
+Guard and recovery: after the call a small kernel checks every cell (new state finite, call finished, each element's
+share of the atoms unchanged up to rounding and what the clamping of accepted small negatives can add), counts the
+failures and lists the failed cells; a third kernel recomputes the listed cells from their inputs (x, T, P, dt and the
+starting h, which the call leaves unchanged), one cell per block of 32 W threads: the same rates, S v and Jacobian
+streams, Rodas3 stages, step control and tolerances, with W = I / (gamma h) - J formed densely (no Sherman-Morrison
+term; in shared memory when it fits, else in global memory) and factored by the cell's first warp with threshold partial
+pivoting (a row exchange only where the diagonal entry is below PIVTAU = 0.1 of the column's largest; plain partial
+pivoting loses the trace species' accuracy at the scale of atol), and REC_STEPS times the tries. It applies the guard's
+test to its result, writes it over the call's and counts the cell as recovered or still failed. It returns at once when
+no cell is listed. Nothing is read back to the host during a call: the counts stay on the device (CudaSolver.fallback
+and check() read them). Each cell's arithmetic depends only on its inputs, so results are bitwise reproducible on one
+GPU whatever the batch order. The element test checks the linear solves: E^T W = E^T / (gamma h) for the element matrix
+E (E^T S = 0), so every stage moves the element budget by gamma h E^T (residual of its solve); a factor without row
+exchanges that has lost accuracy shows up there. Cells with non-finite inputs are counted, not recomputed (they come
+back non-finite); cells below 300 K are not stepped and are counted, and check() raises for them, as TorchRates does.
 """
 import ctypes
 import os
@@ -51,6 +58,8 @@ import kinvulcan as KV
 
 T_MIN = 300.0   # K, as TorchRates
 DRIFT = 1e-6    # relative change of an element's share of the atoms left to rounding (in-domain one-call worst 3e-8)
+REC_STEPS = 2   # the recovery's tries, in units of the call's max_steps
+COUNTS = ("bad_input", "cold", "nonfinite", "unfinished", "drift", "recomputed", "recovered", "still_failed")
 
 
 NTAIL = 32      # rows of the trailing block factored in registers (at most 32)
@@ -260,10 +269,13 @@ def tables(net, w):
     colof = np.array([j for (i, j) in lead], np.uint8)
     diag = np.array([slot[(i, i)] for i in range(ns)], np.uint16)
     nasa = np.concatenate([np.asarray(net.lo)[perm], np.asarray(net.hi)[perm]], 0)
+    didx = np.zeros(nnz, np.uint16)           # dense position of each slot (recovery)
+    for (i, j), s in slot.items():
+        didx[s] = i * ns + j
     return dict(ns=ns, nr=nr, nnz=nnz, k0=k0, tb0=tb0, w=w, P=P, perm=np.array(perm, np.int32), rx=rx, rc=rc, rf=rf,
                 law=law, nasa=nasa, npart=npart, xp=np.array(xp, np.uint8), sst=sst, jt=jt, jround=jround,
                 jsmax=jsmax, nfix=len(fix), lu=np.array(lu, np.uint64), optr=optr, blen=blen, vs=vs, smap=smap,
-                rowptr=rowptr, colof=colof, diag=diag, atoms=np.asarray(net.atoms, float), wd=w_)
+                rowptr=rowptr, colof=colof, diag=diag, didx=didx, atoms=np.asarray(net.atoms, float), wd=w_)
 
 
 _SRC = r"""
@@ -297,6 +309,11 @@ _SRC = r"""
 #define O_RX $o_rx
 #define O_XP $o_xp
 #define O_BLEN $o_blen
+#define WSH $wsh
+#define VR $vr
+#define RPD $rpd
+#define PERWR $perwr
+#define PIVTAU 0.1
 // column k of the sparse leading part has L entries in the leading rows (LPRE), L entries in the trailing rows
 // (LTAIL), U entries (UPRE); trailing column K0 + j has U entries in the leading rows (UTAIL(j)); VSA(q), VSB(q): the
 // widest forward and reverse side of round q of NL reactions
@@ -710,15 +727,12 @@ extern "C" __global__ void __launch_bounds__(NL * CPB, 1) call(
   }
 }
 
-// Checks of each cell after the call (one thread per cell, network species order); counts in count[1..6]: T < TMIN,
-// else non-finite input, else: non-finite state, unfinished, element drift, recompute (redo = 1).
-extern "C" __global__ void guard(const double* __restrict__ x0, const double* __restrict__ Ta,
-    const double* __restrict__ Pa, const double* __restrict__ dta, const double* __restrict__ xout,
-    const int* __restrict__ doneo, const double* __restrict__ noko, const double* __restrict__ atoms,
-    int* __restrict__ redo, int* __restrict__ count, int B, double atol)
+// The guard's test of one cell (network species order): 1 T < TMIN, 2 non-finite input, else the bits 4 non-finite
+// state, 8 unfinished call, 16 element drift (0: passed).
+__device__ int check_cell(const double* __restrict__ x0, const double* __restrict__ Ta, const double* __restrict__ Pa,
+                          const double* __restrict__ dta, const double* xout, int done, double nok,
+                          const double* __restrict__ atoms, double atol, int cell)
 {
-  const int cell = blockIdx.x * blockDim.x + threadIdx.x;
-  if (cell >= B) return;
   double e0[NEL], e1[NEL], p = 0.0;   // atoms of each element in the input and the new state
   #pragma unroll
   for (int e = 0; e < NEL; e++) { e0[e] = 0.0; e1[e] = 0.0; }
@@ -731,24 +745,291 @@ extern "C" __global__ void guard(const double* __restrict__ x0, const double* __
     for (int e = 0; e < NEL; e++) { e0[e] += atoms[i * NEL + e] * a; e1[e] += atoms[i * NEL + e] * b; }
   }
   const double Tc = Ta[cell], nd = Pa[cell] / (KBOLTZ * Tc);
+  if (Tc < TMIN) return 1;
+  if (!(isfinite(p) && isfinite(Tc) && isfinite(nd) && isfinite(dta[cell]))) return 2;
+  double s0 = 0.0, s1 = 0.0;
+  #pragma unroll
+  for (int e = 0; e < NEL; e++) { s0 += e0[e]; s1 += e1[e]; }
+  bool drift = false;   // share moved beyond rounding (DRIFT) and what clamping accepted negatives can add
+  #pragma unroll
+  for (int e = 0; e < NEL; e++)
+    drift = drift || fabs(e1[e] / s1 - e0[e] / s0) > DRIFT * e0[e] / s0 + 2.0 * atol * nok * ETOT / s0;
+  return (xfin ? 0 : 4) | (done ? 0 : 8) | (drift ? 16 : 0);
+}
+
+// Checks of each cell after the call (one thread per cell); counts in count[1] to count[6]: non-finite input, T < TMIN,
+// else: non-finite state, unfinished, element drift, recompute. A cell to recompute gets redo = 1 and is appended to
+// list (the first count[6] entries; their order is not deterministic, the cells' results do not depend on it).
+extern "C" __global__ void guard(const double* __restrict__ x0, const double* __restrict__ Ta,
+    const double* __restrict__ Pa, const double* __restrict__ dta, const double* __restrict__ xout,
+    const int* __restrict__ doneo, const double* __restrict__ noko, const double* __restrict__ atoms,
+    int* __restrict__ redo, int* __restrict__ list, int* __restrict__ count, int B, double atol)
+{
+  const int cell = blockIdx.x * blockDim.x + threadIdx.x;
+  if (cell >= B) return;
+  const int c = check_cell(x0, Ta, Pa, dta, xout, doneo[cell], noko[cell], atoms, atol, cell);
   int r = 0;
-  if (Tc < TMIN) atomicAdd(count + 2, 1);
-  else if (!(isfinite(p) && isfinite(Tc) && isfinite(nd) && isfinite(dta[cell]))) atomicAdd(count + 1, 1);
+  if (c == 1) atomicAdd(count + 2, 1);
+  else if (c == 2) atomicAdd(count + 1, 1);
   else {
-    double s0 = 0.0, s1 = 0.0;
-    #pragma unroll
-    for (int e = 0; e < NEL; e++) { s0 += e0[e]; s1 += e1[e]; }
-    bool drift = false;   // share moved beyond rounding (DRIFT) and what clamping accepted negatives can add
-    #pragma unroll
-    for (int e = 0; e < NEL; e++)
-      drift = drift || fabs(e1[e] / s1 - e0[e] / s0) > DRIFT * e0[e] / s0 + 2.0 * atol * noko[cell] * ETOT / s0;
-    if (!xfin) atomicAdd(count + 3, 1);
-    if (!doneo[cell]) atomicAdd(count + 4, 1);
-    if (drift) atomicAdd(count + 5, 1);
-    r = (!xfin || !doneo[cell] || drift) ? 1 : 0;
-    if (r) atomicAdd(count + 6, 1);
+    if (c & 4) atomicAdd(count + 3, 1);
+    if (c & 8) atomicAdd(count + 4, 1);
+    if (c & 16) atomicAdd(count + 5, 1);
+    if (c) { r = 1; list[atomicAdd(count + 6, 1)] = cell; }
   }
   redo[cell] = r;
+}
+
+// Dense LU of A (row-major NS x NS) on one warp with threshold partial pivoting, in place: row k is exchanged with the
+// row of the largest |entry| of column k (ties to the lower row; non-finite entries are never chosen) only when |W_kk|
+// is below PIVTAU times that entry or not finite; unit L below the diagonal, U on and above it; pr[i] = the row of the
+// original A now in row i; dinv = 1 / U_ii.
+__device__ __forceinline__ void dense_lu(double* A, double* dinv, int* pr, int lane) {
+  for (int i = lane; i < NS; i += 32) pr[i] = i;
+  __syncwarp();
+  for (int k = 0; k < NS; k++) {
+    double best = -1.0;
+    int bi = NS;
+    for (int i = k + lane; i < NS; i += 32) {
+      const double a = fabs(A[i * NS + k]);
+      if (a > best) { best = a; bi = i; }
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+      const double ob = __shfl_xor_sync(FULL, best, o);
+      const int oi = __shfl_xor_sync(FULL, bi, o);
+      if (ob > best || (ob == best && oi < bi)) { best = ob; bi = oi; }
+    }
+    if (bi != NS && bi != k && !(fabs(A[k * NS + k]) >= PIVTAU * best)) {
+      for (int j = lane; j < NS; j += 32) {
+        const double a = A[k * NS + j];
+        A[k * NS + j] = A[bi * NS + j];
+        A[bi * NS + j] = a;
+      }
+      if (lane == 0) { const int t = pr[k]; pr[k] = pr[bi]; pr[bi] = t; }
+    }
+    __syncwarp();
+    const double dk = 1.0 / A[k * NS + k];
+    if (lane == 0) dinv[k] = dk;
+    for (int i = k + 1 + lane; i < NS; i += 32) {
+      const double l = A[i * NS + k] * dk;
+      A[i * NS + k] = l;
+      for (int j = k + 1; j < NS; j++) A[i * NS + j] -= l * A[k * NS + j];
+    }
+    __syncwarp();
+  }
+}
+
+// y <- A^-1 y on one warp with the factors of dense_lu. Lane l holds rows l + 32 p.
+__device__ __forceinline__ void dense_solve(const double* A, const double* dinv, const int* pr, double* y, int lane) {
+  double a[RPD];
+  #pragma unroll
+  for (int p = 0; p < RPD; p++) a[p] = lane + 32 * p < NS ? y[pr[lane + 32 * p]] : 0.0;
+  #pragma unroll
+  for (int k = 0; k < NS - 1; k++) {                   // unit L
+    const double yk = __shfl_sync(FULL, a[k >> 5], k & 31);
+    #pragma unroll
+    for (int p = k >> 5; p < RPD; p++) {
+      const int i = lane + 32 * p;
+      if (i > k && i < NS) a[p] -= A[i * NS + k] * yk;
+    }
+  }
+  #pragma unroll
+  for (int k = NS - 1; k > 0; k--) {                   // U
+    const double zk = __shfl_sync(FULL, a[k >> 5] * dinv[k], k & 31);
+    #pragma unroll
+    for (int p = 0; p <= (k >> 5); p++)
+      if (lane + 32 * p < k) a[p] -= A[(lane + 32 * p) * NS + k] * zk;
+  }
+  __syncwarp();
+  #pragma unroll
+  for (int p = 0; p < RPD; p++) if (lane + 32 * p < NS) y[lane + 32 * p] = a[p] * dinv[lane + 32 * p];
+  __syncwarp();
+}
+
+// Recomputes the listed cells (one cell per block of NL threads; persistent blocks over the first count[6] entries of
+// list) from their inputs with max_steps tries: the call kernel's rates, S v and Jacobian streams, stages and step
+// control, with the dense W = I / (gamma h) - Jn - w 1^T factored by dense_lu on the first warp; writes the result over
+// the call's (xout, hio, doneo, noko), sets redo to 1 (the result passes the guard's test) or 2 and counts it in
+// count[7] / count[8]. Returns at once when the list is empty.
+extern "C" __global__ void __launch_bounds__(NL, 1) recover(
+    const double* __restrict__ x0, const double* __restrict__ Ta, const double* __restrict__ Pa,
+    const double* __restrict__ dta, const double* __restrict__ hin, double* xout, double* hio, int* doneo,
+    double* noko, int* redo, const int* __restrict__ list, int* count, double rtol, double atol, int max_steps,
+    const int* __restrict__ perm, const unsigned* __restrict__ blob, const double* __restrict__ rc,
+    const int* __restrict__ rf, const double* __restrict__ nasa, double* scratch, const unsigned* __restrict__ sst,
+    const u64* __restrict__ jt, const u16* __restrict__ didx, const double* __restrict__ atoms, int sround, int jround)
+{
+  const int nfl = count[6];
+  if ((int)blockIdx.x >= nfl) return;
+  extern __shared__ double smem[];
+  unsigned* tb32 = (unsigned*)(smem + PERWR);
+  for (int i = threadIdx.x; i < TBYTES / 4; i += blockDim.x) tb32[i] = blob[i];
+  __syncthreads();
+  const u8* tb = (const u8*)tb32;
+  Tab T;
+  T.smap = (const u16*)(tb + O_SMAP); T.rowptr = (const u16*)(tb + O_ROWPTR); T.diag = (const u16*)(tb + O_DIAG);
+  T.colof = tb + O_COLOF; T.rx = tb + O_RX; T.xp = tb + O_XP; T.blen = tb + O_BLEN;
+  const int cl = threadIdx.x, lane = cl & 31;
+  double* kf = scratch + (size_t)blockIdx.x * (2 * NR + 2 + (WSH ? 0 : NS * NS));
+  double* kr = kf + NR;
+  double* Wd = WSH ? smem : kf + 2 * NR + 2;   // the dense matrix W
+  double *dinv = smem + (WSH ? NS * NS : 0), *n = dinv + NS, *v = n + NS + 1, *N = v + VR, *Y = N + NS, *F = Y + NS,
+         *u = F + NS, *K1 = u + NS, *K2 = K1 + NS, *K3 = K2 + NS, *K4 = K3 + NS, *part = K4 + NS;
+  int* pr = (int*)(part + NPART);
+  int* nextq = pr + NS;
+  if (cl == 0) kf[2 * NR] = 0.0;              // the zero rate of the Jacobian's padding words
+  int q = blockIdx.x;
+  while (q < nfl) {
+    const int cell = list[q];
+    const double Tc = Ta[cell], dt = dta[cell], nd = Pa[cell] / (KBOLTZ * Tc);
+    for (int i = cl; i < NS; i += NL) N[i] = x0[(size_t)cell * NS + perm[i]];
+    CSYNC(0);
+    double p = 0.0;
+    for (int i = lane; i < NS; i += 32) p += N[i];
+    const bool fin = isfinite(wsum(p)) && isfinite(Tc) && isfinite(nd) && isfinite(dt), cold = Tc < TMIN;
+    if (fin && !cold) {   // rate coefficients, as the call kernel
+      const double lT = log(Tc), iT = 1.0 / Tc, lKT = log(KBOLTZ * Tc / P0BAR);
+      double* g = v;
+      const double* cf = nasa + (Tc < 1000.0 ? 0 : NS * 9);
+      for (int i = cl; i < NS; i += NL) {
+        const double* a = cf + 9 * i;
+        const double T2 = Tc * Tc, T3 = T2 * Tc, T4 = T3 * Tc;
+        const double hh = -a[0] * iT * iT + a[1] * lT * iT + a[2] + a[3] * Tc / 2 + a[4] * T2 / 3 + a[5] * T3 / 4
+                          + a[6] * T4 / 5 + a[7] * iT;
+        const double ss = -a[0] * iT * iT / 2 - a[1] * iT + a[2] * lT + a[3] * Tc + a[4] * T2 / 2 + a[5] * T3 / 3
+                          + a[6] * T4 / 4 + a[8];
+        g[i] = hh - ss;
+      }
+      if (cl == 0) g[NS] = 0.0;
+      CSYNC(0);
+      for (int r = cl; r < NR; r += NL) {
+        const int fl = rf[r];
+        const double k = law(rc + RCW * r, fl, Tc, lT, iT, nd);
+        const u8* x = T.rx + 6 * r;
+        const double dg = g[x[3]] + g[x[4]] + g[x[5]] - g[x[0]] - g[x[1]] - g[x[2]];
+        const double c3 = (fl & 4) ? nd : 1.0;
+        kf[r] = k * c3;
+        kr[r] = $kr;
+      }
+    }
+    CSYNC(0);
+    double h = fmax(fmin(hin[cell], dt), 1e-12), t = 0.0, nok = 0.0;
+    int it = (dt > 0.0 && fin && !cold) ? 0 : max_steps;
+    while (it < max_steps && t < dt * (1.0 - 1e-14)) {
+      const double ha = fmin(h, dt - t), igh = 1.0 / (0.5 * ha), ih = 1.0 / ha;
+      const double ntot = rhs(N, F, u, n, v, part, kf, kr, nd, T, sst, sround, lane, cl, 0);
+      for (int s = cl; s < NS * NS; s += NL) Wd[s] = 0.0;
+      CSYNC(0);
+      {   // W = -Jn: the call kernel's term streams, written to the dense positions of the slots
+        const unsigned* jw = (const unsigned*)jt;
+        const u16* jsl = (const u16*)(jw + jround * NL) + cl * JSMAX;
+        double acc = 0.0;
+        int ne = 0;
+        #pragma unroll 4
+        for (int qq = 0; qq < jround; qq++) {
+          const unsigned w = __ldg(jw + qq * NL + cl);
+          const double pq = kf[w & ${j_km}u] * n[(w >> $j_a) & ${j_sm}u] * n[(w >> $j_b) & ${j_sm}u];
+          const double cf = ((w >> $j_x2) & 1u) ? (((w >> $j_sg) & 1u) ? -2.0 : 2.0)
+                                                : (((w >> $j_sg) & 1u) ? -1.0 : 1.0);
+          acc = fma(cf, pq, acc);
+          if ((w >> $j_end) & 1u) {
+            const unsigned d = __ldg(jsl + ne);
+            if (d < NNZ) Wd[__ldg(didx + d)] = -acc; else Y[d - NNZ] = -acc;
+            acc = 0.0;
+            ne++;
+          }
+        }
+      }
+      CSYNC(0);
+#if NFIX
+      if (cl == 0) {                            // the extra pieces of long slots, in order
+        const u16* fx = (const u16*)((const unsigned*)jt + jround * NL) + NL * JSMAX;
+        for (int e = 0; e < NFIX; e++) Wd[__ldg(didx + __ldg(fx + e))] += Y[e];
+      }
+      CSYNC(0);
+#endif
+      for (int i = cl; i < NS; i += NL) {       // u = w = S v / nd - Jn x (the call kernel's sums, columns in order)
+        double acc = 0.0;
+        for (int j = 0; j < NS; j++)
+          if (T.smap[i * NS + j] != 0xFFFFu) acc += Wd[i * NS + j] * N[j];
+        u[i] = u[i] + acc / ntot;
+      }
+      CSYNC(0);
+      for (int s = cl; s < NS * NS; s += NL) {  // W = I / (gamma h) - Jn - w 1^T
+        const int i = s / NS;
+        Wd[s] = (s == i * (NS + 1) ? Wd[s] + igh : Wd[s]) - u[i];
+      }
+      for (int i = cl; i < NS; i += NL) K1[i] = F[i];
+      CSYNC(0);
+      if (cl < 32) {
+        dense_lu(Wd, dinv, pr, lane);
+        // Rodas3 stages (kinbatch.RODAS3, gamma = 1/2), as the call kernel
+        dense_solve(Wd, dinv, pr, K1, lane);
+        for (int i = lane; i < NS; i += 32) K2[i] = F[i] + 4.0 * ih * K1[i];
+        __syncwarp();
+        dense_solve(Wd, dinv, pr, K2, lane);
+        for (int i = lane; i < NS; i += 32) Y[i] = N[i] + 2.0 * K1[i];
+      }
+      CSYNC(0);
+      rhs(Y, F, nullptr, n, v, part, kf, kr, nd, T, sst, sround, lane, cl, 0);
+      if (cl < 32) {
+        for (int i = lane; i < NS; i += 32) K3[i] = F[i] + ih * (K1[i] - K2[i]);
+        __syncwarp();
+        dense_solve(Wd, dinv, pr, K3, lane);
+        for (int i = lane; i < NS; i += 32) Y[i] = N[i] + 2.0 * K1[i] + K3[i];
+      }
+      CSYNC(0);
+      rhs(Y, F, nullptr, n, v, part, kf, kr, nd, T, sst, sround, lane, cl, 0);
+      if (cl < 32) {
+        for (int i = lane; i < NS; i += 32) K4[i] = F[i] + ih * (K1[i] - K2[i] - (8.0 / 3.0) * K3[i]);
+        __syncwarp();
+        dense_solve(Wd, dinv, pr, K4, lane);
+      }
+      CSYNC(0);
+      // step control (kinnet.advance_compact, order 3); every warp reaches the same decision
+      double e2 = 0.0;
+      bool nn = true;
+      for (int i = lane; i < NS; i += 32) {
+        const double y = N[i] + 2.0 * K1[i] + K3[i] + K4[i];
+        if (cl < 32) Y[i] = y;
+        const double sc = atol + rtol * fmax(fabs(N[i]), fabs(y));
+        const double q4 = K4[i] / sc;
+        e2 += q4 * q4;
+        nn = nn && (y >= -atol);
+      }
+      const double en = sqrt(wsum(e2) / NS);
+      const bool nonneg = __all_sync(FULL, nn), efin = isfinite(en), ok = (en <= 1.0) && nonneg && efin;
+      CSYNC(0);
+      if (ok) {
+        for (int i = cl; i < NS; i += NL) N[i] = fmax(Y[i], 0.0);
+        t += ha;
+        nok += 1.0;
+      }
+      CSYNC(0);
+      double fac = efin ? 0.9 / cbrt(fmax(en, 1e-10)) : 0.1;
+      fac = fmin(fmax(fac, 0.2), 5.0);
+      if (!ok) fac = fmin(fac, 0.5);
+      h = ha * fac;
+      it++;
+    }
+    p = 0.0;
+    for (int i = lane; i < NS; i += 32) p += N[i];
+    const double s = wsum(p);
+    for (int i = cl; i < NS; i += NL) xout[(size_t)cell * NS + perm[i]] = N[i] / s;
+    const int dn = (t >= dt * (1.0 - 1e-14)) ? 1 : 0;
+    CSYNC(0);
+    if (cl == 0) {
+      hio[cell] = h; doneo[cell] = dn; noko[cell] = nok;
+      const int c = check_cell(x0, Ta, Pa, dta, xout, dn, nok, atoms, atol, cell);
+      redo[cell] = c ? 2 : 1;
+      atomicAdd(count + (c ? 8 : 7), 1);
+      *nextq = gridDim.x + atomicAdd(count + 9, 1);
+    }
+    CSYNC(0);
+    q = *nextq;
+    CSYNC(0);
+  }
 }
 """
 
@@ -774,6 +1055,14 @@ def _perc(tab):
     one for the queue's next cell; v and the S v pieces when they do not fit in the trailing block."""
     ns = tab["ns"]
     return tab["nnz"] + ns + 1 + ns + 1 + 8 * ns + 1 + (0 if _alias(tab) else max(tab["nr"], ns + 1) + tab["npart"])
+
+
+def _perw_rec(tab, wsh):
+    """Shared-memory doubles of the recover kernel's cell (PERWR): W when wsh (else in global memory), dinv, n, v (or
+    the G / RT of the species), N, Y, F, u, K1-K4, the S v pieces, the row order of the pivoting and the next list
+    entry (as ints)."""
+    ns = tab["ns"]
+    return (ns * ns if wsh else 0) + 10 * ns + 1 + max(tab["nr"], ns + 1) + tab["npart"] + (ns + 2) // 2
 
 
 def _mask(name, ks, n):
@@ -812,8 +1101,9 @@ _KR = "(k * exp(dg + (double)(((fl >> 3) & 7) - 4) * lKT)) * c3"
 _KREV = "(fl & 256) ? law(rc + RCW * (NR + r), rf[NR + r], Tc, lT, iT, nd) * c3 : " + _KR
 
 
-def source(tab, cpb):
-    """The kernel's CUDA source for the tables of tables() and cpb cells per block."""
+def source(tab, cpb, wsh=True):
+    """The kernels' CUDA source for the tables of tables() and cpb cells per block; wsh: the recover kernel holds W in
+    shared memory."""
     ns, k0, P, w = tab["ns"], tab["k0"], tab["P"], tab["wd"]
     nt = ns - k0
     blob, offs = _blob(tab)
@@ -837,7 +1127,8 @@ def source(tab, cpb):
         j_km=m(w["k"]), j_sg=w["k"], j_x2=w["k"] + 1, j_a=j_a, j_b=j_a + w["s"], j_sm=m(w["s"]),
         j_end=j_a + 2 * w["s"], slm=m(w["slot"]), lu_b=w["slot"], lu_c=2 * w["slot"],
         nel=tab["atoms"].shape[1], etot=repr(float(tab["atoms"].sum())), tmin=repr(T_MIN), drift=repr(DRIFT),
-        kb=repr(K.KB), p0=repr(K.P0), **{f"o_{k}": v for k, v in offs.items()})
+        kb=repr(K.KB), p0=repr(K.P0), wsh=int(wsh), vr=max(tab["nr"], ns + 1), rpd=-(-ns // 32),
+        perwr=_perw_rec(tab, wsh), **{f"o_{k}": v for k, v in offs.items()})
 
 
 _CUDA = []
@@ -901,13 +1192,13 @@ def _launch(fn, grid, block, smem, stream, args):
 
 
 def _load(src, arch):
-    """Compile and load the source: (module, call kernel, guard kernel)."""
+    """Compile and load the source: (module, call kernel, guard kernel, recover kernel)."""
     cu = _cuda()
-    mod, fn, guard = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+    mod, fns = ctypes.c_void_p(), [ctypes.c_void_p() for _ in range(3)]
     _check(cu.cuModuleLoadData(ctypes.byref(mod), compile_cubin(src, arch)), "load")
-    _check(cu.cuModuleGetFunction(ctypes.byref(fn), mod, b"call"), "function")
-    _check(cu.cuModuleGetFunction(ctypes.byref(guard), mod, b"guard"), "function")
-    return mod, fn, guard
+    for fn, name in zip(fns, (b"call", b"guard", b"recover")):
+        _check(cu.cuModuleGetFunction(ctypes.byref(fn), mod, name), "function")
+    return (mod, *fns)
 
 
 def _attr(fn, a):
@@ -920,12 +1211,15 @@ def _attr(fn, a):
 class CudaSolver:
     """CudaSolver(net, device)(x, T, P, dt, h) -> (x, h, done, accepted steps): the call
     advance_compact(rodas3_step(pivot=False), x, TorchRates(T, P), dt, h, order=3) for x [B, S] mole fractions in the
-    network's species order, T [B] K, P [B] dyn cm^-2, dt [B] s and starting step sizes h [B] (float64 CUDA tensors).
-    fallback: the counts of the last call's guard (cells with non-finite inputs; kernel cells with a non-finite state,
-    an unfinished call, an element drift; cells recomputed by the library path); recomputed_total: cells recomputed
-    since construction; info: the kernel's layout (sizes, warps per cell, leading / trailing split, registers and
-    local bytes per thread, cells and warps per block, shared memory per block, resident cells per SM). Calls run one at
-    a time on torch's current stream (the queue counter and the rate scratch are shared)."""
+    network's species order, T [B] K, P [B] dyn cm^-2, dt [B] s and starting step sizes h [B] (float64 CUDA tensors),
+    with the cells the guard flags recomputed on the device (see the module docstring); no host sync. count: the last
+    call's counts (device int32 [10]: queue, then COUNTS, then the recovery's queue); total: the counts since
+    construction (device int64 [10], added on the stream after each call); fallback: the last call's counts as a dict
+    (reads them from the device); check(): the totals as a dict, raises if any cell was below T_MIN; info: the kernel's
+    layout (sizes, warps per cell, leading / trailing split, registers and local bytes per thread, cells and warps per
+    block, shared memory per block, resident cells per SM; the recover kernel's shared memory, W in shared memory or
+    not, resident blocks). Calls run one at a time on torch's current stream (the queues, the counts and the scratch
+    are shared)."""
 
     def __init__(self, net, device):
         self.dev = torch.device(device)
@@ -942,60 +1236,68 @@ class CudaSolver:
         if fit(tab) < 1:
             raise ValueError(f"one cell needs {8 * _perc(tab) + len(blob)} B of shared memory per block; the device "
                              f"has {optin}")
+        wsh = 8 * _perw_rec(tab, True) + len(blob) <= optin  # the recover kernel's W in shared memory if it fits
         # cells per block: from the registers of a one-cell compile, then more while the shared memory and the named
         # barriers (15) allow them and the compiler fits them in the registers without more local memory
         arch = f"{prop.major}{prop.minor}"
         top = min(1024 // nl, 15, fit(tab))
-        mod = _load(source(tab, 1), arch)
+        mod = _load(source(tab, 1, wsh), arch)
         regs, local = -(-_attr(mod[1], 4) // 8) * 8, _attr(mod[1], 3)   # registers (allocation unit 8), local bytes
         self.cpb = max(1, min(top, prop.regs_per_multiprocessor // (nl * regs)))
         if self.cpb > 1:
             _check(_cuda().cuModuleUnload(mod[0]), "unload")
-            mod = _load(source(tab, self.cpb), arch)
+            mod = _load(source(tab, self.cpb, wsh), arch)
         while self.cpb < top:
-            nxt = _load(source(tab, self.cpb + 1), arch)
+            nxt = _load(source(tab, self.cpb + 1, wsh), arch)
             if _attr(nxt[1], 3) > local:
                 _check(_cuda().cuModuleUnload(nxt[0]), "unload")
                 break
             _check(_cuda().cuModuleUnload(mod[0]), "unload")
             mod, self.cpb = nxt, self.cpb + 1
-        self._mod, self._fn, self._guard = mod
+        self._mod, self._fn, self._guard, self._rec = mod
         self.wpb = self.w * self.cpb                          # warps per block
         self.smem = 8 * self.cpb * _perc(tab) + len(blob)
-        self.src = source(tab, self.cpb)
+        self.smem_rec = 8 * _perw_rec(tab, wsh) + len(blob)
+        self.src = source(tab, self.cpb, wsh)
         cu = _cuda()
-        _check(cu.cuFuncSetAttribute(self._fn, 8, self.smem), "shared memory")   # MAX_DYNAMIC_SHARED_SIZE_BYTES
-        occ = ctypes.c_int()
-        _check(cu.cuOccupancyMaxActiveBlocksPerMultiprocessor(ctypes.byref(occ), self._fn, nl * self.cpb, self.smem),
-               "occupancy")
-        if occ.value < 1:
-            raise RuntimeError("the kernel does not fit on this device")
+        occ = []
+        for fn, threads, smem in ((self._fn, nl * self.cpb, self.smem), (self._rec, nl, self.smem_rec)):
+            _check(cu.cuFuncSetAttribute(fn, 8, smem), "shared memory")   # MAX_DYNAMIC_SHARED_SIZE_BYTES
+            o = ctypes.c_int()
+            _check(cu.cuOccupancyMaxActiveBlocksPerMultiprocessor(ctypes.byref(o), fn, threads, smem), "occupancy")
+            if o.value < 1:
+                raise RuntimeError("the kernel does not fit on this device")
+            occ.append(o.value)
+        self.max_blocks, self.rec_blocks = (prop.multi_processor_count * o for o in occ)
         self.info = dict(ns=self.ns, nr=self.nr, nnz=tab["nnz"], k0=tab["k0"], nt=self.ns - tab["k0"], w=self.w,
                          sround=tab["sst"].shape[0], jround=tab["jround"], lu_ops=len(tab["lu"]), alias=_alias(tab),
                          regs=_attr(self._fn, 4), spill_bytes=_attr(self._fn, 3), cpb=self.cpb, wpb=self.wpb,
-                         smem=self.smem, blob=len(blob), cells_per_sm=self.cpb * occ.value)
-        self.max_blocks = prop.multi_processor_count * occ.value
+                         smem=self.smem, blob=len(blob), cells_per_sm=self.cpb * occ[0], rec_smem=self.smem_rec,
+                         rec_w_shared=wsh, rec_blocks=self.rec_blocks)
         f = lambda a, view=None: torch.tensor(a if view is None else np.asarray(a).view(view), device=self.dev)
         self._tabs = [f(tab["perm"]), f(np.frombuffer(blob, np.int32).copy()), f(tab["rc"]), f(tab["rf"]),
                       f(tab["nasa"])]
         self._scratch = torch.empty(self.max_blocks * self.cpb * (2 * self.nr + 2), dtype=torch.float64,
                                     device=self.dev)
+        self._scratch_rec = torch.empty(self.rec_blocks * (2 * self.nr + 2 + (0 if wsh else self.ns ** 2)),
+                                        dtype=torch.float64, device=self.dev)
         self._streams = [f(tab["sst"].ravel(), np.int32), f(tab["jt"], np.int64), f(tab["lu"], np.int64),
                          f(tab["optr"]), ctypes.c_int(tab["sst"].shape[0]), ctypes.c_int(tab["jround"])]
-        self._atoms = f(tab["atoms"])
-        self.count = torch.zeros(7, dtype=torch.int32, device=self.dev)
+        self._didx, self._atoms = f(tab["didx"], np.int16), f(tab["atoms"])
+        self.count = torch.zeros(10, dtype=torch.int32, device=self.dev)
+        self.total = torch.zeros(10, dtype=torch.int64, device=self.dev)
         self.rates, self.mech = KV.TorchRates(net, self.dev), KB.Mech(net, self.dev)
-        self.fallback, self.recomputed_total = {}, 0
 
     def launch(self, x, T, P, dt, h, rtol=1e-3, atol=1e-18, max_steps=4000):
-        """The kernel and its checks, no host sync: (x, h, done, accepted steps, recompute flag) per cell; the counters
-        in self.count (queue, non-finite input, T < T_MIN, non-finite state, unfinished, drift, recompute)."""
+        """The kernel, its checks and the recovery, no host sync: (x, h, done, accepted steps, flag) per cell, flag 0
+        (the call's result passed the guard), 1 (recomputed, passes) or 2 (recomputed, still fails); the counts in
+        self.count."""
         if not all(a.is_cuda and a.dtype == torch.float64 for a in (x, T, P, dt, h)) or x.shape[1] != self.ns:
             raise ValueError(f"x [B, {self.ns}], T, P, dt, h [B]: float64 CUDA tensors")
         B = x.shape[0]
-        x, T, P, dt = (a.contiguous() for a in (x, T, P, dt))
-        xo, ho = torch.empty_like(x), h.contiguous().clone()
-        done, redo = (torch.empty(B, dtype=torch.int32, device=self.dev) for _ in range(2))
+        x, T, P, dt, h = (a.contiguous() for a in (x, T, P, dt, h))
+        xo, ho = torch.empty_like(x), h.clone()
+        done, redo, lst = (torch.empty(B, dtype=torch.int32, device=self.dev) for _ in range(3))
         nok = torch.empty(B, dtype=torch.float64, device=self.dev)
         nb = max(1, min(-(-B // self.cpb), self.max_blocks))
         self.count.zero_()
@@ -1004,8 +1306,13 @@ class CudaSolver:
                 [x, T, P, dt, ho, xo, done, nok, self.count, ctypes.c_int(B), ctypes.c_double(rtol),
                  ctypes.c_double(atol), ctypes.c_int(max_steps), *self._tabs, self._scratch, *self._streams])
         _launch(self._guard, -(-B // 128) or 1, 128, 0, stream,
-                [x, T, P, dt, xo, done, nok, self._atoms, redo, self.count, ctypes.c_int(B), ctypes.c_double(atol)])
-        return xo, ho, done.bool(), nok, redo.bool()
+                [x, T, P, dt, xo, done, nok, self._atoms, redo, lst, self.count, ctypes.c_int(B),
+                 ctypes.c_double(atol)])
+        _launch(self._rec, max(1, min(B, self.rec_blocks)), 32 * self.w, self.smem_rec, stream,
+                [x, T, P, dt, h, xo, ho, done, nok, redo, lst, self.count, ctypes.c_double(rtol), ctypes.c_double(atol),
+                 ctypes.c_int(REC_STEPS * max_steps), *self._tabs, self._scratch_rec, *self._streams[:2], self._didx,
+                 self._atoms, *self._streams[4:]])
+        return xo, ho, done.bool(), nok, redo
 
     def library(self, x, T, P, dt, h, rtol=1e-3, atol=1e-18, max_steps=4000):
         """The same call by the library path (TorchRates, rodas3_step without pivoting, advance_compact)."""
@@ -1014,17 +1321,19 @@ class CudaSolver:
         return KN.advance_compact(step, x, self.rates(T, P), dt, h, rtol=rtol, atol=atol, max_steps=max_steps, order=3)
 
     def __call__(self, x, T, P, dt, h, rtol=1e-3, atol=1e-18, max_steps=4000):
-        """The guarded call: (x, h, done, accepted steps); raises if any T < T_MIN (see the class docstring)."""
-        xo, ho, done, nok, redo = self.launch(x, T, P, dt, h, rtol, atol, max_steps)
-        n = self.count.tolist()
-        if n[2]:
-            raise ValueError(f"{n[2]} cells below {T_MIN:g} K (coldest {float(T.min()):.1f} K): outside the chemistry "
-                             "solver's domain")
-        self.fallback = dict(zip(("bad_input", "nonfinite", "unfinished", "drift", "recomputed"), n[1:2] + n[3:]))
-        if n[6]:
-            i = redo.nonzero().squeeze(1)
-            new = self.library(x[i], T[i], P[i], dt[i], h[i], rtol, atol, max_steps)
-            for out, a in zip((xo, ho, done, nok), new):
-                out[i] = a
-            self.recomputed_total += n[6]
+        """The call: (x, h, done, accepted steps), no host sync; the counts added to self.total on the stream."""
+        xo, ho, done, nok, _ = self.launch(x, T, P, dt, h, rtol, atol, max_steps)
+        self.total += self.count
         return xo, ho, done, nok
+
+    @property
+    def fallback(self):
+        """The last call's counts (one small copy from the device)."""
+        return dict(zip(COUNTS, self.count[1:9].tolist()))
+
+    def check(self):
+        """The counts since construction (one small copy); raises if any cell was below T_MIN."""
+        n = dict(zip(COUNTS, self.total[1:9].tolist()))
+        if n["cold"]:
+            raise ValueError(f"{n['cold']} cells below {T_MIN:g} K: outside the chemistry solver's domain")
+        return n

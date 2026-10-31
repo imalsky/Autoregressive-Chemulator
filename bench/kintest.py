@@ -544,6 +544,7 @@ def main():
     ticks = max(b.stride * (b.end - 1) + 1 for b in blocks)
     print(f"{len(blocks)} blocks, {S['N']:,} cells, {ticks:,} ticks; set up in {time.time() - t_all:.0f} s", flush=True)
     L = run(blocks, S, solver, ticks, READ if quick else 10 * READ, not quick, a.force, t_all, gi_t, fl, dev)
+    solver.check()                                                      # raises if any cell was below 300 K
     R = results(blocks, S)
     report(blocks, R, L, S)
     R.update(L, **Y, tier=np.array(a.tier))
