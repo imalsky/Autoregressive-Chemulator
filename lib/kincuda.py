@@ -1,15 +1,22 @@
-"""The solver's whole call as one CUDA kernel: what kinvulcan.TorchRates + kinbatch.rodas3_step(pivot=False) +
-kinnet.advance_compact(order=3) compute for every cell, in one launch, for any network the reader takes (rate laws in
-the reaction dicts; at most 254 species, 3 species per side, |S| <= 2).
+"""The solver's whole call as one CUDA kernel: every cell's call (rates, every step, the step control) in one launch,
+for any network the reader takes (lib/kinvulcan.py: rate laws in the reaction dicts; at most 254 species, 3 species per
+side, |S| <= 2).
 
-The cell's threads compute its rate coefficients from T and P (NASA-9 Gibbs energies; each reaction's law from the
-network: one or two Arrhenius k0 terms, falloff, Troe factor, efficiency; reverse rates from the equilibrium constants
-or an explicit reverse law; n_tot folded into the three-body coefficients), then take every Rodas3 step of the call with
-advance_compact's step control: a step is accepted when its RMS error is within tolerance and no species is below -atol,
-accepted states are clamped at 0, the next step is 0.9 err^(-1/3) times the last (within [0.2, 5], at most 0.5 after a
-rejection), at most max_steps tries. The exact Jacobian J = Jn + w 1^T (Jn = d(S v)/dn, w the constant-P term) enters
-through an LU factor without row exchanges of M0 = I / (gamma h) - Jn on its sparse pattern, in a minimum-degree order,
-and the Sherman-Morrison formula for the rank-one term.
+The cell's threads compute its rate coefficients from T and P (NASA-9 Gibbs energies, low range below 1000 K; each
+reaction's law from the network: one or two Arrhenius k0 terms, falloff, Troe factor, efficiency; reverse rates from the
+equilibrium constants or an explicit reverse law; n_tot folded into the three-body coefficients), then integrate the
+constant-T, P reactor dN/dt = (sum N / n_tot) S v (N: molecules per starting molecule, n = n_tot N / sum N) over dt
+with Rodas3 (4 stages, order 3, L-stable, stiffly accurate; gamma = 1/2) in the form W = I / (gamma h) - J,
+K_i = W^-1 (f(Y_i) + sum_j C_ij K_j / h), Y_i = N + sum_j A_ij K_j: Y_2 = N (stage 2 reuses f(N)), Y_3 = N + 2 K_1,
+Y_4 = N + 2 K_1 + K_3; C_21 = 4, C_3j = (1, -1), C_4j = (1, -1, -8/3); N' = N + 2 K_1 + K_3 + K_4, error estimate K_4.
+Step control: the first try is max(min(h, dt), 1e-12) with h the cell's step size carried from its last call, each try
+min(h, dt - t); a step is accepted when err = (mean_i (K_4,i / (atol + rtol max(|N_i|, |N'_i|)))^2)^(1/2) <= 1, err is
+finite and no species is below -atol (rtol 1e-3, atol 1e-18 by default); accepted states are clamped at 0; the next step
+is 0.9 err^(-1/3) times the last (0.1 for a non-finite err; within [0.2, 5], at most 0.5 after a rejection); the call
+ends at t >= dt (1 - 1e-14) or after max_steps tries, and returns the mole fractions N / sum N, the next step size, done
+and the accepted steps. The exact Jacobian J = Jn + w 1^T (Jn = d(S v)/dn, w the constant-P term) enters through an LU
+factor without row exchanges of M0 = I / (gamma h) - Jn on its sparse pattern, in a minimum-degree order, and the
+Sherman-Morrison formula for the rank-one term.
 
 Layout. W warps per cell (warps(): 2, or 4 when the shared memory holds at most 3 cells per block). The last NT =
 min(NTAIL, NS) rows and columns of the order (the trailing block, dense or nearly so after the fill; structural zeros
@@ -42,7 +49,7 @@ and check() read them). Each cell's arithmetic depends only on its inputs, so re
 GPU whatever the batch order. The element test checks the linear solves: E^T W = E^T / (gamma h) for the element matrix
 E (E^T S = 0), so every stage moves the element budget by gamma h E^T (residual of its solve); a factor without row
 exchanges that has lost accuracy shows up there. Cells with non-finite inputs are counted, not recomputed (they come
-back non-finite); cells below 300 K are not stepped and are counted, and check() raises for them, as TorchRates does.
+back non-finite); cells below 300 K are not stepped and are counted, and check() raises for them.
 
 The element-drift allowance is per network: the rounding drift of the element shares depends on the network's
 chemistry, not only on the factorization (a network can drift the same on the recover kernel's pivoted path). A
@@ -57,12 +64,9 @@ import string
 import numpy as np
 import torch
 
-import kinbatch as KB
-import kinetics as K
-import kinnet as KN
 import kinvulcan as KV
 
-T_MIN = 300.0   # K, as TorchRates
+T_MIN = 300.0   # K: the solver's domain starts here (colder cells are counted, not stepped)
 DRIFT = 1e-6    # default drift allowance (NCHO): relative change of an element's share left to rounding
 REC_STEPS = 2   # the recovery's tries, in units of the call's max_steps
 COUNTS = ("bad_input", "cold", "nonfinite", "unfinished", "drift", "recomputed", "recovered", "still_failed")
@@ -637,7 +641,7 @@ extern "C" __global__ void __launch_bounds__(NL * CPB, 1) call(
         #pragma unroll
         for (int j = 0; j < NT; j++) c[j] = M[TB0 + myt * NT + j];
       }
-      // Rodas3 stages (kinbatch.RODAS3, gamma = 1/2) as one loop with one copy of the triangular solve: stage 1 solves
+      // Rodas3 stages (gamma = 1/2; module docstring) as one loop with one copy of the triangular solve: stage 1 solves
       // K1 on the first warp and u on the second, then c0 = 1 / (1 - sum M0^-1 u); every stage ends with the
       // Sherman-Morrison update on the first warp
       double c0 = 0.0;
@@ -696,7 +700,7 @@ extern "C" __global__ void __launch_bounds__(NL * CPB, 1) call(
         }
         CSYNC(grp);
       }
-      // step control (kinnet.advance_compact, order 3); every warp of the cell reaches the same decision
+      // step control (module docstring); every warp of the cell reaches the same decision
       double e2 = 0.0;
       bool nn = true;
       for (int i = lane; i < NS; i += 32) {
@@ -970,7 +974,7 @@ extern "C" __global__ void __launch_bounds__(NL, 1) recover(
       CSYNC(0);
       if (cl < 32) {
         dense_lu(Wd, dinv, pr, lane);
-        // Rodas3 stages (kinbatch.RODAS3, gamma = 1/2), as the call kernel
+        // Rodas3 stages (gamma = 1/2), as the call kernel
         dense_solve(Wd, dinv, pr, K1, lane);
         for (int i = lane; i < NS; i += 32) K2[i] = F[i] + 4.0 * ih * K1[i];
         __syncwarp();
@@ -993,7 +997,7 @@ extern "C" __global__ void __launch_bounds__(NL, 1) recover(
         dense_solve(Wd, dinv, pr, K4, lane);
       }
       CSYNC(0);
-      // step control (kinnet.advance_compact, order 3); every warp reaches the same decision
+      // step control (module docstring); every warp reaches the same decision
       double e2 = 0.0;
       bool nn = true;
       for (int i = lane; i < NS; i += 32) {
@@ -1134,7 +1138,7 @@ def source(tab, cpb, wsh=True, drift=None):
         j_end=j_a + 2 * w["s"], slm=m(w["slot"]), lu_b=w["slot"], lu_c=2 * w["slot"],
         nel=tab["atoms"].shape[1], etot=repr(float(tab["atoms"].sum())), tmin=repr(T_MIN),
         drift=repr(float(DRIFT if drift is None else drift)),
-        kb=repr(K.KB), p0=repr(K.P0), wsh=int(wsh), vr=max(tab["nr"], ns + 1), rpd=-(-ns // 32),
+        kb=repr(KV.KB), p0=repr(KV.P0), wsh=int(wsh), vr=max(tab["nr"], ns + 1), rpd=-(-ns // 32),
         perwr=_perw_rec(tab, wsh), **{f"o_{k}": v for k, v in offs.items()})
 
 
@@ -1216,17 +1220,17 @@ def _attr(fn, a):
 
 
 class CudaSolver:
-    """CudaSolver(net, device, drift=None)(x, T, P, dt, h) -> (x, h, done, accepted steps): the call
-    advance_compact(rodas3_step(pivot=False), x, TorchRates(T, P), dt, h, order=3) for x [B, S] mole fractions in the
-    network's species order, T [B] K, P [B] dyn cm^-2, dt [B] s and starting step sizes h [B] (float64 CUDA tensors),
-    with the cells the guard flags recomputed on the device (see the module docstring); no host sync. count: the last
-    call's counts (device int32 [10]: queue, then COUNTS, then the recovery's queue); total: the counts since
-    construction (device int64 [10], added on the stream after each call); fallback: the last call's counts as a dict
-    (reads them from the device); check(): the totals as a dict, raises if any cell was below T_MIN; info: the kernel's
-    layout (sizes, warps per cell, leading / trailing split, registers and local bytes per thread, cells and warps per
-    block, shared memory per block, resident cells per SM; the recover kernel's shared memory, W in shared memory or
-    not, resident blocks). drift: the network's element-drift allowance (module docstring; default DRIFT). Calls run
-    one at a time on torch's current stream (the queues, the counts and the scratch are shared)."""
+    """CudaSolver(net, device, drift=None)(x, T, P, dt, h) -> (x, h, done, accepted steps): the call of the module
+    docstring for x [B, S] mole fractions in the network's species order, T [B] K, P [B] dyn cm^-2, dt [B] s and
+    starting step sizes h [B] (float64 CUDA tensors), with the cells the guard flags recomputed on the device (see the
+    module docstring); no host sync. count: the last call's counts (device int32 [10]: queue, then COUNTS, then the
+    recovery's queue); total: the counts since construction (device int64 [10], added on the stream after each call);
+    fallback: the last call's counts as a dict (reads them from the device); check(): the totals as a dict, raises if
+    any cell was below T_MIN; info: the kernel's layout (sizes, warps per cell, leading / trailing split, registers and
+    local bytes per thread, cells and warps per block, shared memory per block, resident cells per SM; the recover
+    kernel's shared memory, W in shared memory or not, resident blocks). drift: the network's element-drift allowance
+    (module docstring; default DRIFT). Calls run one at a time on torch's current stream (the queues, the counts and the
+    scratch are shared)."""
 
     def __init__(self, net, device, drift=None):
         self.dev = torch.device(device)
@@ -1294,7 +1298,6 @@ class CudaSolver:
         self._didx, self._atoms = f(tab["didx"], np.int16), f(tab["atoms"])
         self.count = torch.zeros(10, dtype=torch.int32, device=self.dev)
         self.total = torch.zeros(10, dtype=torch.int64, device=self.dev)
-        self.rates, self.mech = KV.TorchRates(net, self.dev), KB.Mech(net, self.dev)
 
     def launch(self, x, T, P, dt, h, rtol=1e-3, atol=1e-18, max_steps=4000):
         """The kernel, its checks and the recovery, no host sync: (x, h, done, accepted steps, flag) per cell, flag 0
@@ -1321,12 +1324,6 @@ class CudaSolver:
                  ctypes.c_int(REC_STEPS * max_steps), *self._tabs, self._scratch_rec, *self._streams[:2], self._didx,
                  self._atoms, *self._streams[4:]])
         return xo, ho, done.bool(), nok, redo
-
-    def library(self, x, T, P, dt, h, rtol=1e-3, atol=1e-18, max_steps=4000):
-        """The same call by the library path (TorchRates, rodas3_step without pivoting, advance_compact)."""
-        m = self.mech
-        step = lambda N, hh, kf, kr, nd: KB.rodas3_step(m, N, kf, kr, nd, hh, pivot=False)
-        return KN.advance_compact(step, x, self.rates(T, P), dt, h, rtol=rtol, atol=atol, max_steps=max_steps, order=3)
 
     def __call__(self, x, T, P, dt, h, rtol=1e-3, atol=1e-18, max_steps=4000):
         """The call: (x, h, done, accepted steps), no host sync; the counts added to self.total on the stream."""

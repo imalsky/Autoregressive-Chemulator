@@ -1,4 +1,4 @@
-"""Derivatives of one solver call (lib/kincuda.py's call: TorchRates + Rodas3 + advance_compact's step control) as CUDA
+"""Derivatives of one solver call (lib/kincuda.py's call: rates from T and P, Rodas3 and its step control) as CUDA
 kernels generated from the same tables: a tangent (JVP) kernel and an adjoint (VJP) kernel; each also returns the call's
 result with the call kernel's arithmetic (bitwise). One warp per cell: each lane walks W of the call kernel's 32 W lane
 streams (S v, Jacobian terms, LU updates), and the trailing block, the solves and the Sherman-Morrison steps are the call

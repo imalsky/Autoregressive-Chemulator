@@ -3,8 +3,8 @@ judged).
 (a) Primal parity: the jvp and vjp kernels' (x, h, done, steps) bitwise equal to CudaSolver.launch on yardstick cold
     calls (dt 1, 500 s), scrambled starts (sigma 0 / 1 / 2 dex at dt 0.01 / 1 / 50 / 500 s) and a 300-call panel-P
     chain.
-(b) Against the torch-autograd reference (paths.AD_REF: the library call differentiated by torch, contracts F and
-    A): tangents of ln x_out (error / the cell's largest |d ln x|, species above 1e-25) and every input cotangent
+(b) Against the torch-autograd reference (paths.AD_REF: the torch reference call differentiated by torch, contracts
+    F and A): tangents of ln x_out (error / the cell's largest |d ln x|, species above 1e-25) and every input cotangent
     (error / the cell's largest |reference entry|; the log-multiplier and Arrhenius cotangents on reactions away from
     balance, see away_from_balance). Pass: step counts equal, every class median <= 1e-9 and p90 <= 1e-7 over cells
     (the maxima are rounding-dominated cells, printed). h_out's adaptive tangent is judged in (c) (the reference's is
@@ -46,10 +46,10 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import kinbatch as KB  # noqa: E402
 import kincuda as KC  # noqa: E402
 import kincuda_ad as KA  # noqa: E402
 import kinvulcan as KV  # noqa: E402
+import libref as LR  # noqa: E402
 import paths  # noqa: E402
 
 YARD = paths.YARD / "design"
@@ -157,18 +157,20 @@ def parity():
 
 # ---------------------------------------------------------------------------------------------------------------- (b)
 KEYS = {"lnA0": 0, "B0": 1, "C0": 2, "lnAi": 6, "Bi": 7, "Ci": 8}
-RATES, MECH = KV.TorchRates(net, dev), KB.Mech(net, dev)
+SIG = LR.netsig(f"{paths.VULCAN_THERMO}/NCHO_thermo_network.txt", f"{paths.VULCAN_THERMO}/NASA9", sp)
+RI, PI = (torch.tensor([r[k] + [len(sp)] * (3 - len(r[k])) for r in net.reac], device=dev) for k in ("re", "pr"))
+TB = torch.tensor([r["kind"] in (3, 5, 6) for r in net.reac], device=dev)          # three-body: times n_tot
 
 
 def away_from_balance(x, T, P, q=1e-3):
-    """[B, R]: reactions whose forward and reverse fluxes at the state x differ by more than q of their sum. A balanced
-    fast reaction's multiplier changes nothing in exact arithmetic; its computed sensitivity is rounding of the order of
-    1e-16 x its one-way flux, on any implementation."""
-    kf, kr, nd = RATES(T, P)
-    c3 = torch.where(MECH.tb[None], nd[:, None], torch.ones_like(kf))
-    (ri, _), (pi, _) = MECH.idx
+    """[B, R]: reactions whose forward and reverse fluxes at the state x differ by more than q of their sum (rate
+    coefficients: the torch reference's, stored for these T, P in paths.LIBREF). A balanced fast reaction's multiplier
+    changes nothing in exact arithmetic; its computed sensitivity is rounding of the order of 1e-16 x its one-way flux,
+    on any implementation."""
+    kf, kr, nd = (tt(a) for a in LR.rates(SIG, T, P))
+    c3 = torch.where(TB[None], nd[:, None], torch.ones_like(kf))
     ne = torch.cat([x * nd[:, None], torch.ones_like(nd)[:, None]], 1)
-    a, b = c3 * kf * ne[:, ri].prod(-1), c3 * kr * ne[:, pi].prod(-1)
+    a, b = c3 * kf * ne[:, RI].prod(-1), c3 * kr * ne[:, PI].prod(-1)
     return (a - b).abs() > q * (a + b)
 
 

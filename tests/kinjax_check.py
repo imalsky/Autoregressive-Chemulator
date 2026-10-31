@@ -47,11 +47,11 @@ import jax.numpy as jnp  # noqa: E402
 import torch  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import kinbatch as KB  # noqa: E402
 import kincuda as KC  # noqa: E402
 import kincuda_ad as KA  # noqa: E402
 import kinjax as KJ  # noqa: E402
 import kinvulcan as KV  # noqa: E402
+import libref as LR  # noqa: E402
 import paths  # noqa: E402
 
 YARD = paths.YARD / "design"
@@ -105,7 +105,9 @@ RC0 = kj.rc
 gen = torch.Generator(device=dev).manual_seed(11)
 rn = lambda *s: torch.randn(*s, generator=gen, dtype=torch.float64, device=dev)
 J = lambda a: None if a is None else jnp.asarray(a.detach().cpu().numpy())
-RATES, MECH = KV.TorchRates(net, dev), KB.Mech(net, dev)
+SIG = LR.netsig(f"{paths.VULCAN_THERMO}/NCHO_thermo_network.txt", f"{paths.VULCAN_THERMO}/NASA9", sp)
+RI, PI = (torch.tensor([r[k] + [len(sp)] * (3 - len(r[k])) for r in net.reac], device=dev) for k in ("re", "pr"))
+TB = torch.tensor([r["kind"] in (3, 5, 6) for r in net.reac], device=dev)          # three-body: times n_tot
 
 
 def verdict(name, ok, text):
@@ -199,11 +201,10 @@ def tangents(a):
 
 def away_from_balance(x, T, P, q=1e-3):
     """[B, R]: reactions whose forward and reverse fluxes differ by more than q of their sum (kincuda_ad_check)."""
-    kf, kr, nd = RATES(T, P)
-    c3 = torch.where(MECH.tb[None], nd[:, None], torch.ones_like(kf))
-    (ri, _), (pi, _) = MECH.idx
+    kf, kr, nd = (tt(a) for a in LR.rates(SIG, T, P))
+    c3 = torch.where(TB[None], nd[:, None], torch.ones_like(kf))
     ne = torch.cat([x * nd[:, None], torch.ones_like(nd)[:, None]], 1)
-    a, b = c3 * kf * ne[:, ri].prod(-1), c3 * kr * ne[:, pi].prod(-1)
+    a, b = c3 * kf * ne[:, RI].prod(-1), c3 * kr * ne[:, PI].prod(-1)
     return (a - b).abs() > q * (a + b)
 
 

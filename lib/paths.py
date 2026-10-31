@@ -24,5 +24,8 @@ YARD = DATA / "benches/yardstick"                        # mini-chem yardstick: 
 # repository)
 VULCAN_THERMO = Path(os.environ.get("VULCAN_THERMO")
                      or HARNESS.parent / "training-data-generator/fast/tdg/VULCAN-0D/thermo")
-AD_REF = DATA / "benches/kincuda_ad/refdata.npz"         # torch-autograd derivatives of the library call (AD check)
+AD_REF = DATA / "benches/kincuda_ad/refdata.npz"         # torch-autograd derivatives of the torch reference call
+                                                         # (AD check)
+LIBREF = DATA / "benches/kincuda/libref.npz"             # the torch reference call's outputs and rate coefficients on
+                                                         # the checks' inputs (tests/libref.py)
 KINJAX = DATA / "caches/kinjax"                          # the JAX shim built from lib/kinjax.cc
