@@ -26,6 +26,10 @@ kincuda_ad.ADSolver and central differences, on one GPU; PASS / FAIL per case (I
 (i) Status: a NaN input, a cell stopped by max_steps, a dt = 0 cell among ordinary ones: the primal's flag and counts
     equal ADSolver's, JAX derivatives bitwise ADSolver's; a cell below 300 K counted cold, other cells' derivatives
     unchanged.
+(k) Forward mode in one tangent call: the jaxpr of jit(jvp) holds one kinjax_lin and no kinjax_call, and jvp's primal
+    outputs (x, h, done, steps, flag, status) are bitwise the call's; linearize's primal part and grad hold one
+    kinjax_call and no kinjax_lin (partial evaluation splits it off); paired timing (GPU may be shared, INFO) of jit(jvp)
+    against ADSolver.jvp and the call, 4,096 GCM-like cells.
 (j) Edge cases: no lm with an Arrhenius tangent / cotangent; no h_out cotangent; grad w.r.t. x, T, P, dt, h launches no
     Arrhenius reduction; vmap of vmap of grad (per-cell Arrhenius cotangents); a mapped Arrhenius table, a mapped
     Arrhenius tangent over mapped cells and reverse mode with max_steps above CAP^2 raise; empty batches.
@@ -702,6 +706,46 @@ def recovered():
             f"contracts) except {bad or 'none'}")
 
 
+def jvp_cost():
+    B = 4096
+    x, h, fo = gcm_states(B)
+    a = (x, *fo[0], h)
+    P_ = tuple(J(q) for q in a) + (jnp.zeros((B, NR)), RC0)
+    v = tangents(a)
+    V_ = tuple(J(q) for q in v)
+    cx, ch = J(rn(B, NS)), J(rn(B))
+    f = fn(True)
+    jv = jax.jit(lambda p, t: jax.jvp(f, p, t))
+    full_jv = jax.jit(lambda p, t: jax.jvp(lambda *q: kj.call(*q), p, t)[0])
+    n_j = [q for q, _ in prims(jax.make_jaxpr(jv)(P_, V_))]
+    n_l = [q for q, _ in prims(jax.make_jaxpr(lambda *p: jax.linearize(f, *p)[0])(*P_))]
+    n_g = [q for q, _ in prims(jax.make_jaxpr(jax.grad(dot_loss(f, cx, ch), argnums=tuple(range(7))))(*P_))]
+    cnt = lambda ns: {k: ns.count(k) for k in ("kinjax_call", "kinjax_lin", "kinjax_adj")}  # noqa: E731
+    s_j = cnt(n_j) == {"kinjax_call": 0, "kinjax_lin": 1, "kinjax_adj": 0}
+    s_l = cnt(n_l) == {"kinjax_call": 1, "kinjax_lin": 0, "kinjax_adj": 0}
+    s_g = cnt(n_g) == {"kinjax_call": 1, "kinjax_lin": 0, "kinjax_adj": 1}
+    prim_eq = all(eq(p, q) for p, q in zip(kj(*P_), full_jv(P_, V_)))
+    call = jax.jit(lambda *p: f(*p))
+    runs = {"jit(jvp)": lambda: jax.block_until_ready(jv(P_, V_)), "call": lambda: jax.block_until_ready(call(*P_)),
+            "ADSolver.jvp": lambda: (ad.jvp(*a, *v[:5], dlm=v[5], drc=v[6]), torch.cuda.synchronize())}
+    for g in runs.values():
+        g()
+    tm = {k: [] for k in runs}
+    for k in range(10):                                       # rotated order, paired
+        for name in list(runs)[k % 3:] + list(runs)[:k % 3]:
+            t0 = time.perf_counter()
+            runs[name]()
+            tm[name].append(time.perf_counter() - t0)
+    med = {k: float(np.median(q)) for k, q in tm.items()}
+    verdict("forward mode in one tangent call", s_j and s_l and s_g and prim_eq,
+            f"jit(jvp) jaxpr {cnt(n_j)} {s_j}; linearize's primal jaxpr {cnt(n_l)} {s_l}; grad jaxpr {cnt(n_g)} {s_g}; "
+            f"jvp's primal outputs (x, h, done, steps, flag, status) bitwise the call's {prim_eq}")
+    info("jvp cost (paired medians of 10 rotated runs, 4,096 GCM-like cells, GPU may be shared)",
+         f"jit(jvp) {1e3 * med['jit(jvp)']:.2f} ms, ADSolver.jvp {1e3 * med['ADSolver.jvp']:.2f} ms, the call "
+         f"{1e3 * med['call']:.2f} ms: jit(jvp) / ADSolver.jvp {med['jit(jvp)'] / med['ADSolver.jvp']:.2f}, "
+         f"jit(jvp) / call {med['jit(jvp)'] / med['call']:.2f}")
+
+
 def edges():
     """No lm with an rc tangent / cotangent; no h_out cotangent; the reduction skipped when rc's cotangent is not
     wanted; vmap of vmap of grad (groups multiply); what is refused; empty batches."""
@@ -769,7 +813,8 @@ def main():
           f"{KJ._MODULES[kj.module]}", flush=True)
     cs = cases()
     for f, a in ((primal, (cs,)), (parity, (cs,)), (dot_tests, ()), (finite_differences, ()), (transforms, ()),
-                 (scan_window, ()), (end_to_end, ()), (status, ()), (recovered, ()), (edges, ())):
+                 (scan_window, ()), (end_to_end, ()), (status, ()), (recovered, ()), (jvp_cost, ()),
+                 (edges, ())):
         f(*a)
         print(f"  ({time.time() - t_start:.0f} s)", flush=True)
     print(f"{sum(results)} of {len(results)} cases PASS", flush=True)

@@ -19,11 +19,14 @@ Arrhenius cotangent summed over it is NaN).
 
 Derivatives of x_out and h_out with respect to x, T, P, dt, h, lm and rc, contract A (adapt=True, default: the step
 control differentiated on the branch taken) or F (adapt=False: accepted step sizes frozen; no dt, h or h_out derivative),
-a static argument. The primal's JVP rule binds the primal for the outputs and the linear primitive _lin_p for the
-tangents (FFI target kinjax_jvp: the tangent kernel, which recomputes the call; D directions share one launch per 16);
-_lin_p's transpose binds _adj_p (kinjax_vjp: the adjoint kernel, one launch per cotangent, recompute and reverse; then
-the Arrhenius-table reduction, only when that cotangent is wanted). jax.jvp, linearize, vjp, grad, jacfwd / jacrev and
-vmap all go through these rules. vmap: mapped cell operands are merged into the cells; (co)tangents mapped over an
+a static argument. The primal's JVP rule binds only _lin_p (FFI target kinjax_jvp: the tangent kernel, the guard and the
+recovery's tangent kernel; D directions share one launch per 16), whose outputs are the call's (bitwise kinjax_call's)
+and the tangents, so a forward-mode derivative costs one tangent call. Where the tangents are unknown and the call's
+operands known (linearize, vjp, grad, jax.checkpoint), partial evaluation splits _lin_p: the call's outputs from
+kinjax_call, the tangents from _lin_p staged as a linear map of the tangents. _lin_p's transpose binds _adj_p
+(kinjax_vjp: the adjoint kernel, one launch per cotangent, recompute and reverse; then the Arrhenius-table reduction,
+only when that cotangent is wanted). jax.jvp, linearize, vjp, grad, jacfwd / jacrev and vmap all go through these
+rules (partial evaluation by jax_use_direct_linearize, the default, or by jvp and partial evaluation). vmap: mapped cell operands are merged into the cells; (co)tangents mapped over an
 unmapped call become more directions (one primal recomputation per launch for all of them); the Arrhenius cotangent of a
 mapped call is reduced per mapped element (groups). The mechanism tables and rc cannot be mapped.
 """
@@ -40,7 +43,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
+from jax._src import core as jcore
 from jax._src import dispatch
+from jax._src.interpreters import partial_eval as pe
 from jax.extend.core import Primitive
 from jax.interpreters import ad, batching, mlir
 
@@ -217,19 +222,49 @@ def _zero(o):
 
 
 def _call_jvp(primals, tangents, **params):
-    outs = _call_p.bind(*primals, **params)
     if any(type(t) is not ad.Zero for t in tangents[NDIFF:]):
         raise NotImplementedError("kinjax: no derivative with respect to the mechanism tables")
     tan = list(tangents[:NDIFF])
     if not _has(primals[5]):
         tan[5] = _zero(primals[5])                                   # lm absent
     if all(type(t) is ad.Zero for t in tan):
+        outs = _call_p.bind(*primals, **params)
         return outs, [_zero(o) for o in outs]
     empty = jnp.zeros((0,), jnp.float64)
     lin = [ad.instantiate_zeros(t)[None] for t in tan[:5]] + [
         empty if type(t) is ad.Zero else t[None] for t in tan[5:]]
-    dx, dh = _lin_p.bind(*primals, *lin, **params)[:2]
-    return outs, [dx[0], dh[0]] + [_zero(o) for o in outs[2:]]
+    outs = _lin_p.bind(*primals, *lin, **params)                     # the call's outputs and the tangents at once
+    scratch = [jnp.zeros(a.shape, a.dtype) for a in _call_abstract(*primals, **params)[6:]]   # the call's, unused
+    prim = list(outs[2:8]) + scratch
+    return prim, [outs[0][0], outs[1][0]] + [_zero(o) for o in prim[2:]]
+
+
+def _lin_partial_eval(trace, *tracers, **params):
+    """_lin_p with known call operands and unknown tangents (linearize, vjp, grad, jax.checkpoint): the call's outputs
+    known, from kinjax_call; the tangents (and the scratch) from _lin_p staged. Otherwise the default rule."""
+    if not all(t.is_known() for t in tracers[:NP]) or all(t.is_known() for t in tracers[NP:]):
+        return trace.default_process_primitive(_lin_p, tracers, params)
+    outs = _call_p.bind(*(t.pval.get_known() for t in tracers[:NP]), **params)[:6]
+    staged = trace.default_process_primitive(_lin_p, tracers, params)
+    return staged[:2] + [trace.new_const(o) for o in outs] + staged[8:]
+
+
+def _lin_partial_eval_custom(saveable, unks_in, inst_in, eqn):
+    """_lin_partial_eval for jaxpr-level partial evaluation: a known kinjax_call equation for the call's outputs and the
+    staged _lin_p equation for the tangents."""
+    n = len(eqn.outvars)
+    res = [v for v, inst in zip(eqn.invars, inst_in) if type(v) is jcore.Var and not inst]
+    if not any(unks_in):
+        return eqn, None, [False] * n, [False] * n, []
+    if any(unks_in[:NP]):
+        return None, eqn, [True] * n, [True] * n, res
+    scratch = _call_abstract(*(v.aval for v in eqn.invars[:NP]), **eqn.params)[6:]
+    known = jcore.new_jaxpr_eqn(list(eqn.invars[:NP]), list(eqn.outvars[2:8]) + [jcore.DropVar(a) for a in scratch],
+                                _call_p, eqn.params, eqn.effects, eqn.source_info, eqn.ctx)
+    staged = eqn.replace(outvars=list(eqn.outvars[:2]) + [jcore.DropVar(v.aval) for v in eqn.outvars[2:8]]
+                         + list(eqn.outvars[8:]))
+    unk = [True] * 2 + [False] * 6 + [True] * (n - 8)
+    return known, staged, unk, unk, res
 
 
 def _lin_transpose(cts, *args, **params):
@@ -321,11 +356,17 @@ def _tan_batch(prim, args, dims, **params):
             res.append(o.reshape((o.shape[0], V, o.shape[1] // V) + o.shape[2:]))
         else:
             res.append(o.reshape((o.shape[0], V, B) + o.shape[2:]))
-    return res + list(outs[nout:]), [1 if _has(o) else None for o in outs[:nout]] + [None] * (len(outs) - nout)
+    rest, dims = list(outs[nout:]), [1 if _has(o) else None for o in outs[:nout]] + [None] * (len(outs) - nout)
+    if not adj:                                                    # the call's x, h, done, steps, flag: [V, B, ...]
+        rest[:5] = [o.reshape((V, B) + o.shape[1:]) for o in rest[:5]]
+        dims[2:7] = [0] * 5
+    return res + rest, dims
 
 
 ad.primitive_jvps[_call_p] = _call_jvp
 ad.primitive_transposes[_lin_p] = _lin_transpose
+pe.custom_partial_eval_rules[_lin_p] = _lin_partial_eval
+pe.partial_eval_jaxpr_custom_rules[_lin_p] = _lin_partial_eval_custom
 batching.primitive_batchers[_call_p] = _call_batch
 batching.primitive_batchers[_lin_p] = functools.partial(_tan_batch, _lin_p)
 batching.primitive_batchers[_adj_p] = functools.partial(_tan_batch, _adj_p)
