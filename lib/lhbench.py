@@ -95,7 +95,7 @@ def load_model(spec, ckpt, dev, newton=None):
     cfg = blob["cfg"]
     _, _, zlo, zhi = D.norm_consts(dev)
     m = M.build(cfg["head"], cfg["hidden"], zlo, zhi, newton=cfg.get("closed_iters", 12) if newton is None else newton,
-                fallback=cfg.get("closed_fallback", "keep")).to(dev)
+                fallback=cfg.get("closed_fallback", "keep"), latent=cfg.get("fm_latent", 512)).to(dev)
     m.load_state_dict(blob["state_dict"])
     return m.eval(), cfg
 

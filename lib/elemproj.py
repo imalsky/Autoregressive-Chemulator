@@ -54,6 +54,30 @@ def project_ln(ln_y, lr, na, nh, iters=12, clip=2.0, mol=None):
     return w - torch.logsumexp(w if mol is None else torch.index_select(w, -1, mol), -1, keepdim=True), res
 
 
+def project_cont(ln_y, ln0, lr, na, nh, stages=32, per=2, final=8, clip=2.0, mol=None):
+    """project_ln's family and clipped Newton step, reached by continuation from the input ln0 (whose own ratios are lr,
+    so lam = 0 solves the target ln0 exactly): per steps on each target ln0 + a (ln_y - ln0), a = 1/stages ... 1, then
+    final steps at a = 1. For rows that project_ln and project_lm cannot solve from lam = 0 (a near-flat Jacobian
+    direction when one entry dominates two element budgets); where they converge it returns their root. Returns
+    (w normalised over mol, residual) as project_ln."""
+    la, lh = torch.log(na), torch.log(nh)
+    lam = torch.zeros(lr.shape, dtype=ln_y.dtype, device=ln_y.device)
+    for a in [k / stages for k in range(1, stages + 1) for _ in range(per)] + [1.0] * final:
+        w = ln0 + a * (ln_y - ln0) + lam @ na.T
+        le = torch.logsumexp(w.unsqueeze(-1) + la, -2)
+        lhs = torch.logsumexp(w + lh, -1, keepdim=True)
+        F = le - lhs - lr
+        pe = torch.exp(w.unsqueeze(-1) + la - le.unsqueeze(-2))
+        q = torch.exp(w + lh - lhs)
+        J = torch.einsum("...se,sf->...ef", pe, na) - (q @ na).unsqueeze(-2)
+        step = torch.linalg.solve_ex(J, -F.unsqueeze(-1))[0].squeeze(-1)
+        step = torch.nan_to_num(step, nan=0.0, posinf=0.0, neginf=0.0)
+        lam = lam + torch.clamp(step, -clip, clip)
+    w = ln_y + lam @ na.T
+    res = (log_ratios(w, na, nh) - lr).abs().amax(-1)
+    return w - torch.logsumexp(w if mol is None else torch.index_select(w, -1, mol), -1, keepdim=True), res
+
+
 PIVOT_TINY = 1e-100   # _solve4 divisors at or below this magnitude flag the row
 
 

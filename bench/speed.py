@@ -5,7 +5,8 @@ random in the normalized ranges. Writes paths.OUT/speed_<run>.json.
     python speed.py <run> [<closed heads' Newton iterations>]
 <run>: a run name under paths.RUNS or a run folder (SPEED_NAME names the output instead of the folder); the state width is
 the normalization file's entry count (lhbench: M.S). SPEED_FALLBACK=lm times the closed head with the LM rescue on every
-row; SPEED_GPU_ONLY=1 skips the CPU timings.
+row; SPEED_GPU_ONLY=1 skips the CPU timings; SPEED_CKPT names the checkpoint (default stage2.pt; stage1.pt for single-stage
+runs).
 """
 import json
 import os
@@ -24,8 +25,9 @@ RUN = os.environ.get("SPEED_NAME") or Path(SPEC).name
 NEWTON = int(sys.argv[2]) if len(sys.argv) > 2 else None
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
+CKPT = os.environ.get("SPEED_CKPT", "stage2.pt")
 FALLBACK = os.environ.get("SPEED_FALLBACK")  # 'lm' times the closed head with the LM rescue on every row
-out = {"run": RUN, "closed_iters": NEWTON, "fallback": FALLBACK, "gpu": {}, "cpu1": {}, "cpu8": {}}
+out = {"run": RUN, "ckpt": CKPT, "closed_iters": NEWTON, "fallback": FALLBACK, "gpu": {}, "cpu1": {}, "cpu8": {}}
 
 
 def set_fallback(m):
@@ -45,7 +47,7 @@ def inputs(n, dev):
 
 
 dev = torch.device("cuda")
-model = set_fallback(LB.load_model(SPEC, "stage2.pt", dev, NEWTON)[0])
+model = set_fallback(LB.load_model(SPEC, CKPT, dev, NEWTON)[0])
 print(f"{RUN} on {torch.cuda.get_device_name(0)}; params {sum(p.numel() for p in model.parameters())}", flush=True)
 with torch.no_grad():
     for n in (1, 10, 100, 1000, 10_000, 100_000, 730_000):
@@ -72,7 +74,7 @@ with torch.no_grad():
         print(f"  GPU batch {n:7d}: {dt * 1e6:9.1f} us per call, {dt / n * 1e6:9.4f} us per cell", flush=True)
         del graph, z, gl, dtn
         torch.cuda.empty_cache()
-cpu_model = set_fallback(LB.load_model(SPEC, "stage2.pt", torch.device("cpu"), NEWTON)[0])
+cpu_model = set_fallback(LB.load_model(SPEC, CKPT, torch.device("cpu"), NEWTON)[0])
 CPU_RUNS = () if os.environ.get("SPEED_GPU_ONLY") else (("cpu1", 1, (1, 10, 100, 1000, 10_000)),
                                                           ("cpu8", 8, (1, 10, 100, 1000, 10_000, 100_000)))
 for key, nth, sizes in CPU_RUNS:

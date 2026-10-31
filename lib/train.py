@@ -98,6 +98,58 @@ DEFAULTS = {
     "chain_row_clip": 0.0,      # row's incoming state gradient to norm <= c (RowClip); chain_row_clip likewise for the chain
                                 # rollout. c is absolute: re-derive it when the batch, K or weight of the term change. Log:
                                 # rowclip_<term> = clipped (row, call) pairs / all
+    "s1_init_from": None,       # a stage file to start stage 1 from (a fine-tune; exclusive with init_from). A dt-aware head
+                                # (relaxclosedrdt) started from a head without the dt input gets that input's weight
+                                # columns at zero, so it starts as the same function (load_init)
+    "miss_w": 0.0, "miss_tau": 0.1, "miss_c": 1.0,   # stage 1: + miss_w x the mean over windows and the 12 scored gases
+                                # of phi(relu(a - miss_tau)), a = Misses.resid (dex), phi(x) = x^2 / (2 miss_c) up to
+                                # miss_c, then x - miss_c / 2: every miss gets a gradient that grows with it up to a
+                                # bounded slope (a few huge misses cannot own the batch)
+    "frac_w": 0.0, "frac_cap": 2.0,  # stage 1: + frac_w x the fractional error summed over a trajectory's calls and the 12
+                                # scored gases, averaged over trajectories: per point 10^a - 1 (a = Misses.resid, dex),
+                                # linear past frac_cap dex with the same slope (one-step windows: one call; rollouts:
+                                # roll_K calls)
+    "cvar_w": 0.0, "cvar_q": 0.05,    # stage 1: + cvar_w x the mean of the top cvar_q fraction of the windows' relu(worst a -
+                                # miss_tau) (worst = max over the 12 gases)
+    "roll_w": 0.0,              # stage 1: + roll_w x the loss of constant-condition rollouts, summed over their calls
+    "roll_batch": 512,          # (roll_draw): roll_batch runs, each from row 0 (share roll_t0_frac) or a log-uniform age in
+    "roll_K": 8,                # [1, 1e3] s, one dt each (log-uniform in data.DT_LOG); n_pre uniform in 0 to roll_pre_max
+    "roll_pre_max": 32,         # calls without gradient, then roll_K calls with gradient, each against the stored trajectory
+    "roll_t0_frac": 0.5,        # at that time (HybridLoss on the states + the miss terms when on); roll_row_clip as
+    "roll_row_clip": 0.0,       # grid_row_clip, after every call with gradient
+    "roll_pre0_frac": 0.0,      # > 0: n_pre = 0 (the rollout's first calls supervised) with this probability per step, else
+                                # uniform in 1 to roll_pre_max (0: n_pre uniform in 0 to roll_pre_max, the original draw)
+    "roll_pre_long_frac": 0.0,  # > 0: n_pre uniform in roll_pre_max + 1 to roll_pre_long_max with this probability per
+    "roll_pre_long_max": 256,   # step (after the roll_pre0_frac share), so rollouts also train at states reached late
+    "roll_late_frac": 0.0,      # > 0: each rollout run instead starts, with this probability (its own generator, not
+    "roll_late_tmin": 1e4,      # checkpointed, like the rollout generators), at an age log-uniform in [roll_late_tmin,
+                                # t_end - (n_pre + roll_K) x dt_max] s of its trajectory, so rollouts train at settled states
+    "stat_w": 0.0,              # stage 1: + stat_w x the late one-call term (stat_term): stat_batch runs, dt log-uniform in
+    "stat_batch": 2048,         # data.DT_LOG, a time log-uniform in [stat_tmin, t_end - dt]; per resolved non-He entry the
+    "stat_tmin": 1e4,           # signed residual of the call's change in log10 y, r = (d_pred - d_true) / (stat_eps +
+    "stat_eps": 1e-6,           # |d_true|) (dex; the projected update), Huber with transition stat_huber; the mean over the
+    "stat_huber": 1.0,          # entries whose truth moves less than stat_eps + stat_moving_w x the mean over those that move
+    "stat_moving_w": 0.0,       # more (own generator, not checkpointed; own compiled call; per-term gradient norms logged)
+    "stat_ramp": 0,             # > 0: stat_w ramps linearly from 0 over the stage's first stat_ramp steps
+    "stat_eps_dt": False,       # true: the floor is stat_eps x dt / dt_max, at least stat_eps_min (a per-time tolerance)
+    "stat_eps_min": 3e-7,
+    "stat_moving_scored": False,   # true: the moving mean over the 12 scored gases only
+    "s1_jump_w": 0.0,           # stage 1: + s1_jump_w x the long-jump loss of jump_batch pairs (data.sample_jump_pairs, D in
+                                # [jump_min_s, jump_max_s], as stage 2's jump term; own generator, not checkpointed, and
+                                # own compiled call)
+    "s2_joint": False,          # stage 2 also carries the miss / fractional terms (miss_w, frac_w) on its one-step windows
+                                # and the rollout term (roll_*; stage 1's generators, not checkpointed), so the short-run and
+                                # long-run terms train together
+    "fm_latent": 512,           # the flow-map head's latent width (head relaxclosedfm)
+    "s1_targets": 1,            # > 1: stage-1 one-step windows as batch / s1_targets anchor states with s1_targets end
+                                # points each, one dt per equal log-width slice of data.DT_LOG (multi_targets)
+    "resample_every": 0,        # stage 1: every n steps, per-trajectory draw weights: (1 - resample_alpha) uniform +
+    "resample_alpha": 0.0,      # resample_alpha in proportion to clamp(e / miss_tau - 1, 0, resample_cap), e = the live
+    "resample_cap": 10.0,       # model's worst scored error on two windows of each training run (from row 0, and from a
+                                # log-uniform start in 1e-3..1e3 s; dt as the one-step windows; own generator)
+                                # (miss_weights). 0 = off
+    "log_misses": False,        # log rows add the sampled batch's share of one-step windows with a scored miss (> miss_tau)
+                                # and a large miss (> 1 dex), its worst error, and its share of rows whose projection failed
     "clip_norm_fp64": False,    # the global gradient norm in fp64 (fp32 sums of squares overflow above ~1.8e19); log rows add
                                 # the pre-clip norm's median (gnorm_p50, per grid sub-step count gnorm_p50_nsub), max and
                                 # the steps above 1e3 (gnorm_gt1e3)
@@ -152,6 +204,226 @@ def row_clip(z, rc):
         return z
     rc[2] += z.shape[0]
     return RowClip.apply(z, rc)
+
+
+class Misses:
+    """Errors on the 12 scored gases of z states and the miss terms built on them (miss_w, cvar_w). zp, zt [B, S] fp64 z
+    states, lnd [B] log10 number density (cm^-3).
+    err: the score's per-gas error [B, 12] (dex), 0 where a point does not count, as scorerule.err with SCORE_RULE phys (for
+    logs and the draw weights).
+    resid: the training residual [B, 12] (dex): |p - t| where the truth t is at or above the gas's floor S, max(p - S, 0)
+    where it is below, 0 on unresolved points (mask without gradient). Unlike err it keeps a gradient when a gas that is
+    present is predicted below its floor (err is flat there)."""
+
+    def __init__(self, cfg, mu, sd, dev):
+        self.cols = torch.tensor([D.SHORT.index(s) for s in C.REPORTED], device=dev)
+        self.mu, self.sd = mu[self.cols], sd[self.cols]
+        self.floor = torch.tensor([SR.PHYS[s] for s in C.REPORTED], dtype=torch.float64, device=dev)
+        self.w, self.tau, self.c, self.cw, self.q = cfg["miss_w"], cfg["miss_tau"], cfg["miss_c"], cfg["cvar_w"], cfg["cvar_q"]
+        self.fw, self.fcap = cfg["frac_w"], cfg["frac_cap"]
+        self.on = self.w > 0 or self.cw > 0 or self.fw > 0   # any miss-aware loss term
+
+    def err(self, zp, zt, lnd):
+        lp = zp[:, self.cols] * self.sd + self.mu
+        lt = zt[:, self.cols] * self.sd + self.mu
+        res = ((lt + lnd[:, None]) >= -2.0) | ((lp + lnd[:, None]) >= -2.0)
+        cnt = res & ((lt >= self.floor) | (lp >= self.floor))
+        return torch.where(cnt, (torch.maximum(lp, self.floor) - torch.maximum(lt, self.floor)).abs(), torch.zeros_like(lp))
+
+    def resid(self, zp, zt, lnd):
+        lp = zp[:, self.cols] * self.sd + self.mu
+        lt = zt[:, self.cols] * self.sd + self.mu
+        with torch.no_grad():
+            res = ((lt + lnd[:, None]) >= -2.0) | ((lp + lnd[:, None]) >= -2.0)
+        a = torch.where(lt >= self.floor, (lp - lt).abs(), torch.relu(lp - self.floor))
+        return torch.where(res, a, torch.zeros_like(a))
+
+    def loss(self, zp, zt, lnd, calls=1):
+        """The miss-aware terms on rows of states [B, S]; calls = the calls per trajectory when the rows are a
+        trajectory's calls in order (rollouts, call-minor): the fractional term is then summed over each trajectory."""
+        a = self.resid(zp, zt, lnd)
+        out = zp.new_zeros(())
+        if self.fw > 0:
+            ac = torch.clamp(a, max=self.fcap)
+            f = torch.pow(10.0, ac) - 1.0 + math.log(10.0) * 10.0 ** self.fcap * torch.relu(a - self.fcap)
+            out = out + self.fw * calls * f.sum(-1).mean()
+        if self.w > 0:
+            x = torch.relu(a - self.tau)
+            out = out + self.w * torch.where(x <= self.c, x.square() / (2.0 * self.c), x - 0.5 * self.c).mean()
+        if self.cw > 0:
+            worst = torch.relu(a.amax(-1) - self.tau)
+            out = out + self.cw * torch.topk(worst, max(1, math.ceil(self.q * worst.numel()))).values.mean()
+        return out
+
+
+@torch.no_grad()
+def miss_weights(model, train, ms, cfg, gen, bs=16384):
+    """resample_every: per-trajectory draw weights from the live model's worst scored error on two one-step windows of
+    every training run, one from row 0 (t = 0) and one from a log-uniform start in [1e-3, 1e3] s, each at a log-uniform
+    dt in data.DT_LOG (eager calls, the training projection). Returns weights fp32 [n] from m = clamp(e /
+    miss_tau - 1, 0, resample_cap) mixed with uniform weights: (1 - resample_alpha) / n + resample_alpha m / sum m (uniform
+    if no run misses), and the share of runs with e > miss_tau."""
+    dev, n = train.device, train.n
+    e = torch.empty(n, dtype=torch.float64, device=dev)
+    lo, hi = D.DT_LOG
+    for i in range(0, n, bs):
+        idx = torch.arange(i, min(n, i + bs), device=dev)
+        B = idx.numel()
+        dt0, dt1 = (torch.pow(10.0, lo + (hi - lo) * torch.rand(B, device=dev, generator=gen, dtype=torch.float64))
+                    for _ in range(2))
+        ts = torch.pow(10.0, -3.0 + 6.0 * torch.rand(B, device=dev, generator=gen, dtype=torch.float64))
+        ts = torch.minimum(ts, train.t[train.end[idx]] - dt1)
+        z0 = train.z_of(train.logy[idx, 0])
+        y = train.logy_at(idx, torch.stack([dt0, ts, ts + dt1], 1))
+        zz = train.z_of(y)
+        g, lnd = train.g[idx], train.lnd[idx]
+        p0 = z0 + model.delta(z0.float(), D.dt_norm_of(dt0).float(), g).double()
+        p1 = zz[:, 1] + model.delta(zz[:, 1].float(), D.dt_norm_of(dt1).float(), g).double()
+        e[i:i + B] = torch.maximum(ms.err(p0, zz[:, 0], lnd).amax(-1), ms.err(p1, zz[:, 2], lnd).amax(-1))
+    m = torch.clamp(e / cfg["miss_tau"] - 1.0, 0.0, cfg["resample_cap"])
+    al = cfg["resample_alpha"] if float(m.sum()) > 0 else 0.0
+    w = (1.0 - al) / n + al * m / torch.clamp(m.sum(), min=1e-300)
+    return w.float(), float((e > cfg["miss_tau"]).double().mean())
+
+
+def roll_draw(train, cfg, gen, pre_gen, late_gen=None):
+    """The rollout term's draw: roll_batch runs (uniform, or train.w when set), start age 0 (row 0) with probability
+    roll_t0_frac else log-uniform in [1, 1e3] s, one dt per run (log-uniform in data.DT_LOG), n_pre uniform in 0 to
+    roll_pre_max on the host generator pre_gen; with late_gen, a run starts instead with probability roll_late_frac at an
+    age log-uniform in [roll_late_tmin, t_end - (n_pre + roll_K) x dt_max] of its trajectory (draws on late_gen only).
+    Returns z0 [B, S] (the state at the start age), the truth after calls n_pre + 1 to n_pre + roll_K [B, K, S]
+    (RawSplit.logy_at), dt_norm [B], g [B, G], lnd [B] and n_pre."""
+    dev, B, K = train.device, cfg["roll_batch"], cfg["roll_K"]
+    if cfg["roll_pre0_frac"] > 0 or cfg["roll_pre_long_frac"] > 0:
+        r = float(torch.rand(1, generator=pre_gen))
+        if r < cfg["roll_pre0_frac"]:
+            n_pre = 0
+        elif r < cfg["roll_pre0_frac"] + cfg["roll_pre_long_frac"]:
+            n_pre = int(torch.randint(cfg["roll_pre_max"] + 1, cfg["roll_pre_long_max"] + 1, (1,), generator=pre_gen))
+        else:
+            n_pre = int(torch.randint(1, cfg["roll_pre_max"] + 1, (1,), generator=pre_gen))
+    else:
+        n_pre = int(torch.randint(0, cfg["roll_pre_max"] + 1, (1,), generator=pre_gen))
+    idx = train.draw(B, gen)
+    lo, hi = D.DT_LOG
+    dt = torch.pow(10.0, lo + (hi - lo) * torch.rand(B, device=dev, generator=gen, dtype=torch.float64))
+    age = torch.pow(10.0, 3.0 * torch.rand(B, device=dev, generator=gen, dtype=torch.float64))
+    at0 = torch.rand(B, device=dev, generator=gen) < cfg["roll_t0_frac"]
+    if late_gen is not None:
+        late = torch.rand(B, device=dev, generator=late_gen) < cfg["roll_late_frac"]
+        lo_t = math.log10(cfg["roll_late_tmin"])
+        hi_t = torch.log10(train.t[train.end[idx]].double() - (n_pre + K) * 10.0 ** hi)
+        assert bool((hi_t > lo_t).all()), "roll_late_tmin leaves no room before a trajectory's end"
+        age = torch.where(late, torch.pow(10.0, lo_t + (hi_t - lo_t) * torch.rand(B, device=dev, generator=late_gen,
+                                                                                    dtype=torch.float64)), age)
+        at0 = at0 & torch.logical_not(late)
+    age = torch.where(at0, torch.zeros_like(age), age)
+    k = torch.arange(n_pre + 1, n_pre + K + 1, device=dev, dtype=torch.float64)
+    zt = train.z_of(train.logy_at(idx, age[:, None] + dt[:, None] * k[None]))
+    z0 = train.z_of(train.logy_at(idx, torch.clamp(age, min=float(train.t[1]))[:, None].contiguous()))[:, 0]
+    z0 = torch.where(at0[:, None], train.z_of(train.logy[idx, 0]), z0)
+    return z0, zt, D.dt_norm_of(dt).float(), train.g[idx], train.lnd[idx], n_pre
+
+
+def stat_term(sfn, train, cfg, gen, mu, sd, scol, sfloor, he):
+    """The late one-call term (stat_w): stat_batch runs (train.draw), dt log-uniform in data.DT_LOG, a time t log-uniform
+    in [stat_tmin, t_end - dt] of the run; z(t) and z(t + dt) from RawSplit.logy_at; one model call sfn (the projected
+    update). With stat_eps_dt the floor eps is stat_eps x dt / dt_max (at least stat_eps_min) for the residual and the
+    still / moving split; with stat_moving_scored the moving entries are the scored gases only. Entries count where
+    resolved (truth or prediction >= 1e-2 cm^-3), the scored gases also where truth or
+    prediction is at or above the gas's floor (scorerule.PHYS), He never. r = (d_pred - d_true) / (stat_eps + |d_true|) in
+    dex; Huber(r) with transition stat_huber; returns the mean over the counted entries whose truth moves less than
+    stat_eps + stat_moving_w x the mean over the others, both means (detached) and diagnostics (the still mean over the
+    scored gases, still / moving entries per row, the median |r| of the still entries)."""
+    dev, B = train.device, cfg["stat_batch"]
+    idx = train.draw(B, gen)
+    lo, hi = D.DT_LOG
+    dt = torch.pow(10.0, lo + (hi - lo) * torch.rand(B, device=dev, generator=gen, dtype=torch.float64))
+    lo_t = math.log10(cfg["stat_tmin"])
+    hi_t = torch.log10(train.t[train.end[idx]].double() - dt)
+    assert bool((hi_t > lo_t).all()), "stat_tmin leaves no room before a trajectory's end"
+    t = torch.pow(10.0, lo_t + (hi_t - lo_t) * torch.rand(B, device=dev, generator=gen, dtype=torch.float64))
+    zz = train.z_of(train.logy_at(idx, torch.stack([t, t + dt], 1)))                 # [B, 2, S] fp64
+    z0 = zz[:, 0]
+    d_true = (zz[:, 1] - z0) * sd                                                     # dex
+    d_pred = sfn(z0.float(), D.dt_norm_of(dt).float(), train.g[idx]).double() * sd
+    with torch.no_grad():
+        lt, lp = zz[:, 1] * sd + mu, z0 * sd + mu + d_pred
+        lnd = train.lnd[idx].reshape(-1, 1)
+        cnt = ((lt + lnd) >= -2.0) | ((lp + lnd) >= -2.0)
+        cnt[:, scol] &= (lt[:, scol] >= sfloor) | (lp[:, scol] >= sfloor)
+        cnt[:, he] = False
+        still = cnt & (d_true.abs() < (cfg["stat_eps"] if not cfg["stat_eps_dt"] else torch.clamp(
+            cfg["stat_eps"] * dt / 10.0 ** hi, min=cfg["stat_eps_min"]).reshape(-1, 1)))
+        moving = cnt & torch.logical_not(still)
+        if cfg["stat_moving_scored"]:
+            sc = torch.zeros_like(moving)
+            sc[:, scol] = True
+            moving = moving & sc
+    eps = cfg["stat_eps"]
+    if cfg["stat_eps_dt"]:
+        eps = torch.clamp(cfg["stat_eps"] * dt / 10.0 ** hi, min=cfg["stat_eps_min"]).reshape(-1, 1)
+    r = (d_pred - d_true) / (eps + d_true.abs())
+    h, a = cfg["stat_huber"], r.abs()
+    hub = torch.where(a <= h, 0.5 * r * r, h * (a - 0.5 * h))
+    ls = (hub * still).sum() / still.sum().clamp(min=1)
+    lm = (hub * moving).sum() / moving.sum().clamp(min=1)
+    with torch.no_grad():   # diagnostics: the still mean over the scored gases, and the counted entries per row
+        scm = torch.zeros_like(still)
+        scm[:, scol] = True
+        diag = {"still_scored": (hub * (still & scm)).sum() / (still & scm).sum().clamp(min=1),
+                "n_still": still.sum() / B, "n_moving": moving.sum() / B,
+                "med": a[still].median() if bool(still.any()) else a.new_zeros(())}
+    return ls + cfg["stat_moving_w"] * lm, ls.detach(), lm.detach(), diag
+
+
+def multi_targets(train, cfg, gen):
+    """s1_targets > 1: the stage-1 one-step windows as batch / T anchor states (T = s1_targets) with T end points each,
+    one dt per equal log-width slice of data.DT_LOG (uniform in log within it). Anchor starts as RawSplit.sample draws
+    them: row 0 with the run's p0_anchor probability, else the first positive stored time with probability
+    data.ANCHOR_P, else log-uniform in [t[1], t_end - dt_max]. Labels from RawSplit.logy_at. Returns z [B, 2, S] (anchor,
+    end point), dt_norm [B], g [B, G], idx [B], anchor-major (the T end points of one anchor are adjacent)."""
+    dev, T = train.device, cfg["s1_targets"]
+    assert cfg["batch"] % T == 0, f"batch {cfg['batch']} is not a multiple of s1_targets {T}"
+    m = cfg["batch"] // T
+    idx = train.draw(m, gen)
+    lo, hi = D.DT_LOG
+    t1 = train.t[1]
+    thi = torch.clamp(train.t[train.end[idx]] - 10.0 ** hi, min=float(t1) * (1 + 1e-12))
+    u = torch.rand(m, device=dev, generator=gen, dtype=torch.float64)
+    ts = torch.pow(10.0, torch.log10(t1) + u * (torch.log10(thi) - torch.log10(t1)))
+    ts = torch.where(torch.rand(m, device=dev, generator=gen) < D.ANCHOR_P, t1.expand(m), ts)
+    a0 = torch.zeros(m, dtype=torch.bool, device=dev)
+    if train.p0_anchor is not None:
+        a0 = torch.rand(m, device=dev, generator=gen) < train.p0_anchor[idx]
+        ts = torch.where(a0, torch.zeros_like(ts), ts)
+    j = torch.arange(T, device=dev, dtype=torch.float64)
+    dt = torch.pow(10.0, lo + (hi - lo) * (j + torch.rand(m, T, device=dev, generator=gen, dtype=torch.float64)) / T)
+    y0 = train.logy_at(idx, torch.where(a0, t1.expand(m), ts)[:, None].contiguous())[:, 0]   # row 0: placeholder time
+    y0 = torch.where(a0[:, None], train.logy[idx, 0], y0)
+    y1 = train.logy_at(idx, ts[:, None] + dt)                                                 # [m, T, S]
+    z = torch.stack([train.z_of(y0).repeat_interleave(T, 0), train.z_of(y1).reshape(m * T, -1)], 1)
+    return z, D.dt_norm_of(dt.reshape(-1)).float(), train.g[idx].repeat_interleave(T, 0), idx.repeat_interleave(T)
+
+
+def load_init(model, path, dev):
+    """A stage file's weights into model (init_from, s1_init_from). A dt-aware head started from a head without the dt input:
+    the first layer's (and its projection's) weight column for the dt input is added at zero, so the start is the same
+    function; likewise a mixed-mode head's added outputs from a per-entry or a mixed-mode head."""
+    sdict = torch.load(path, map_location=dev)["state_dict"]
+    own = model.state_dict()
+    if getattr(model, "rate_dt", None) is not None and not any(k.startswith("rate_dt.") for k in sdict):
+        sdict.update({k: v for k, v in own.items() if k.startswith("rate_dt.")})   # the zero-initialized rate branch
+    if getattr(model, "vmix", False):   # a mixed-mode head from a per-entry or a mixed-mode head: the added outputs at zero
+        for k in ("trunk.out.weight", "trunk.out.bias"):   # (V = I, U = I: the start is the stored model)
+            if k in sdict and k in own and sdict[k].shape[0] in (2 * M.S, 2 * M.S + M.S * (M.S - 1) // 2) \
+                    and sdict[k].shape[0] < own[k].shape[0]:
+                sdict[k] = torch.cat([sdict[k], torch.zeros_like(own[k][sdict[k].shape[0]:])], 0)
+    if getattr(model, "dt_input", False):
+        for k in ("trunk.linears.0.weight", "trunk.projs.0.weight"):
+            if k in sdict and k in own and sdict[k].shape[1] + 1 == own[k].shape[1]:
+                sdict[k] = torch.cat([sdict[k], torch.zeros_like(sdict[k][:, :1])], 1)
+    model.load_state_dict(sdict)
 
 
 def lr_at(step, total, peak, warmup, min_frac):
@@ -471,8 +743,8 @@ def lock_terms(fns, crit, train, cs, cfg, step, gen, pre_gen, mu, sd, rep, want_
     """Stage 2's terms: every batch drawn first (one-step windows, jump pairs, grid chains on gen; chain windows on the
     store's generator and pre_gen), then the one-step windows and the jump pairs in one model call and the grid and chain
     rollouts in lock_rollouts. Returns the one-step + jump + grid loss (summed in that order), the chain loss and tail,
-    n_pre and K."""
-    z, dtn, g, _ = train.sample(cfg["batch"], 1, gen)
+    n_pre, K and the one-step windows' (d_pred, z0, z1, idx) for s2_joint."""
+    z, dtn, g, idx = train.sample(cfg["batch"], 1, gen)
     z0 = z[:, 0]
     d_true = (z[:, 1] - z0).float()
     j0, j1, jdt, jg = D.sample_jump_pairs(train, cfg["jump_batch"], gen, cfg["jump_min_s"], cfg["jump_max_s"])
@@ -488,7 +760,7 @@ def lock_terms(fns, crit, train, cs, cfg, step, gen, pre_gen, mu, sd, rep, want_
     gl = crit(gp, gz[:, 1:])["loss_total"]
     loss = loss + cfg["grid_w"] * gl
     cl, tail = chain_loss(crit, cfg, w, n_pre, cpred, mu, sd, rep, want_tail)
-    return loss, cl, tail, n_pre, K
+    return loss, cl, tail, n_pre, K, (d_pred, z0, z[:, 1], idx)
 
 
 def run_stage(stage, cfg, model, train, vy, vdt, vg, mu, sd, run, log, pr=None, t0r=None):
@@ -509,14 +781,72 @@ def run_stage(stage, cfg, model, train, vy, vdt, vg, mu, sd, run, log, pr=None, 
         rep = torch.tensor([D.SHORT.index(s) for s in C.REPORTED], device=dev)
         cacc = [0.0, 0.0, 0, 0]  # chain loss, tail (sampled every 50 steps), samples; sum of n_pre over the log interval
         log(stage, None, chain_paths=cs.info, chain_calls=int(cs.n.sum()))
+    macc = racc = 0.0                                               # miss / rollout term samples (as acc), logged
+    rfn = gen_roll = pre_roll = late_roll = None
+    if (stage == 1 or cfg["s2_joint"]) and cfg["roll_w"] > 0:   # the rollout term's calls (compiled like lock_fns' grid
+        # call) and generators
+        def rstep(zs, dtn, g):
+            return zs + model.delta(zs.float(), dtn, g).double()
+
+        def rstep_ng(zs, dtn, g):
+            return zs + model.delta(zs.float(), dtn, g).double()
+        cmp = (lambda fn: torch.compile(fn, fullgraph=True)) if cfg["compile"] else (lambda fn: fn)
+        rfn = {"step": cmp(rstep), "pre": cmp(rstep_ng)}
+        gen_roll = torch.Generator(device=dev).manual_seed(1000 * cfg["seed"] + 14)
+        pre_roll = torch.Generator().manual_seed(1000 * cfg["seed"] + 15)
+        if cfg["roll_late_frac"] > 0:
+            late_roll = torch.Generator(device=dev).manual_seed(1000 * cfg["seed"] + 16)
+    sfn = stat_gen = None
+    sacc = [0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0]   # stat term: still / moving means, median |r|, samples, scored still, counts
+    if stage == 1 and cfg["stat_w"] > 0:   # the late one-call term's own compiled call and generator
+        def sstep(zs, dtn, g):
+            return model.delta(zs, dtn, g)
+        sfn = torch.compile(sstep, fullgraph=True) if cfg["compile"] else sstep
+        stat_gen = torch.Generator(device=dev).manual_seed(1000 * cfg["seed"] + 17)
+        scol = torch.tensor([D.SHORT.index(s_) for s_ in C.REPORTED], device=dev)
+        sfloor = torch.tensor([SR.PHYS[s_] for s_ in C.REPORTED], dtype=torch.float64, device=dev)
+        she = D.SHORT.index("He")
+    jfn = jump_gen = None
+    jacc = 0.0                                                      # stage-1 jump term samples (as acc), logged
+    if stage == 1 and cfg["s1_jump_w"] > 0:   # the stage-1 long-jump term's own compiled call and generator
+        def jstep(zs, dtn, g):
+            return model.delta(zs, dtn, g)
+        jfn = torch.compile(jstep, fullgraph=True) if cfg["compile"] else jstep
+        jump_gen = torch.Generator(device=dev).manual_seed(1000 * cfg["seed"] + 18)
+    gns = {}                                                        # stat term: per-term gradient norms at the log step
+    ms = Misses(cfg if stage == 1 else {**cfg, "cvar_w": 0.0}, mu, sd, dev) if (stage == 1 or cfg["s2_joint"]) \
+        and (cfg["miss_w"] > 0 or cfg["cvar_w"] > 0 or cfg["frac_w"] > 0
+                                                     or cfg["resample_every"] > 0
+                                                     or cfg["log_misses"]) else None
+    rs_gen = torch.Generator(device=dev).manual_seed(1000 * cfg["seed"] + 13) if stage == 1 and cfg["resample_every"] > 0 \
+        else None
     params = list(model.parameters())
     rcs = {k: [float(cfg[f"{k}_row_clip"]), torch.zeros((), dtype=torch.int64, device=dev), 0]
            if cfg[f"{k}_row_clip"] > 0 and stage == 2 else None for k in ("grid", "chain")}
+    rcs["roll"] = [float(cfg["roll_row_clip"]), torch.zeros((), dtype=torch.int64, device=dev), 0] \
+        if cfg["roll_row_clip"] > 0 and (stage == 1 or cfg["s2_joint"]) and cfg["roll_w"] > 0 else None
     gnl = []                                                        # clip_norm_fp64: (grid sub-steps, pre-clip norm) per step
     if lock:
         lfns = lock_fns(model, delta_fn, cfg["compile"], mu, sd)
         lfns.update(rc_g=rcs["grid"], rc_c=rcs["chain"])
     nskip = nskip_log = 0                                           # skip_nonfinite: steps skipped so far, at the last log row
+
+    def roll_term():   # the rollout term: the loss of every call with gradient, summed (averaged) over them
+        rz, rzt, rdtn, rg, rlnd, rpre = roll_draw(train, cfg, gen_roll, pre_roll, late_roll)
+        with torch.no_grad():
+            for _ in range(rpre):
+                rz = rfn["pre"](rz, rdtn, rg)
+        rp = []
+        for _ in range(cfg["roll_K"]):
+            rz = row_clip(rfn["step"](rz, rdtn, rg), rcs["roll"])
+            rp.append(rz)
+        rp = torch.stack(rp, 1)
+        rl = crit(rp, rzt)["loss_total"]
+        if ms is not None and ms.on:
+            S_ = rp.shape[-1]
+            rl = rl + ms.loss(rp.reshape(-1, S_), rzt.reshape(-1, S_), rlnd.repeat_interleave(cfg["roll_K"]),
+                              calls=cfg["roll_K"])
+        return rl
     ck = run / f"ckpt_stage{stage}.pt"
     step0 = 0
     if cfg["resume"] and ck.exists():
@@ -537,24 +867,77 @@ def run_stage(stage, cfg, model, train, vy, vdt, vg, mu, sd, run, log, pr=None, 
         for pg in opt.param_groups:
             pg["lr"] = lr_at(step, steps, peak, warm, cfg["lr_min_frac"])
         if lock:
-            loss, cl, tail, n_pre, kc = lock_terms(lfns, crit, train, cs, cfg, step, gen, pre_gen, mu, sd, rep,
-                                                   (step + 1) % 50 == 0)
+            loss, cl, tail, n_pre, kc, one = lock_terms(lfns, crit, train, cs, cfg, step, gen, pre_gen, mu, sd, rep,
+                                                        (step + 1) % 50 == 0)
             loss = loss + cfg["chain_w"] * cl
             if cfg["chain_tail_w"] > 0:
                 loss = loss + cfg["chain_tail_w"] * tail
+            if cfg["s2_joint"]:   # stage 1's short-run terms beside the long-run ones
+                d_pred, z0, z1, idx = one
+                if ms is not None and ms.on:
+                    ml = ms.loss(z0 + d_pred.double(), z1, train.lnd[idx])
+                    loss = loss + ml
+                    macc += float(ml.detach()) if (step + 1) % cfg["loss_every"] == 0 else 0.0
+                if rfn is not None:
+                    rl = roll_term()
+                    loss = loss + cfg["roll_w"] * rl
+                    racc += float(rl.detach()) if (step + 1) % cfg["loss_every"] == 0 else 0.0
             cacc[3] += n_pre
             if (step + 1) % 50 == 0:
                 cacc[0] += float(cl.detach())
                 cacc[1] += float(tail.detach())
                 cacc[2] += 1
         else:
-            z, dtn, g, _ = train.sample(cfg["batch"], 1, gen)
+            if rs_gen is not None and (step % cfg["resample_every"] == 0 or step == step0):   # weights are not checkpointed
+                train.w, rs_share = miss_weights(model, train, ms, cfg, rs_gen)
+                log(stage, step, resample_miss_share=rs_share, resample_w_mean=float(train.w.mean()))
+            z, dtn, g, idx = train.sample(cfg["batch"], 1, gen) if cfg["s1_targets"] <= 1 else multi_targets(train, cfg, gen)
             z0 = z[:, 0]
             d_true = (z[:, 1] - z0).float()
             d_pred = delta_fn(z0.float(), dtn, g)
             loss = crit(d_pred.unsqueeze(1), d_true.unsqueeze(1))["loss_total"]
+            if ms is not None and ms.on:
+                ml = ms.loss(z0 + d_pred.double(), z[:, 1], train.lnd[idx])
+                loss = loss + ml
+                macc += float(ml.detach()) if (step + 1) % cfg["loss_every"] == 0 else 0.0
+            if rfn is not None:
+                rl = roll_term()
+                loss = loss + cfg["roll_w"] * rl
+                racc += float(rl.detach()) if (step + 1) % cfg["loss_every"] == 0 else 0.0
+            if jfn is not None:   # the stage-1 long-jump term: one call from z(t) across D to z(t + D)
+                j0, j1, jdt, jg = D.sample_jump_pairs(train, cfg["jump_batch"], jump_gen, cfg["jump_min_s"],
+                                                      cfg["jump_max_s"])
+                jl = crit((j0 + jfn(j0.float(), jdt, jg).double()).unsqueeze(1), j1.unsqueeze(1))["loss_total"]
+                loss = loss + cfg["s1_jump_w"] * jl
+                jacc += float(jl.detach()) if (step + 1) % cfg["loss_every"] == 0 else 0.0
+            if sfn is not None:   # the late one-call term (stat_term; its own graph through sfn)
+                sl, ls_, lm_, dg_ = stat_term(sfn, train, cfg, stat_gen, mu, sd, scol, sfloor, she)
+                sw = cfg["stat_w"] * (min(1.0, step / cfg["stat_ramp"]) if cfg["stat_ramp"] > 0 else 1.0)
+                if (step + 1) % cfg["loss_every"] == 0:
+                    sacc[0] += float(ls_)
+                    sacc[1] += float(lm_)
+                    sacc[2] += float(dg_["med"])
+                    sacc[3] += 1
+                    sacc[4] += float(dg_["still_scored"])
+                    sacc[5] += float(dg_["n_still"])
+                    sacc[6] += float(dg_["n_moving"])
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        if sfn is not None and (step + 1) % cfg["log_every"] == 0:
+            # per-term gradient norms (fp64) before the global clip: the stat graph is separate, so its gradient is taken
+            # alone (compiled backwards allow one pass per graph), the main loss is back-propagated, then the two are added
+            gs_ = torch.autograd.grad(sw * sl, params, allow_unused=True)
+            loss.backward()
+            nrm = lambda gl: float(torch.linalg.vector_norm(torch.stack(
+                [torch.linalg.vector_norm(q_, dtype=torch.float64) for q_ in gl if q_ is not None])))
+            gns.update(gnorm_main=nrm([p_.grad for p_ in params]), gnorm_stat=nrm(gs_))
+            for p_, g_ in zip(params, gs_):
+                if g_ is not None:
+                    p_.grad = g_ if p_.grad is None else p_.grad + g_
+            loss = (loss + sw * sl).detach()
+        else:
+            if sfn is not None:
+                loss = loss + sw * sl
+            loss.backward()
         if cfg["clip_norm_fp64"]:   # as clip_grad_norm_ with the norm in fp64
             gl_ = [p_.grad for p_ in params if p_.grad is not None]
             tn = torch.linalg.vector_norm(torch.stack([torch.linalg.vector_norm(q_, dtype=torch.float64) for q_ in gl_]))
@@ -595,6 +978,34 @@ def run_stage(stage, cfg, model, train, vy, vdt, vg, mu, sd, run, log, pr=None, 
                     extra[f"rowclip_{k_}"] = int(rc[1]) / max(1, rc[2])
                     rc[1].zero_()
                     rc[2] = 0
+            if ms is not None and ms.on:
+                extra["miss_loss"] = macc / max(1, nacc)
+                macc = 0.0
+            if rfn is not None:
+                extra["roll_loss"] = racc / max(1, nacc)
+                racc = 0.0
+            if jfn is not None:
+                extra["jump_loss"] = jacc / max(1, nacc)
+                jacc = 0.0
+            if sfn is not None:
+                n_ = max(1, sacc[3])
+                extra.update(stat_still=sacc[0] / n_, stat_moving=sacc[1] / n_, stat_r_median=sacc[2] / n_,
+                             stat_still_scored=sacc[4] / n_, stat_n_still=sacc[5] / n_, stat_n_moving=sacc[6] / n_, **gns)
+                sacc[:] = [0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0]
+            if ms is not None and cfg["log_misses"] and not lock:   # this step's batch: misses and projection failures
+                with torch.no_grad():
+                    model.rowcount = torch.zeros(z0.shape[0], 2, dtype=torch.long, device=dev)
+                    e_ = ms.err(z0 + model.delta(z0.float(), dtn, g).double(), z[:, 1], train.lnd[idx]).amax(-1)
+                    extra.update(miss_share=float((e_ > cfg["miss_tau"]).double().mean()),
+                                 large_share=float((e_ > 1.0).double().mean()), worst=float(e_.max()),
+                                 proj_fail_share=float((model.rowcount[:, 1] > 0).double().mean()))
+                    model.rowcount = None
+            elif ms is not None and cfg["log_misses"] and cfg["s2_joint"]:   # stage 2: this step's one-step windows
+                with torch.no_grad():
+                    d_pred, z0, z1, idx = one
+                    e_ = ms.err(z0 + d_pred.double(), z1, train.lnd[idx]).amax(-1)
+                    extra.update(miss_share=float((e_ > cfg["miss_tau"]).double().mean()),
+                                 large_share=float((e_ > 1.0).double().mean()), worst=float(e_.max()))
             if dev.type == "cuda":   # peak allocated memory since the start (log only)
                 extra["peak_mem_gb"] = torch.cuda.max_memory_allocated(dev) / 1e9
             log(stage, step + 1, train_loss=acc / max(1, nacc), lr=opt.param_groups[0]["lr"],
@@ -663,9 +1074,21 @@ def main(run):
         assert w.shape == (train.n,) and np.all(w >= 0) and w.sum() > 0, (w.shape, train.n)
         train.w = torch.from_numpy(w).float().to(dev)   # fp32 weights
     train.p0_anchor, train.p0_jump = row0_probs(cfg, train)
+    if cfg["init_from"] and cfg["s1_init_from"]:
+        sys.exit(f"{run / 'config.json'}: init_from (stage 2 only) and s1_init_from (stage 1 from a file) are exclusive")
+    if cfg["s2_joint"] and cfg["s2_steps"] <= 0:
+        sys.exit(f"{run / 'config.json'}: s2_joint needs a stage 2")
+    if (cfg["cvar_w"] > 0 or cfg["resample_every"] > 0 or cfg["stat_w"] > 0 or cfg["s1_jump_w"] > 0
+            or (not cfg["s2_joint"] and (cfg["miss_w"] > 0 or cfg["frac_w"] > 0 or cfg["roll_w"] > 0))) \
+            and (cfg["init_from"] or cfg["s1_steps"] <= 0):
+        sys.exit(f"{run / 'config.json'}: cvar_w, resample_every, stat_w, s1_jump_w and (without s2_joint) miss_w, frac_w and "
+                 "roll_w act in stage 1 only, and this run has no stage 1")
+    if cfg["resample_every"] > 0 and cfg["traj_weights_file"] is not None:
+        sys.exit(f"{run / 'config.json'}: resample_every replaces the draw weights; traj_weights_file must be None")
+    train.lnd = torch.from_numpy(np.log10(train.P / (C.KB * train.T))).to(dev)   # log10 number density per run (cm^-3)
     mu, sd, zlo, zhi = D.norm_consts(dev)
     model = M.build(cfg["head"], cfg["hidden"], zlo, zhi, newton=cfg["closed_iters"], fallback=cfg["closed_fallback"],
-                    fused=cfg["fused_proj"]).to(dev)
+                    fused=cfg["fused_proj"], latent=cfg["fm_latent"]).to(dev)
     vy, vdt, vg = D.cache_val(cfg["val_windows"], 2, dev)
     pr = None if cfg["path_readout"] is None else readout_setup(cfg["path_readout"], dev)
     t0r = t0_setup(cfg["t0_readout_files"], dev) if cfg["t0_readout"] else None
@@ -679,8 +1102,8 @@ def main(run):
     info = {"params": M.n_params(model), "flops_per_call": M.flops_per_call(model), "n_train_groups": train.n}
     (run / "model_info.json").write_text(json.dumps(info))
     secs = {}
-    if cfg["init_from"]:
-        model.load_state_dict(torch.load(cfg["init_from"], map_location=dev)["state_dict"])
+    if cfg["init_from"] or cfg["s1_init_from"]:
+        load_init(model, cfg["init_from"] or cfg["s1_init_from"], dev)
     for stage, todo in ((1, not cfg["init_from"]), (2, cfg["s2_steps"] > 0)):
         if not todo:
             continue

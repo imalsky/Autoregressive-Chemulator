@@ -42,10 +42,12 @@ def chk(cond, msg):
 
 
 def design_codes(path, rows):
-    """Start and stratum codes of the given design rows: fields 'kind' and 'stratum' of the generator's design_map.npy
-    (a structured array, one record per driven row, in row order)."""
-    m = np.load(path, mmap_mode="r")[rows]
-    assert np.array_equal(m["row"], rows), "design_map.npy records are not in row order"
+    """Start and stratum codes of the given design rows: fields 'kind' and 'stratum' of the generator's design map
+    (design_map.npy, or design_map_ext.npy for rows from 786,432: a structured array, one record per row, in row order
+    from its first record's row)."""
+    m = np.load(path, mmap_mode="r")
+    m = m[rows - int(m["row"][0])]
+    assert np.array_equal(m["row"], rows), "design map records are not in row order"
     return m["kind"].astype(str), m["stratum"].astype(str)
 
 

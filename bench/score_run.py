@@ -1,7 +1,7 @@
 """Model runner: one model on one design (bench/score_design.py, or a stored yardstick-format design with its batch
 file), GPU, CUDA graphs. Writes the states at the design's saved calls; truth is never read.
 
-    python score_run.py <run dir> <design dir> <out dir> [--ckpt stage2.pt] [--batches b,b,...] [--groups FILE]
+    python score_run.py <run dir> <design dir> <out dir> [--ckpt stage2.pt] [--batches b,b,...] [--groups FILE] [--cont]
 
 Environment (run/env.sh, then): LHB_BLOCK=50 and HARNESS_NORM = the model's normalization (its run folder's norm.json);
 lhbench.load_model refuses a run whose manifest names another normalization. --groups: the batch file of a
@@ -11,7 +11,8 @@ batch's part exists the parts are merged.
 Inference policy (fixed): the P3 state (fp64 z, z' = z + fp64(delta(z fp32, dt, T/P))), 32 Newton iterations of the closed
 head's element projection, the LM rescue where Newton fails run adaptively (lhbench.ADAPTIVE: a CUDA-graph block in which a
 Newton solve failed is undone and rerun with the rescue), LHB_BLOCK 50, TF32 off, one model call per step, no startup
-substeps. The rows of a batch run together for the batch's largest N; a row's counters are read at its own N and later
+substeps; --cont adds the continuation fallback after the LM rescue (models.py, the head's cont), recorded in
+meta.json as "cont". The rows of a batch run together for the batch's largest N; a row's counters are read at its own N and later
 calls are neither recorded nor counted. Fixed-dt rows advance in graph blocks between saved calls; path rows advance one
 call at a time with T, P, dt and the recorded mixing set in-graph before each call, as lhbench.run_paths does.
 
@@ -116,7 +117,7 @@ class Design:
 
 
 # ------------------------------------------------------------------------------------------------ the code
-def load_lib(run, ckpt):
+def load_lib(run, ckpt, cont=False):
     """This repository's lib (read only) with lhbench's globals set for the policy, and the model."""
     assert os.environ.get("LHB_BLOCK") == "50", "LHB_BLOCK=50"
     assert os.environ.get("HARNESS_NORM"), "HARNESS_NORM = the model's normalization file"
@@ -135,6 +136,7 @@ def load_lib(run, ckpt):
     for m_ in model.modules():
         if isinstance(m_, LB.M.RelaxClosedRHead):
             m_.fallback = "lm"
+            m_.cont = cont
             assert m_.newton == 32
             n += 1
     assert n == 1, n
@@ -415,9 +417,10 @@ def main():
     ap.add_argument("--ckpt", default="stage2.pt")
     ap.add_argument("--batches", default=None)
     ap.add_argument("--groups", type=Path, default=None)
+    ap.add_argument("--cont", action="store_true")
     a = ap.parse_args()
     D = Design(a.design, a.groups)
-    torch, LB, model, dev, TEngine = load_lib(a.run, a.ckpt)
+    torch, LB, model, dev, TEngine = load_lib(a.run, a.ckpt, a.cont)
     out = a.out
     (out / "parts").mkdir(parents=True, exist_ok=True)
     for f in ("states.npz", "model_states.npz"):
@@ -453,7 +456,7 @@ def main():
             f"redo blocks {o['nredo']}, rows with a Newton failure {int((o['newton_n'] > 0).sum())}, kept input "
             f"{int((o['kept_n'] > 0).sum())}, guard {int((o['guard_n'] > 0).sum())}, non-finite {int((o['nonfin_n'] > 0).sum())}")
     log(f"{D.name}: rollout seconds this process {tot:.1f}")
-    merge(D, out, a.run, a.ckpt, {"checks": chk})
+    merge(D, out, a.run, a.ckpt, {"checks": chk, "cont": a.cont})
 
 
 if __name__ == "__main__":
