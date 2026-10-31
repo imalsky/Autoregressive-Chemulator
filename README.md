@@ -22,14 +22,18 @@ losses, flow-map and mixed-mode heads).
   gradients through the accepted steps.
 - `TorchRates` raises for gas below 300 K.
 - Production settings: Rodas3, rtol 1e-3, atol 1e-18 (mole fraction).
+- `lib/kincuda.py`: the same call as one CUDA kernel (one warp per cell: rates, every Rodas3 step and the sparse LU without
+  row exchanges in a minimum-degree order, compiled at run time with NVRTC); a guard kernel flags cells with a non-finite
+  state, an unfinished call or an element drift and recomputes them with the library path.
 
 ## Layout
 
-- `lib/`: `kinetics.py`, `kinvulcan.py`, `kinbatch.py`, `kinnet.py`; `paths.py` (every data location).
+- `lib/`: `kinetics.py`, `kinvulcan.py`, `kinbatch.py`, `kinnet.py`, `kincuda.py`; `paths.py` (every data location).
 - `bench/`: `score_design.py` (score designs from VULCAN outputs) and `score.py` (the averaged score and its comparisons).
 - `datagen/build_kin.py`: VULCAN clean-design runs mapped onto a reduced species set (rate-network training set).
 - `run/env.sh` (environment: GPU, threads, `CHEM_DATA`), `run/runner.sh` (a job lane).
-- `tests/score_regress.py`: the scorer on hand-made cases.
+- `tests/kincuda_check.py`: the CUDA kernel against the library path (parity, guard, paired timing);
+  `tests/score_regress.py`: the scorer on hand-made cases.
 
 ## Data and components not included
 
