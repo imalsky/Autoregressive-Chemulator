@@ -375,16 +375,16 @@ batching.primitive_batchers[_adj_p] = functools.partial(_tan_batch, _adj_p)
 # --- the solver -------------------------------------------------------------------------------------------------------
 
 class KinJax:
-    """KinJax(net)(x, T, P, dt, h, lm=None, rc=None, rtol=1e-3, atol=1e-18, max_steps=4000, adapt=True) -> (x, h, done,
-    steps, flag, status): one solver call per cell on the local CUDA devices, differentiable (see the module
-    docstring). The call kernel's layout is CudaSolver's (built once here through torch to choose it); the tables are
+    """KinJax(net, drift=None)(x, T, P, dt, h, lm=None, rc=None, rtol=1e-3, atol=1e-18, max_steps=4000, adapt=True) ->
+    (x, h, done, steps, flag, status): one solver call per cell on the local CUDA devices, differentiable (see the module
+    docstring); drift: the element-drift allowance (kincuda). The call kernel's layout is CudaSolver's (built once here through torch to choose it); the tables are
     device constants of the traced call; rtol, atol, max_steps and adapt are static."""
 
-    def __init__(self, net):
+    def __init__(self, net, drift=None):
         if not jax.config.jax_enable_x64:
             raise RuntimeError("kinjax needs jax_enable_x64 (float64 state)")
         lib = _lib()
-        cs = KC.CudaSolver(net, torch.device("cuda"))         # the call kernel's warps, cells per block, source
+        cs = KC.CudaSolver(net, torch.device("cuda"), drift)  # the call kernel's warps, cells per block, source
         tab = KC.tables(net, cs.w)
         KA.supported(tab)
         ext = KA.ad_tables(net, tab)
@@ -411,7 +411,7 @@ class KinJax:
                 raise RuntimeError(f"the {kind} kernel's work arrays do not fit in shared memory")
             sm = 8 * wpb * perwa + len(blob)                    # the recovery's kernel: the same grid and layout
             geo[kind] = [self.ns, self.nr, wpb, 32 * wpb, sm, 32 * wpb, sm] + rounds
-            self.src[kind] = KA.source_ad(tab, ext, kind, wpb) + (_ARRHG if kind == "vjp" else "")
+            self.src[kind] = KA.source_ad(tab, ext, kind, wpb, drift=drift) + (_ARRHG if kind == "vjp" else "")
         rec = cs.rec_blocks * (2 * self.nr + 2 + (0 if cs.info["rec_w_shared"] else self.ns ** 2))
         del cs
         handle, cells = -1, {}

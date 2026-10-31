@@ -1526,14 +1526,14 @@ extern "C" __global__ void arrh(const double* __restrict__ glm, const double* __
 """
 
 
-def source_ad(tab, ext, kind, wpb, cap=CAP):
+def source_ad(tab, ext, kind, wpb, cap=CAP, drift=None):
     """CUDA source of the tangent (kind "jvp") or adjoint (kind "vjp": vjp and arrh) kernels, after the call kernel's
-    source whose helpers, stream layout and descriptor widths they use."""
+    source (element-drift allowance drift) whose helpers, stream layout and descriptor widths they use."""
     off, perwa = layout(tab, ext, kind)
     w = tab["wd"]
     m = lambda b: (1 << b) - 1  # noqa: E731
     j_a = w["k"] + 2
-    return KC.source(tab, 1) + string.Template(_SRC_AD).substitute(
+    return KC.source(tab, 1, drift=drift) + string.Template(_SRC_AD).substitute(
         wpb=wpb, perwa=perwa, cap=cap, dmax=DMAX, npg=ext["npg"], urow=f"{ext['urow']}ull", lrow=f"{ext['lrow']}ull",
         offsets="\n".join([f"#define KIND {int(kind == 'vjp')}"] + [f"#define A_{k} {v}" for k, v in off.items()]),
         sv_r=m(w["r"]), sv_sg=w["r"], sv_x2=w["r"] + 1, sv_dst=w["r"] + 2, sv_pm=m(w["part"]),
@@ -1542,7 +1542,7 @@ def source_ad(tab, ext, kind, wpb, cap=CAP):
 
 
 class ADSolver:
-    """ADSolver(net, device): one solver call with its derivatives, x [B, S] in the network's species order, T [B] K,
+    """ADSolver(net, device, drift=None): one solver call with its derivatives, x [B, S] in the network's species order, T [B] K,
     P [B] dyn cm^-2, dt [B] s, h [B] s (float64 CUDA tensors), optional per-cell log multipliers lm [B, R] and Arrhenius
     table rc [R, 9] (default: the network's, as kincuda.tables).
       jvp(...)  -> (x, h, done, accepted steps, dx, dh): the call and its tangent for the input tangents;
@@ -1552,10 +1552,11 @@ class ADSolver:
     (module docstring), so the result is bitwise CudaSolver.launch's and the derivative is that of the result returned.
     status: the counts of kincuda.COUNTS (recomputed = flagged by the guard); flag [B] int32: 0 passed the guard, 1
     recovered, 2 still failed after the recovery (NaN derivatives; with an rc cotangent the reduction over cells is
-    NaN too). Cells below 300 K raise. Calls run one at a time on torch's current stream (the rate and record scratch
+    NaN too); drift: the element-drift allowance (kincuda's, so the flags are CudaSolver's with the same drift).
+    Cells below 300 K raise. Calls run one at a time on torch's current stream (the rate and record scratch
     are shared)."""
 
-    def __init__(self, net, device, cap=CAP):
+    def __init__(self, net, device, cap=CAP, drift=None):
         self.dev = torch.device(device)
         torch.zeros(1, device=self.dev)
         prop = torch.cuda.get_device_properties(self.dev)
@@ -1576,7 +1577,7 @@ class ADSolver:
             if wpb < 1:
                 raise RuntimeError(f"the {kind} kernel's work arrays do not fit in shared memory")
             self.wpb[kind], self.smem[kind] = wpb, 8 * wpb * perwa + len(blob)
-            self.src[kind] = source_ad(tab, ext, kind, wpb, cap)
+            self.src[kind] = source_ad(tab, ext, kind, wpb, cap, drift)
             self._mod[kind] = ctypes.c_void_p()
             KC._check(cu.cuModuleLoadData(ctypes.byref(self._mod[kind]),
                                           KC.compile_cubin(self.src[kind], f"{prop.major}{prop.minor}")), "load")

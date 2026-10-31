@@ -590,10 +590,7 @@ def recovered():
     xs, hs, _, _ = kc(x0, T, P, full(B, 100.0), full(B, 1e-10))          # settled states
     cases = [("settled starts dt 1000 s, max_steps 3", (xs, T, P, full(B, 1e3), hs), 3, (ad, kc)),
              ("cold starts dt 500 s, max_steps 60", (x0, T, P, full(B, 500.0), full(B, 1e-10)), 60, (ad, kc))]
-    drift0 = KC.DRIFT
-    KC.DRIFT = 0.0                                   # every rounding change of an element share is flagged
-    sz = (KA.ADSolver(net, dev), KC.CudaSolver(net, dev))
-    KC.DRIFT = drift0
+    sz = (KA.ADSolver(net, dev, drift=0.0), KC.CudaSolver(net, dev, drift=0.0))   # every rounding drift flagged
     xz, Tz, Pz = yardstick(1024, 2, 1.0)
     cases.append(("scrambled 1 dex dt 500 s, drift allowance 0", (xz, Tz, Pz, full(1024, 500.0), full(1024, 1e-10)),
                   4000, sz))

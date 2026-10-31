@@ -186,10 +186,7 @@ def main():
             f"counts {fb}; cell 7 recomputed with {10 * KC.REC_STEPS} tries ({e:.1e} dex from a separate library call "
             f"with those tries, {int(nr)} accepted steps, finished {bool(dr)}, flag {int(flag[7])})")
 
-    drift0 = KC.DRIFT
-    KC.DRIFT = 0.0                                   # every rounding change of an element share is flagged
-    kz = KC.CudaSolver(net, dev)
-    KC.DRIFT = drift0
+    kz = KC.CudaSolver(net, dev, drift=0.0)          # every rounding change of an element share is flagged
     x0, T, P = yardstick(256, 2, 1.0)
     args = (x0, T, P, full(256, 500.0), full(256, 1e-10))
     y, _, _, _, flag = kz.launch(*args)

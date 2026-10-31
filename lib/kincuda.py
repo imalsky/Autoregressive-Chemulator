@@ -29,8 +29,8 @@ The CUDA source is generated from the network at construction and compiled once 
 of torch's CUDA wheels); the kernel runs on torch's current stream.
 
 Guard and recovery: after the call a small kernel checks every cell (new state finite, call finished, each element's
-share of the atoms unchanged up to rounding and what the clamping of accepted small negatives can add), counts the
-failures and lists the failed cells; a third kernel recomputes the listed cells from their inputs (x, T, P, dt and the
+share of the atoms unchanged up to rounding (relative change at most drift) and what the clamping of accepted small
+negatives can add), counts the failures and lists the failed cells; a third kernel recomputes the listed cells from their inputs (x, T, P, dt and the
 starting h, which the call leaves unchanged), one cell per block of 32 W threads: the same rates, S v and Jacobian
 streams, Rodas3 stages, step control and tolerances, with W = I / (gamma h) - J formed densely (no Sherman-Morrison
 term; in shared memory when it fits, else in global memory) and factored by the cell's first warp with threshold partial
@@ -43,6 +43,12 @@ GPU whatever the batch order. The element test checks the linear solves: E^T W =
 E (E^T S = 0), so every stage moves the element budget by gamma h E^T (residual of its solve); a factor without row
 exchanges that has lost accuracy shows up there. Cells with non-finite inputs are counted, not recomputed (they come
 back non-finite); cells below 300 K are not stepped and are counted, and check() raises for them, as TorchRates does.
+
+The element-drift allowance is per network: the rounding drift of the element shares depends on the network's
+chemistry, not only on the factorization (a network can drift the same on the recover kernel's pivoted path). A
+network takes drift = max(DRIFT, 10 r), with r its rounding drift: the largest relative change of an element's share
+beyond the clamping term over the parity stress cases (recorded starts and their scrambles to 2 dex at dt up to 500 s)
+with the guard's drift test off. DRIFT is NCHO's (r 2e-9).
 """
 import ctypes
 import os
@@ -57,7 +63,7 @@ import kinnet as KN
 import kinvulcan as KV
 
 T_MIN = 300.0   # K, as TorchRates
-DRIFT = 1e-6    # relative change of an element's share of the atoms left to rounding (in-domain one-call worst 3e-8)
+DRIFT = 1e-6    # default drift allowance (NCHO): relative change of an element's share left to rounding
 REC_STEPS = 2   # the recovery's tries, in units of the call's max_steps
 COUNTS = ("bad_input", "cold", "nonfinite", "unfinished", "drift", "recomputed", "recovered", "still_failed")
 
@@ -1101,9 +1107,9 @@ _KR = "(k * exp(dg + (double)(((fl >> 3) & 7) - 4) * lKT)) * c3"
 _KREV = "(fl & 256) ? law(rc + RCW * (NR + r), rf[NR + r], Tc, lT, iT, nd) * c3 : " + _KR
 
 
-def source(tab, cpb, wsh=True):
+def source(tab, cpb, wsh=True, drift=None):
     """The kernels' CUDA source for the tables of tables() and cpb cells per block; wsh: the recover kernel holds W in
-    shared memory."""
+    shared memory; drift: the element-drift allowance (default DRIFT)."""
     ns, k0, P, w = tab["ns"], tab["k0"], tab["P"], tab["wd"]
     nt = ns - k0
     blob, offs = _blob(tab)
@@ -1126,7 +1132,8 @@ def source(tab, cpb, wsh=True):
         sv_end=w["r"] + 2 + w["part"],
         j_km=m(w["k"]), j_sg=w["k"], j_x2=w["k"] + 1, j_a=j_a, j_b=j_a + w["s"], j_sm=m(w["s"]),
         j_end=j_a + 2 * w["s"], slm=m(w["slot"]), lu_b=w["slot"], lu_c=2 * w["slot"],
-        nel=tab["atoms"].shape[1], etot=repr(float(tab["atoms"].sum())), tmin=repr(T_MIN), drift=repr(DRIFT),
+        nel=tab["atoms"].shape[1], etot=repr(float(tab["atoms"].sum())), tmin=repr(T_MIN),
+        drift=repr(float(DRIFT if drift is None else drift)),
         kb=repr(K.KB), p0=repr(K.P0), wsh=int(wsh), vr=max(tab["nr"], ns + 1), rpd=-(-ns // 32),
         perwr=_perw_rec(tab, wsh), **{f"o_{k}": v for k, v in offs.items()})
 
@@ -1209,7 +1216,7 @@ def _attr(fn, a):
 
 
 class CudaSolver:
-    """CudaSolver(net, device)(x, T, P, dt, h) -> (x, h, done, accepted steps): the call
+    """CudaSolver(net, device, drift=None)(x, T, P, dt, h) -> (x, h, done, accepted steps): the call
     advance_compact(rodas3_step(pivot=False), x, TorchRates(T, P), dt, h, order=3) for x [B, S] mole fractions in the
     network's species order, T [B] K, P [B] dyn cm^-2, dt [B] s and starting step sizes h [B] (float64 CUDA tensors),
     with the cells the guard flags recomputed on the device (see the module docstring); no host sync. count: the last
@@ -1218,11 +1225,12 @@ class CudaSolver:
     (reads them from the device); check(): the totals as a dict, raises if any cell was below T_MIN; info: the kernel's
     layout (sizes, warps per cell, leading / trailing split, registers and local bytes per thread, cells and warps per
     block, shared memory per block, resident cells per SM; the recover kernel's shared memory, W in shared memory or
-    not, resident blocks). Calls run one at a time on torch's current stream (the queues, the counts and the scratch
-    are shared)."""
+    not, resident blocks). drift: the network's element-drift allowance (module docstring; default DRIFT). Calls run
+    one at a time on torch's current stream (the queues, the counts and the scratch are shared)."""
 
-    def __init__(self, net, device):
+    def __init__(self, net, device, drift=None):
         self.dev = torch.device(device)
+        self.drift = float(DRIFT if drift is None else drift)
         torch.zeros(1, device=self.dev)                       # torch's context is current from here on
         prop = torch.cuda.get_device_properties(self.dev)
         optin = prop.shared_memory_per_block_optin
@@ -1241,14 +1249,14 @@ class CudaSolver:
         # barriers (15) allow them and the compiler fits them in the registers without more local memory
         arch = f"{prop.major}{prop.minor}"
         top = min(1024 // nl, 15, fit(tab))
-        mod = _load(source(tab, 1, wsh), arch)
+        mod = _load(source(tab, 1, wsh, self.drift), arch)
         regs, local = -(-_attr(mod[1], 4) // 8) * 8, _attr(mod[1], 3)   # registers (allocation unit 8), local bytes
         self.cpb = max(1, min(top, prop.regs_per_multiprocessor // (nl * regs)))
         if self.cpb > 1:
             _check(_cuda().cuModuleUnload(mod[0]), "unload")
-            mod = _load(source(tab, self.cpb, wsh), arch)
+            mod = _load(source(tab, self.cpb, wsh, self.drift), arch)
         while self.cpb < top:
-            nxt = _load(source(tab, self.cpb + 1, wsh), arch)
+            nxt = _load(source(tab, self.cpb + 1, wsh, self.drift), arch)
             if _attr(nxt[1], 3) > local:
                 _check(_cuda().cuModuleUnload(nxt[0]), "unload")
                 break
@@ -1258,7 +1266,7 @@ class CudaSolver:
         self.wpb = self.w * self.cpb                          # warps per block
         self.smem = 8 * self.cpb * _perc(tab) + len(blob)
         self.smem_rec = 8 * _perw_rec(tab, wsh) + len(blob)
-        self.src = source(tab, self.cpb, wsh)
+        self.src = source(tab, self.cpb, wsh, self.drift)
         cu = _cuda()
         occ = []
         for fn, threads, smem in ((self._fn, nl * self.cpb, self.smem), (self._rec, nl, self.smem_rec)):
@@ -1273,7 +1281,7 @@ class CudaSolver:
                          sround=tab["sst"].shape[0], jround=tab["jround"], lu_ops=len(tab["lu"]), alias=_alias(tab),
                          regs=_attr(self._fn, 4), spill_bytes=_attr(self._fn, 3), cpb=self.cpb, wpb=self.wpb,
                          smem=self.smem, blob=len(blob), cells_per_sm=self.cpb * occ[0], rec_smem=self.smem_rec,
-                         rec_w_shared=wsh, rec_blocks=self.rec_blocks)
+                         rec_w_shared=wsh, rec_blocks=self.rec_blocks, drift=self.drift)
         f = lambda a, view=None: torch.tensor(a if view is None else np.asarray(a).view(view), device=self.dev)
         self._tabs = [f(tab["perm"]), f(np.frombuffer(blob, np.int32).copy()), f(tab["rc"]), f(tab["rf"]),
                       f(tab["nasa"])]
