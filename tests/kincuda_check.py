@@ -18,6 +18,10 @@ advances its own state from the same inputs.
     device: within 1e-6 dex of the reference call with the recovery's tries (REC_STEPS x max_steps; the reference is
     not bitwise the kernel: its sums run in another order), counted as recovered or still failed, the other cells
     bitwise those of a solver that flags none; a cell below 300 K is counted and check() raises.
+(c) Layouts: one cell per block and the packed cells per block (forced through CudaSolver.small) bitwise equal (x, h,
+    done, steps, flag, counts) on the yardstick cold calls, the scrambled starts, a forced-recovery case (max_steps 30)
+    and a 300-call panel-P chain; 128 cells alone (one cell per block, the automatic choice for small batches) bitwise
+    the same cells inside 8,192 (packed), and 8,192 cells in a permuted order bitwise the same per cell.
     taskset -c <cpus> $PY tests/kincuda_check.py <VULCAN thermo folder: NCHO_thermo_network.txt, NASA9/>
 (about 1 min on an idle GPU). Exit 0 = every case PASS."""
 import argparse
@@ -212,6 +216,55 @@ def main():
     except ValueError as e:
         verdict("guard: T < 300 K raises in check()", kc.fallback["cold"] == 1 and not bool(d[0]),
                 f"cell 0 not stepped; ValueError: {e}")
+
+    # (c) layouts
+    small, bad = kc.small, []
+
+    def both(*a, **kw):
+        out = []
+        for lim in (0, 1 << 40):                                          # packed, then one cell per block
+            kc.small = lim
+            out.append((kc.launch(*a, **kw), kc.count.tolist()[1:9]))
+        kc.small = small
+        return all(torch.equal(p, q) for p, q in zip(out[0][0], out[1][0])) and out[0][1] == out[1][1]
+
+    B = 4096
+    cases = []
+    x0, T, P = yardstick(B, 0, 0.0)
+    cases += [(f"cold dt {dt:g}", (x0, T, P, full(B, dt), full(B, 1e-10)), {}) for dt in (1.0, 500.0)]
+    cases.append(("forced recovery", (x0, T, P, full(B, 500.0), full(B, 1e-10)), dict(max_steps=30)))
+    for sigma in (0.0, 1.0, 2.0):
+        x0, T, P = yardstick(B, int(10 + sigma), sigma)
+        cases += [(f"scrambled {sigma:g} dt {dt:g}", (x0, T, P, full(B, dt), full(B, 1e-10)), {})
+                  for dt in (0.01, 1.0, 50.0, 500.0)]
+    bad = [n for n, a, kw in cases if not both(*a, **kw)]
+    B = 1024
+    path = np.arange(B) % 256
+    xa = tt(s["x53"][r["unit"][path]] / s["x53"][r["unit"][path]].sum(1, keepdims=True))
+    st, chain = [(xa, full(B, 1e-10)), (xa, full(B, 1e-10))], True
+    for k in range(300):                                     # the panel-P chain's paths, offsets and forcing
+        fo = (tt(Tc[k]), tt(Pc[k]), tt(dc[k]))
+        o = []
+        for i, lim in enumerate((0, 1 << 40)):
+            kc.small = lim
+            o.append(kc.launch(st[i][0], *fo, st[i][1]))
+        kc.small = small
+        chain = chain and all(torch.equal(p, q) for p, q in zip(*o))
+        st = [q[:2] for q in o]
+    x0, T, P = yardstick(8192, 7, 1.0)
+    a = (x0, T, P, full(8192, 50.0), full(8192, 1e-10))
+    big, sel = kc.launch(*a), torch.arange(0, 8192, 64, device=dev)
+    perm = torch.randperm(8192, generator=torch.Generator().manual_seed(3)).to(dev)
+    shuf = kc.launch(*(q[perm] for q in a))
+    inv = torch.empty_like(perm)
+    inv[perm] = torch.arange(8192, device=dev)
+    alone = 128 <= kc.small < 8192 and all(torch.equal(p[sel], q)
+                                           for p, q in zip(big, kc.launch(*(q[sel] for q in a))))
+    order = all(torch.equal(p, q[inv]) for p, q in zip(big, shuf))
+    verdict("layouts: one cell per block and packed", not bad and chain and alone and order,
+            f"{len(cases)} cases x 4096 cells bitwise equal except {bad or 'none'}; 300-call chain x {B} cells "
+            f"{chain}; 128 cells alone (one cell per block, small = {kc.small} cells) bitwise inside 8,192 (packed) "
+            f"{alone}; 8,192 cells permuted bitwise {order}")
 
     print(f"{sum(results)} of {len(results)} cases PASS", flush=True)
     sys.exit(0 if all(results) else 1)

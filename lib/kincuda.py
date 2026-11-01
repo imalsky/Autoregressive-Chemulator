@@ -29,8 +29,11 @@ cell's 32 W lanes, with descriptor bit widths set by the network's sizes; the re
 in batches of consecutive independent pivots. The four stage solves run from one copy of the triangular solve: stage 1
 solves K1 on the first warp and M0^-1 w on the second, each stage ends with the Sherman-Morrison update on the first
 warp. Cells per block: as many as the shared memory (per-cell arrays plus one copy of the small tables per block), the
-named barriers and the registers (without spilling) allow. Persistent cells take work from an atomic queue, so no cell
-waits for the stiffest one. Results do not depend on the batch size or order.
+named barriers and the registers (without spilling) allow; a batch of 2 to CudaSolver.small cells (the number of
+SMs) runs a one-cell-per-block build instead, one cell per SM rather than a few SMs holding several (a lone cell has
+an SM either way; two one-cell blocks on an SM run slower than one block with both). The cells per block change no
+arithmetic. Persistent cells take work from an atomic queue, so no cell waits for the stiffest one. Results do not
+depend on the batch size or order.
 
 The CUDA source is generated from the network at construction and compiled once with NVRTC through ctypes (the library
 of torch's CUDA wheels); the kernel runs on torch's current stream.
@@ -1228,9 +1231,9 @@ class CudaSolver:
     fallback: the last call's counts as a dict (reads them from the device); check(): the totals as a dict, raises if
     any cell was below T_MIN; info: the kernel's layout (sizes, warps per cell, leading / trailing split, registers and
     local bytes per thread, cells and warps per block, shared memory per block, resident cells per SM; the recover
-    kernel's shared memory, W in shared memory or not, resident blocks). drift: the network's element-drift allowance
-    (module docstring; default DRIFT). Calls run one at a time on torch's current stream (the queues, the counts and the
-    scratch are shared)."""
+    kernel's shared memory, W in shared memory or not, resident blocks; small: batches of 2 up to this size (the SMs)
+    run one cell per block). drift: the network's element-drift allowance (module docstring; default DRIFT). Calls run
+    one at a time on torch's current stream (the queues, the counts and the scratch are shared)."""
 
     def __init__(self, net, device, drift=None):
         self.dev = torch.device(device)
@@ -1253,18 +1256,17 @@ class CudaSolver:
         # barriers (15) allow them and the compiler fits them in the registers without more local memory
         arch = f"{prop.major}{prop.minor}"
         top = min(1024 // nl, 15, fit(tab))
-        mod = _load(source(tab, 1, wsh, self.drift), arch)
-        regs, local = -(-_attr(mod[1], 4) // 8) * 8, _attr(mod[1], 3)   # registers (allocation unit 8), local bytes
+        one = _load(source(tab, 1, wsh, self.drift), arch)    # one cell per block (small batches)
+        regs, local = -(-_attr(one[1], 4) // 8) * 8, _attr(one[1], 3)   # registers (allocation unit 8), local bytes
         self.cpb = max(1, min(top, prop.regs_per_multiprocessor // (nl * regs)))
-        if self.cpb > 1:
-            _check(_cuda().cuModuleUnload(mod[0]), "unload")
-            mod = _load(source(tab, self.cpb, wsh, self.drift), arch)
+        mod = _load(source(tab, self.cpb, wsh, self.drift), arch) if self.cpb > 1 else one
         while self.cpb < top:
             nxt = _load(source(tab, self.cpb + 1, wsh, self.drift), arch)
             if _attr(nxt[1], 3) > local:
                 _check(_cuda().cuModuleUnload(nxt[0]), "unload")
                 break
-            _check(_cuda().cuModuleUnload(mod[0]), "unload")
+            if mod is not one:
+                _check(_cuda().cuModuleUnload(mod[0]), "unload")
             mod, self.cpb = nxt, self.cpb + 1
         self._mod, self._fn, self._guard, self._rec = mod
         self.wpb = self.w * self.cpb                          # warps per block
@@ -1281,16 +1283,24 @@ class CudaSolver:
                 raise RuntimeError("the kernel does not fit on this device")
             occ.append(o.value)
         self.max_blocks, self.rec_blocks = (prop.multi_processor_count * o for o in occ)
+        # batches of up to one cell per SM run the one-cell build (the same arithmetic: only the packing differs); its
+        # launches never exceed its resident blocks (the scratch holds them), whatever small is set to
+        self._one, self.small, self._one_blocks, self.smem1 = one, 0, 0, 8 * _perc(tab) + len(blob)
+        if mod is not one:
+            _check(cu.cuFuncSetAttribute(one[1], 8, self.smem1), "shared memory")
+            o = ctypes.c_int()
+            _check(cu.cuOccupancyMaxActiveBlocksPerMultiprocessor(ctypes.byref(o), one[1], nl, self.smem1), "occupancy")
+            self.small, self._one_blocks = prop.multi_processor_count, prop.multi_processor_count * o.value
         self.info = dict(ns=self.ns, nr=self.nr, nnz=tab["nnz"], k0=tab["k0"], nt=self.ns - tab["k0"], w=self.w,
                          sround=tab["sst"].shape[0], jround=tab["jround"], lu_ops=len(tab["lu"]), alias=_alias(tab),
                          regs=_attr(self._fn, 4), spill_bytes=_attr(self._fn, 3), cpb=self.cpb, wpb=self.wpb,
                          smem=self.smem, blob=len(blob), cells_per_sm=self.cpb * occ[0], rec_smem=self.smem_rec,
-                         rec_w_shared=wsh, rec_blocks=self.rec_blocks, drift=self.drift)
+                         rec_w_shared=wsh, rec_blocks=self.rec_blocks, drift=self.drift, small=self.small)
         f = lambda a, view=None: torch.tensor(a if view is None else np.asarray(a).view(view), device=self.dev)
         self._tabs = [f(tab["perm"]), f(np.frombuffer(blob, np.int32).copy()), f(tab["rc"]), f(tab["rf"]),
                       f(tab["nasa"])]
-        self._scratch = torch.empty(self.max_blocks * self.cpb * (2 * self.nr + 2), dtype=torch.float64,
-                                    device=self.dev)
+        self._scratch = torch.empty(max(self.max_blocks * self.cpb, self._one_blocks) * (2 * self.nr + 2),
+                                    dtype=torch.float64, device=self.dev)
         self._scratch_rec = torch.empty(self.rec_blocks * (2 * self.nr + 2 + (0 if wsh else self.ns ** 2)),
                                         dtype=torch.float64, device=self.dev)
         self._streams = [f(tab["sst"].ravel(), np.int32), f(tab["jt"], np.int64), f(tab["lu"], np.int64),
@@ -1302,7 +1312,7 @@ class CudaSolver:
     def launch(self, x, T, P, dt, h, rtol=1e-3, atol=1e-18, max_steps=4000):
         """The kernel, its checks and the recovery, no host sync: (x, h, done, accepted steps, flag) per cell, flag 0
         (the call's result passed the guard), 1 (recomputed, passes) or 2 (recomputed, still fails); the counts in
-        self.count."""
+        self.count. Batches of 2 to self.small cells (the SMs) run one cell per block (the same results)."""
         if not all(a.is_cuda and a.dtype == torch.float64 for a in (x, T, P, dt, h)) or x.shape[1] != self.ns:
             raise ValueError(f"x [B, {self.ns}], T, P, dt, h [B]: float64 CUDA tensors")
         B = x.shape[0]
@@ -1310,10 +1320,12 @@ class CudaSolver:
         xo, ho = torch.empty_like(x), h.clone()
         done, redo, lst = (torch.empty(B, dtype=torch.int32, device=self.dev) for _ in range(3))
         nok = torch.empty(B, dtype=torch.float64, device=self.dev)
-        nb = max(1, min(-(-B // self.cpb), self.max_blocks))
+        fn, cpb, smem, mb = ((self._one[1], 1, self.smem1, self._one_blocks) if 1 < B <= self.small else
+                             (self._fn, self.cpb, self.smem, self.max_blocks))
+        nb = max(1, min(-(-B // cpb), mb))
         self.count.zero_()
         stream = torch.cuda.current_stream(self.dev).cuda_stream
-        _launch(self._fn, nb, 32 * self.w * self.cpb, self.smem, stream,
+        _launch(fn, nb, 32 * self.w * cpb, smem, stream,
                 [x, T, P, dt, ho, xo, done, nok, self.count, ctypes.c_int(B), ctypes.c_double(rtol),
                  ctypes.c_double(atol), ctypes.c_int(max_steps), *self._tabs, self._scratch, *self._streams])
         _launch(self._guard, -(-B // 128) or 1, 128, 0, stream,
