@@ -15,12 +15,19 @@ judged).
     error over those steps counts. Only cells whose output depends on the input are judged (largest |d ln x| > 1e-6,
     |d h_out / h_out| > 1e-6): elsewhere both sides are rounding. Cases: GCM-like (panel P after 150 calls, the next
     call), cold starts dt 500 s, scrambled sigma 1 dt 50 s, GCM-like states at 1000 +- 2 K (NASA-9 switch). Pass: p90
-    over cells <= 1e-5 for every input, 1e-4 for the starting step size (its derivative runs through the whole chain of
-    controller steps of a cold start; the torch reference's own difference test reads the same, p90 6e-5 at dt 500 s).
+    over cells <= 1e-5 for every input but the starting step size h. Its derivative runs through the whole chain of
+    controller steps, and on cold and scrambled starts the differences have no clean plateau for about 10 % of cells
+    (truncation at the clamped controller's kinks for large steps, cancellation-amplified rounding for small ones), so
+    one direction's p90 sits at that noise. h is one number per cell, so a direction only scales each cell's steps: the
+    h class runs NDH directions per case (NDH step scales per cell) as tiled copies of the cells in one batch, and over
+    the (cell, direction) pairs: a plateau for >= 85 % of the sensitive pairs and at least the case's floor of
+    sensitive pairs; p90 of the best error <= 3e-4; and at most 1 % of the pairs with a best error above both 1e-4 and
+    3 x the two differences' own disagreement at that plateau (an error the differences resolve).
 (d) Dot products <c, J v> vs <J^T c, v> per cell, both contracts, log-weighted cotangents (c_i = N(0, 1) / x_i),
     scale = the larger of the two sums of absolute terms; pass: p99 over cells <= 1e-6 with every input class (the
-    multipliers on reactions away from balance). Printed, not judged: the multipliers on every reaction and the
-    Arrhenius table (batch total).
+    multipliers on reactions away from balance), and with the starting step alone (adaptive; with (b)'s check of its
+    cotangent this checks its tangent without differences). Printed, not judged: the multipliers on every reaction and
+    the Arrhenius table (batch total).
 (e) Determinism: the same call twice gives the same bits (every output incl. the Arrhenius reduction); cells permuted,
     and cells run alone, give the same per-cell bits.
 (f) Several tangent directions in one jvp call: bitwise equal to one call per direction.
@@ -34,9 +41,9 @@ judged).
     starts with the element-drift allowance 0): jvp and vjp primal bitwise CudaSolver.launch with its flags and counts;
     derivatives finite on unflagged and recovered cells, NaN on cells still failed; the unflagged cells as their own
     batch bitwise; with log multipliers too. The recovered cells' adaptive tangents against central differences of the
-    recovered call (bars as (c), or twice the p90 of the same cells and directions on the ordinary path, max_steps 4000,
-    where those cells take the same steps; the long cold calls sit at that level on both paths); dot products on the
-    recovered cells, both contracts (p99 <= 1e-6).
+    recovered call (bars as (c), or twice the statistic of the same cells and directions on the ordinary path,
+    max_steps 4000, where those cells take the same steps; the long cold calls sit at that level on both paths); dot
+    products on the recovered cells, both contracts (p99 <= 1e-6).
     taskset -c <cpus> $PY tests/kincuda_ad_check.py      (GPU1; about 5 min idle, 10-15 min on a shared GPU)"""
 import sys
 import time
@@ -247,20 +254,78 @@ def shifted(a, v, e):
             None if v["lm"] is None else e * v["lm"], ad.rc0 if v["rc"] is None else ad.rc0 + e * v["rc"])
 
 
-def fd_case(name, a, max_steps=4000, judge=None, ref=None, info=False):
+NDH = 16                        # directions of the starting-step class per case (tiled copies of the cells)
+FD_STEPS = (1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8)
+
+
+def plateau(u, sc, fx, ok):
+    """The best plateau error per cell (inf without a plateau) and the two differences' disagreement there: over
+    neighbouring steps with unchanged steps and flags whose differences agree to 1e-2 of the cell's largest |u|."""
+    best = torch.full_like(sc, np.inf)
+    dis = torch.full_like(sc, np.nan)
+    for k in range(len(fx) - 1):
+        agree = (fx[k] - fx[k + 1]).abs().max(1).values / sc.clamp(min=1e-300)
+        err = (u - fx[k]).abs().max(1).values / sc.clamp(min=1e-300)
+        pick = ok[k] & ok[k + 1] & (agree < 1e-2) & (err < best)
+        best, dis = torch.where(pick, err, best), torch.where(pick, agree, dis)
+    return best, dis
+
+
+def fd_h(a, max_steps, judge):
+    """The starting-step class over NDH directions v_h = h N(0, 1) per cell, run as tiled copies of the cells in one
+    batch (per-cell results do not depend on the batch, (e)): (best errors, disagreements) of the judged pairs, the
+    number of sensitive pairs."""
+    x, T, P, dt, h = (q.repeat(NDH, *([1] * (q.dim() - 1))) for q in a)
+    z = zeros_tan(x)
+    vh = h * rn(x.shape[0])
+    xo, _, _, nok, dxo, _ = ad.jvp(x, T, P, dt, h, *z[:4], vh, max_steps=max_steps)
+    fl = ad.flag.clone()
+    m = xo > 1e-25
+    rel = lambda q: torch.where(m, q / xo.clamp(min=1e-300), torch.zeros_like(xo))  # noqa: E731
+    u = rel(dxo)
+    sc = u.abs().max(1).values
+    fx, ok = [], []
+    for e in FD_STEPS:
+        o, f = [], []
+        for sg in (1.0, -1.0):
+            o.append(ad.jvp(x, T, P, dt, h + sg * e * vh, *z, max_steps=max_steps))
+            f.append(ad.flag.clone())
+        fx.append(rel((o[0][0] - o[1][0]) / (2 * e)))
+        ok.append((o[0][3] == nok) & (o[1][3] == nok) & (f[0] == fl) & (f[1] == fl))
+    best, dis = plateau(u, sc, fx, ok)
+    sens = sc > 1e-6
+    if judge is not None:
+        sens = sens & judge.repeat(NDH)
+    fin = torch.isfinite(best) & sens
+    return best[fin].cpu().numpy(), dis[fin].cpu().numpy(), int(sens.sum())
+
+
+def h_stats(e, d, ns):
+    """p90 of the best errors, the share of pairs above both 1e-4 and 3 x their disagreement, the plateau coverage."""
+    return dict(p90=float(np.quantile(e, 0.9)) if len(e) else np.inf,
+                share=float(np.mean(e > np.maximum(1e-4, 3.0 * d))) if len(e) else 1.0, cover=len(e) / max(ns, 1),
+                n=ns)
+
+
+def fd_case(name, a, max_steps=4000, judge=None, ref=None, info=False, hmin=1):
     """Central differences of the call (its primal: bitwise CudaSolver.launch, recovered cells included) against the
     tangents; judge: the cells judged (default all); ref: the errors of another run on the same cells and directions,
-    whose p90 doubled raises a class's bar; info: printed, not judged. Returns the errors per input class."""
+    whose statistics doubled raise a class's bars; info: printed, not judged; hmin: the least number of sensitive
+    (cell, direction) pairs of the starting-step class. Returns the errors per input class (h: its statistics)."""
     x, T, P, dt, h = a
     B = x.shape[0]
     errs, hs = {}, {}
     for cls in CLS:
         v = direction(cls, *a)
+        if cls == "h":
+            st = gen.get_state()
+            errs["h"] = h_stats(*fd_h(a, max_steps, judge))
+            gen.set_state(st)
         xo, ho, _, nok, dxo, dho = ad.jvp(*a, v["x"], v["T"], v["P"], v["dt"], v["h"], dlm=v["lm"], drc=v["rc"],
                                           max_steps=max_steps)
         fl = ad.flag.clone()
         fx, fh, ok = [], [], []
-        for e in (1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8):
+        for e in FD_STEPS:
             o, f = [], []
             for sg in (1.0, -1.0):
                 x_, T_, P_, dt_, h_, lm_, rc_ = shifted(a, v, sg * e)
@@ -270,39 +335,44 @@ def fd_case(name, a, max_steps=4000, judge=None, ref=None, info=False):
             fh.append((o[0][1] - o[1][1]) / (2 * e))
             ok.append((o[0][3] == nok) & (o[1][3] == nok) & (f[0] == fl) & (f[1] == fl))
         m = xo > 1e-25
-        u = torch.where(m, dxo / xo.clamp(min=1e-300), torch.zeros_like(xo))
+        rel = lambda q: torch.where(m, q / xo.clamp(min=1e-300), torch.zeros_like(xo))  # noqa: E731
+        u = rel(dxo)
         sc = u.abs().max(1).values
-        best_x, best_h = torch.full((B,), np.inf, device=dev), torch.full((B,), np.inf, device=dev)
-        for k in range(len(fx) - 1):           # plateau: neighbouring steps agree; error against the JVP there
-            uf = torch.where(m, fx[k] / xo.clamp(min=1e-300), torch.zeros_like(xo))
-            un = torch.where(m, fx[k + 1] / xo.clamp(min=1e-300), torch.zeros_like(xo))
-            stab = ok[k] & ok[k + 1]
-            agree = (uf - un).abs().max(1).values / sc.clamp(min=1e-300)
-            err = (u - uf).abs().max(1).values / sc.clamp(min=1e-300)
-            pick = stab & (agree < 1e-2)
-            best_x = torch.where(pick, torch.minimum(best_x, err), best_x)
+        best_x, _ = plateau(u, sc, [rel(q) for q in fx], ok)
+        best_h = torch.full((B,), np.inf, device=dev)
+        for k in range(len(fh) - 1):           # h_out (printed): plateau of its own differences
             hr = (dho - fh[k]).abs() / dho.abs().clamp(min=1e-300)
             agh = (fh[k] - fh[k + 1]).abs() / dho.abs().clamp(min=1e-300)
-            best_h = torch.where(stab & (agh < 1e-2), torch.minimum(best_h, hr), best_h)
+            best_h = torch.where(ok[k] & ok[k + 1] & (agh < 1e-2), torch.minimum(best_h, hr), best_h)
         sens, sens_h = sc > 1e-6, dho.abs() > 1e-6 * ho      # cells whose output depends on this input
         if judge is not None:
             sens, sens_h = sens & judge, sens_h & judge
-        fin = torch.isfinite(best_x) & sens
-        errs[cls] = (best_x[fin].cpu().numpy(), int(fin.sum()), int(sens.sum()))
         fh_ = torch.isfinite(best_h) & sens_h
         hs[cls] = (best_h[fh_].cpu().numpy(), int(fh_.sum()), int(sens_h.sum()))
-    bar = {k: max(1e-4 if k == "h" else 1e-5, 2.0 * np.quantile(ref[k][0], 0.9) if ref and len(ref[k][0]) else 0.0)
-           for k in errs}
-    ok = all(np.quantile(q[0], 0.9) <= bar[k] for k, q in errs.items() if len(q[0]))
+        if cls != "h":
+            fin = torch.isfinite(best_x) & sens
+            errs[cls] = (best_x[fin].cpu().numpy(), int(fin.sum()), int(sens.sum()))
+    rh = ref["h"] if ref else dict(p90=0.0, share=0.0, cover=1.0)
+    bar = {k: max(1e-5, 2.0 * np.quantile(ref[k][0], 0.9) if ref and len(ref[k][0]) else 0.0)
+           for k in errs if k != "h"}
+    hb = dict(p90=max(3e-4, 2.0 * rh["p90"]), share=max(0.01, 2.0 * rh["share"]),
+              gap=max(0.15, 2.0 * (1.0 - rh["cover"])))         # gap: the share of sensitive pairs without a plateau
+    H = errs["h"]
+    hok = H["n"] >= hmin and 1.0 - H["cover"] <= hb["gap"] and H["p90"] <= hb["p90"] and H["share"] <= hb["share"]
+    ok = hok and all(np.quantile(q[0], 0.9) <= bar[k] for k, q in errs.items() if k != "h" and len(q[0]))
     if judge is not None:                       # the judged cells must reach a plateau in every class
-        ok = ok and all(len(q[0]) for q in errs.values())
+        ok = ok and all(len(q[0]) for k, q in errs.items() if k != "h")
     if ref:
-        name += " (bars: 1e-5 / 1e-4 or twice the reference's p90: " + ", ".join(f"{k} {b:.1e}" for k, b in bar.items()) + ")"
+        name += (" (bars: 1e-5 or twice the reference's p90: " + ", ".join(f"{k} {b:.1e}" for k, b in bar.items())
+                 + f"; h p90 {hb['p90']:.1e}, share {100 * hb['share']:.1f} %, no plateau {100 * hb['gap']:.0f} %)")
     (info_line if info else verdict)(f"adaptive vs central differences, {name}", ok,
             f"{B} cells; error of d ln x / the cell's largest |d ln x| at the best step (cells with a plateau / cells "
             f"sensitive to the input: largest |d ln x| > 1e-6): "
-            + "; ".join(f"{k} {pct(q[0])} ({q[1]}/{q[2]})" for k, q in errs.items() if len(q[0])) + " | h_out rel "
-            "(|d h / h| > 1e-6): " + "; ".join(f"{k} {pct(q[0])} ({q[1]}/{q[2]})" for k, q in hs.items() if len(q[0])))
+            + "; ".join(f"{k} {pct(q[0])} ({q[1]}/{q[2]})" for k, q in errs.items() if k != "h" and len(q[0]))
+            + f"; starting step over {NDH} directions: {H['n']} sensitive pairs (floor {hmin}), plateau on "
+            f"{100 * H['cover']:.1f} %, p90 {H['p90']:.1e}, pairs above 1e-4 and 3 x the differences' disagreement "
+            f"{100 * H['share']:.2f} % | h_out rel (|d h / h| > 1e-6): "
+            + "; ".join(f"{k} {pct(q[0])} ({q[1]}/{q[2]})" for k, q in hs.items() if len(q[0])))
     return errs
 
 
@@ -320,15 +390,18 @@ def gcm_states(B, ncalls=150, extra=0):
 
 
 def finite_differences():
+    """The four cases; hmin: half the sensitive starting-step pairs each case has (80, 387, 822, 384), so a tangent
+    that loses its dependence on h cannot pass by leaving nothing to judge."""
     x, h, fo = gcm_states(256)
-    fd_case("GCM-like (panel P, call 151)", (x, *fo[0], h))
+    fd_case("GCM-like (panel P, call 151)", (x, *fo[0], h), hmin=40)
     x0, T, P = yardstick(64, 3, 0.0)
-    fd_case("cold starts dt 500 s", (x0, T, P, full(64, 500.0), full(64, 1e-10)))
+    fd_case("cold starts dt 500 s", (x0, T, P, full(64, 500.0), full(64, 1e-10)), hmin=190)
     x0, T, P = yardstick(64, 4, 1.0)
-    fd_case("scrambled sigma 1 dex, dt 50 s", (x0, T, P, full(64, 50.0), full(64, 1e-10)))
+    fd_case("scrambled sigma 1 dex, dt 50 s", (x0, T, P, full(64, 50.0), full(64, 1e-10)), hmin=410)
     x, h, fo = gcm_states(64, 150)
     T = 1000.0 + 4.0 * (torch.rand(64, generator=gen, dtype=torch.float64, device=dev) - 0.5)
-    fd_case("GCM-like states at T = 1000 +- 2 K (NASA-9 range switch), dt 50 s", (x, T, fo[0][1], full(64, 50.0), h))
+    fd_case("GCM-like states at T = 1000 +- 2 K (NASA-9 range switch), dt 50 s", (x, T, fo[0][1], full(64, 50.0), h),
+            hmin=190)
 
 
 # ---------------------------------------------------------------------------------------------------------------- (d)
@@ -357,12 +430,15 @@ def dots(name, a, max_steps=4000, judge=None, sv=None):
         xo, ho = kc_.launch(*a, max_steps=max_steps)[:2]
         cx, ch = rn(B, ad_.ns) / xo.clamp(min=1e-30) * (xo > 1e-25), rn(B) / ho     # log-weighted cotangents
         _, _, _, _, g = ad_.vjp(*a, cx, ch, adapt=adapt, max_steps=max_steps)
-        for part, lmmask in (("x, T, P, dt, h and lm on reactions away from balance", far),
-                             ("lm on every reaction (balanced ones are rounding; not judged)", None)):
+        parts = [("x, T, P, dt, h and lm on reactions away from balance", "all"),
+                 ("lm on every reaction (balanced ones are rounding; not judged)", "lm")]
+        if adapt:                               # the starting step alone (its terms are small beside the others')
+            parts.append(("the starting step h alone", "h"))
+        for part, kind in parts:
             v = dict(x=x * rn(B, ad_.ns), T=T * 1e-2 * rn(B), P=P * 1e-2 * rn(B), dt=dt * 1e-2 * rn(B),
-                     h=h * 1e-2 * rn(B), lm=rn(B, ad_.nr) * 1e-2 * (far if lmmask is not None else 1.0))
-            if lmmask is None:
-                v.update({k: v[k] * 0.0 for k in ("x", "T", "P", "dt", "h")})
+                     h=h * 1e-2 * rn(B), lm=rn(B, ad_.nr) * 1e-2 * (1.0 if kind == "lm" else far))
+            if kind != "all":
+                v.update({k: v[k] * 0.0 for k in ("x", "T", "P", "dt", "h", "lm") if k != kind})
             _, _, _, nok, dxo, dho = ad_.jvp(*a, v["x"], v["T"], v["P"], v["dt"], v["h"], dlm=v["lm"],
                                              adapt=adapt, max_steps=max_steps)
             lhs = (cx * dxo).sum(1) + ch * dho
@@ -378,7 +454,7 @@ def dots(name, a, max_steps=4000, judge=None, sv=None):
                 continue
             text = (f"{rel.size} cells, steps mean {float(nok.mean()):.2f} max {int(nok.max())}; |<c,Jv> - <J^T c,v>| / "
                     f"scale {pct(rel)}; p99 {np.quantile(rel, 0.99):.1e}")
-            if lmmask is None:
+            if kind == "lm":
                 print(f"INFO  dot products, {name}, {lab}, {part}: {text}", flush=True)
             else:
                 verdict(f"dot products, {name}, {lab}, {part}", np.quantile(rel, 0.99) <= 1e-6, text)
