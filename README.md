@@ -18,13 +18,14 @@ losses, flow-map and mixed-mode heads).
   of the thermodynamic data hold by construction.
 - Constant T and P within a call: the mole fractions follow dx/dt = (S v - x sum(S v)) / n_tot, with n_tot = P / kT.
 - `lib/kincuda.py`: the production call, `CudaSolver(net, device)(x, T, P, dt, h)`, as CUDA kernels generated per
-  network and compiled at run time with NVRTC (two or four warps per cell). Per cell: the rate coefficients from T and
-  P, then Rodas3 (order 3, L-stable) with the exact Jacobian, the sparse LU without row exchanges in a minimum-degree
-  order (the densest trailing block factored in registers), adaptive steps (rtol 1e-3, atol 1e-18 in mole fraction) and
-  the cell's step size carried to its next call. A guard kernel flags cells with a non-finite state, an unfinished call
-  or an element drift beyond the network's allowance, and a recover kernel redoes them on the GPU (dense LU with
-  threshold pivoting, twice the step budget), so a call never waits for the host; the counts are read on demand, and
-  `check()` raises for gas below 300 K. Any VULCAN-format network up to 254 species.
+  network and compiled at run time with NVRTC (two or four warps per cell; small batches, up to one cell per SM, run one
+  cell per block, with the same results). Per cell: the rate coefficients from T and P, then Rodas3 (order 3, L-stable)
+  with the exact Jacobian, the sparse LU without row exchanges in a minimum-degree order (the densest trailing block
+  factored in registers), adaptive steps (rtol 1e-3, atol 1e-18 in mole fraction) and the cell's step size carried to
+  its next call. A guard kernel flags cells with a non-finite state, an unfinished call or an element drift beyond the
+  network's allowance, and a recover kernel redoes them on the GPU (dense LU with threshold pivoting, twice the step
+  budget), so a call never waits for the host; the counts are read on demand, and `check()` raises for gas below 300 K.
+  Any VULCAN-format network up to 254 species.
 - `lib/kincuda_ad.py`: tangent and adjoint kernels of one call (state, T, P, dt, step size, per-cell rate multipliers,
   Arrhenius table), with the step control differentiated (default) or the steps frozen; recovered cells are
   differentiated on the recovery's path (NaN when still failed); no host sync.
